@@ -201,6 +201,14 @@ struct OpenClickyWidgetStateStoreTests {
         let logStore = OpenClickyMessageLogStore(fileManager: .default, logDirectory: tempDir)
         let widgetStore = OpenClickyWidgetStateStore(fileManager: .default, logStore: logStore)
         
+        // Redirect the snapshot container into the temp dir. The real one is
+        // the app group, which is TCC-protected: an unsigned test bundle is
+        // denied, write() swallows the error, and readSnapshot returns
+        // .empty — which made the `== 0` assertion below pass for the wrong
+        // reason while every other assertion in this test failed.
+        OpenClickyWidgetStateStore.containerDirectoryOverride = tempDir
+        defer { OpenClickyWidgetStateStore.containerDirectoryOverride = nil }
+
         // Write mock snapshot file to ensure readSnapshot works
         let container = OpenClickyWidgetStateStore.containerDirectory(fileManager: .default)
         try? FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)

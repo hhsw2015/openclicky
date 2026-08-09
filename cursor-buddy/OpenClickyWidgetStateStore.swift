@@ -23,7 +23,19 @@ final class OpenClickyWidgetStateStore {
             .appendingPathComponent(snapshotFileName, isDirectory: false)
     }
 
+    /// Overrides the container for the duration of a test.
+    ///
+    /// The app-group container is TCC-protected: an unsigned test bundle gets
+    /// a URL back from `containerURL(forSecurityApplicationGroupIdentifier:)`
+    /// but is denied when it touches the path. `write` then throws into its
+    /// own `do/catch` and `readSnapshot` falls through to `.empty` — so
+    /// assertions expecting a zero value passed for the wrong reason while
+    /// every other assertion failed. Tests set this to a temp directory.
+    nonisolated(unsafe) static var containerDirectoryOverride: URL?
+
     nonisolated static func containerDirectory(fileManager: FileManager = .default) -> URL {
+        if let containerDirectoryOverride { return containerDirectoryOverride }
+
         if let appGroupURL = fileManager.containerURL(forSecurityApplicationGroupIdentifier: AppBundleConfiguration.appGroupIdentifier) {
             return appGroupURL
         }

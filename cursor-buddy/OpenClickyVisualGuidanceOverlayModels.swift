@@ -41,10 +41,20 @@ struct OpenClickyVisualGuidanceRect: Codable, Equatable, Hashable, Sendable {
     }
 
     init(_ rect: CGRect) {
-        self.x = Double(rect.origin.x)
-        self.y = Double(rect.origin.y)
-        self.width = Double(rect.width)
-        self.height = Double(rect.height)
+        // `.standardized` first: CGRect's `width`/`height` accessors already
+        // return absolute values while `origin` stays put, so reading
+        // `origin.x` + `rect.width` from a negative-width rect silently
+        // discards the sign and leaves the origin on the wrong edge.
+        //
+        // CGRect(x: 120, y: 90, width: -80, height: 60) spans x 40...120.
+        // The old code stored x=120, width=80 — the box drawn 80 pt to the
+        // right of where the caller asked. `normalized` below could not
+        // recover it either, since by then min(120, 120+80) is just 120.
+        let standardized = rect.standardized
+        self.x = Double(standardized.origin.x)
+        self.y = Double(standardized.origin.y)
+        self.width = Double(standardized.width)
+        self.height = Double(standardized.height)
     }
 
     var cgRect: CGRect {
