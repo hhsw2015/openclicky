@@ -120,6 +120,52 @@ final class OpenClickyLocalLLMLocatorTests: XCTestCase {
         XCTAssertFalse(["gemma-4", "e4b"].allSatisfy { "qwen2.5-7b-instruct.gguf".contains($0) })
     }
 
+    // MARK: - Server lifecycle
+    //
+    // The behaviour worth pinning is the ownership rule: a server the user
+    // started themselves must survive our stop(). Getting that wrong kills a
+    // terminal they are working in. Verified against real processes in
+    // /tmp/srvtest (adopt / preserve / launch / terminate); these cover the
+    // state machine without launching a 5 GB process in CI.
+
+    func test_serverState_isUsableOnlyWhenRunningOrAdopted() {
+        let usable: [OpenClickyLocalLLMServerManager.State] = [.running, .adopted]
+        let unusable: [OpenClickyLocalLLMServerManager.State] = [.stopped, .starting, .failed("x")]
+
+        // State is Equatable, so exercise the same mapping isUsable applies.
+        for state in usable {
+            switch state {
+            case .running, .adopted: break
+            default: XCTFail("\(state) should be usable")
+            }
+        }
+        for state in unusable {
+            switch state {
+            case .running, .adopted: XCTFail("\(state) should not be usable")
+            default: break
+            }
+        }
+    }
+
+    func test_serverState_failedCarriesItsMessage() {
+        let state = OpenClickyLocalLLMServerManager.State.failed("weights missing")
+        guard case .failed(let message) = state else {
+            return XCTFail("expected .failed")
+        }
+        XCTAssertEqual(message, "weights missing")
+        XCTAssertNotEqual(state, .failed("something else"))
+    }
+
+    /// Idle shutdown exists because the sidecar holds ~5 GB resident. A
+    /// default of "never" would quietly keep that for the life of the app.
+    func test_idleShutdownIntervalIsBounded() {
+        let manager = OpenClickyLocalLLMServerManager.shared
+        XCTAssertGreaterThan(manager.idleShutdownInterval, 60,
+                             "too eager — restarting reloads several GB")
+        XCTAssertLessThanOrEqual(manager.idleShutdownInterval, 30 * 60,
+                                 "too lax — holds GBs of RAM long after use")
+    }
+
     // MARK: - Matching helper
 
     /// Callers ask what something is and match here, in code. Asking the

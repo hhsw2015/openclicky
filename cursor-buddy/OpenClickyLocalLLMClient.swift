@@ -57,10 +57,18 @@ final class OpenClickyLocalLLMClient: LLMClient {
 
     private let baseURL: URL
     private let session: URLSession
+    private let port: UInt16
+    /// Start the sidecar on demand. Off in tests, which point `baseURL` at a
+    /// stub and must not launch a 5 GB process.
+    private let managesServer: Bool
 
     init(baseURL: URL = OpenClickyLocalLLMLocator.baseURL(),
+         port: UInt16 = OpenClickyLocalLLMLocator.defaultPort,
+         managesServer: Bool = true,
          session: URLSession? = nil) {
         self.baseURL = baseURL
+        self.port = port
+        self.managesServer = managesServer
         if let session {
             self.session = session
         } else {
@@ -80,8 +88,17 @@ final class OpenClickyLocalLLMClient: LLMClient {
 
     // MARK: - Health
 
+    /// Whether local inference is possible at all — a runtime and weights
+    /// exist on disk, even if no server is currently up. This is what a
+    /// Settings row or a routing decision wants; `isReachable` answers the
+    /// narrower "is one listening right now".
+    nonisolated static var isConfigured: Bool {
+        OpenClickyLocalLLMLocator.resolve() != nil
+    }
+
     /// Whether the sidecar is up. Short timeout: this gates a fallback
-    /// decision, so a slow answer is as bad as a negative one.
+    /// decision, so a slow answer is as bad as a negative one. Does NOT
+    /// start a server — use `complete`/`send` for that.
     func isReachable(timeout: TimeInterval = 1.5) async -> Bool {
         var request = URLRequest(url: baseURL.appendingPathComponent("health"))
         request.timeoutInterval = timeout
@@ -186,6 +203,20 @@ final class OpenClickyLocalLLMClient: LLMClient {
             // string-matched; sampling variation is pure downstream noise.
             "temperature": 0
         ]
+
+        // Start the sidecar if it is not up, and refresh the idle deadline
+        // either way. Callers should not have to know the process exists.
+        if managesServer {
+            let state = await OpenClickyLocalLLMServerManager.shared.ensureRunning(port: port)
+            switch state {
+            case .running, .adopted:
+                break
+            case .failed(let message):
+                throw OpenClickyLocalLLMError.httpStatus(503, message)
+            case .stopped, .starting:
+                throw OpenClickyLocalLLMError.serverUnreachable(baseURL)
+            }
+        }
 
         var request = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions"))
         request.httpMethod = "POST"
