@@ -20,6 +20,29 @@ import Foundation
 
 public enum AssistAgentJSON {
 
+    /// Convert curly single quotes that are acting as string DELIMITERS
+    /// into double quotes, leaving real apostrophes alone.
+    ///
+    /// A delimiter has a JSON structural character (or whitespace) on its
+    /// outer side: `{‘a’: ‘b’}`. An apostrophe sits between two letters:
+    /// `"it’s fine"`. Judging each quote by its neighbours keeps
+    /// `{“note”:“it’s fine”}` intact while repairing `{“x”:‘y’}`.
+    private static func replacingDelimitingSingleQuotes(in input: String) -> String {
+        let curly: Set<Character> = ["\u{2018}", "\u{2019}"]
+        let chars = Array(input)
+        var out = ""
+        out.reserveCapacity(chars.count)
+
+        for (i, ch) in chars.enumerated() {
+            guard curly.contains(ch) else { out.append(ch); continue }
+            let before = i > 0 ? chars[i - 1] : nil
+            let after = i + 1 < chars.count ? chars[i + 1] : nil
+            let isApostrophe = (before?.isLetter ?? false) && (after?.isLetter ?? false)
+            out.append(isApostrophe ? "'" : "\"")
+        }
+        return out
+    }
+
     /// Repair non-destructive: touches obvious syntax issues only.
     public static func repair(_ input: String) -> String {
         // Fullwidth → ASCII structural chars.
@@ -28,8 +51,13 @@ public enum AssistAgentJSON {
         s = s.replacingOccurrences(of: "，", with: ",")
         s = s.replacingOccurrences(of: "\u{201C}", with: "\"") // “
         s = s.replacingOccurrences(of: "\u{201D}", with: "\"") // ”
-        s = s.replacingOccurrences(of: "\u{2018}", with: "'")  // ‘
-        s = s.replacingOccurrences(of: "\u{2019}", with: "'")  // ’
+        // Curly SINGLE quotes become double quotes, not ASCII apostrophes.
+        // Mapping ‘y’ -> 'y' keeps the payload just as invalid — JSON has no
+        // single-quoted strings — so {“x”:‘y’} still failed to parse. A model
+        // that reached for ‘ ’ was delimiting a string, not writing an
+        // apostrophe: a real apostrophe inside prose arrives as U+2019
+        // surrounded by letters, which the guard below leaves alone.
+        s = Self.replacingDelimitingSingleQuotes(in: s)
 
         // Strip trailing commas: `,}` and `,]` (with optional whitespace).
         if let re = try? NSRegularExpression(pattern: ",(\\s*[}\\]])") {

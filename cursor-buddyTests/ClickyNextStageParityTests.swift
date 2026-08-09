@@ -16,7 +16,19 @@ struct ClickyNextStageParityTests {
 
 
     @Test func wikiManagerIndexesBundledWikiSeedAndSkills() throws {
-        let resourcesRoot = URL(fileURLWithPath: "/Users/jkneen/Documents/GitHub/openclicky/AppResources/OpenClicky", isDirectory: true)
+        // Derive the resources root from this source file's own location.
+        // It was hardcoded to /Users/jkneen/Documents/GitHub/openclicky/...,
+        // so it could only ever pass on the upstream author's machine and
+        // failed for everyone else -- five assertions, always red.
+        // #filePath is cursor-buddyTests/ClickyNextStageParityTests.swift,
+        // so two levels up is the repo root.
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // cursor-buddyTests/
+            .deletingLastPathComponent()   // repo root
+        let resourcesRoot = repoRoot
+            .appendingPathComponent("AppResources/OpenClicky", isDirectory: true)
+        try #require(FileManager.default.fileExists(atPath: resourcesRoot.path),
+                     "bundled resources not found at \(resourcesRoot.path)")
 
         let index = try OpenClickyCore.WikiManager.Index.load(fromBundledResourcesRoot: resourcesRoot)
 

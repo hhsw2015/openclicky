@@ -23,7 +23,10 @@ struct OpenClickyProfileTests {
         #expect(mirage.sttProvider == BuddyTranscriptionProviderID.mirageDeepgram.rawValue)
         #expect(mirage.ttsProvider == OpenClickyTTSProvider.mirageCartesia.rawValue)
         #expect(mirage.responseModelID == "mirage/claude-fable-5")
-        #expect(mirage.agentModelID == "mirage/claude-haiku-4-5-20251001")
+        // Agent tier is deliberately Opus 5, not the cheap tier: the dialog
+        // model stays on Fable 5 while planning turns get the strongest
+        // model. See the comment on OpenClickyProfile.mirage.
+        #expect(mirage.agentModelID == "mirage/claude-opus-5")
     }
 
     @Test func taskCompletionVoiceDefaultsOn() {

@@ -131,7 +131,10 @@ struct OpenClickyContextAwarenessDefaultsTests {
         #expect(settings.knownApps.count == 1)
         let first = settings.knownApps.first
         #expect(first?.titlePattern == "^xlinkBook")
-        #expect(first?.discoverUrl == "http://localhost:5000/.well-known/agent-skills")
+        // Port 32123 is OpenClickyExternalControlBridge.defaultPort — the
+        // app's own MCP bridge. The old localhost:5000 agent-skills URL was
+        // a placeholder from before that bridge existed.
+        #expect(first?.discoverUrl == "http://127.0.0.1:32123/mcp/tools?domain=xlb")
     }
 
     // MARK: - Override + persistence

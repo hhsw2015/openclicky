@@ -277,9 +277,22 @@ struct ClickyResponseCard: Identifiable, Equatable {
             return flattenedTitle
         }
 
+        // Cut on a word boundary. A hard 28-character slice produced
+        // "SPACEX COMPETITOR RESEARCH A…" — the orphaned initial reads as a
+        // rendering glitch rather than an abbreviation. Drop back to the
+        // last space when the slice lands mid-word.
         let endIndex = flattenedTitle.index(flattenedTitle.startIndex, offsetBy: 28)
-        let prefix = String(flattenedTitle[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return prefix + "…"
+        var prefix = String(flattenedTitle[..<endIndex])
+        let cutMidWord = flattenedTitle[endIndex].isLetter || flattenedTitle[endIndex].isNumber
+        if cutMidWord, let lastSpace = prefix.lastIndex(of: " ") {
+            let candidate = String(prefix[..<lastSpace])
+            // Only honour the boundary if something readable survives —
+            // a single very long word still gets the hard cut.
+            if !candidate.trimmingCharacters(in: .whitespaces).isEmpty {
+                prefix = candidate
+            }
+        }
+        return prefix.trimmingCharacters(in: .whitespacesAndNewlines) + "…"
     }
 }
 
