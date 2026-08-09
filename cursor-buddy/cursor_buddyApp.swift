@@ -92,6 +92,7 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDel
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("OpenClicky: Starting...")
         print("OpenClicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
+        OpenClickyAgentsSocketServer.shared.start()
 
         // Terminate any duplicate running instances of OpenClicky to prevent port (error 48) and permission conflicts
         let currentApp = NSRunningApplication.current
@@ -105,31 +106,171 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDel
                 app.terminate()
             }
             if !duplicateApps.isEmpty {
-                // Give the system a brief moment to release TCP sockets and file handles
-                Thread.sleep(forTimeInterval: 0.3)
+                // FIX(startup-perf-2026-08-01): was unconditional 300 ms
+                // Thread.sleep on the main thread — a visible boot
+                // hitch every launch when NO stale copy was actually
+                // still running. Poll each duplicate's `.isTerminated`
+                // with a 5 ms sleep, cap at 150 ms total. Users with
+                // no duplicates see 0 delay.
+                let deadline = Date().addingTimeInterval(0.15)
+                while Date() < deadline {
+                    if duplicateApps.allSatisfy({ $0.isTerminated }) { break }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
             }
+        }
+
+        // If the real HeyClicky.app is running, defer to it: both apps
+        // share the same global hotkeys (Ctrl+Option, Alt+S/L, Shift+Space)
+        // and only the first CGEvent tap installer wins. Rather than fight
+        // for the tap, we exit cleanly so the user can toggle which one
+        // owns the machine simply by launching the other.
+        let heyClickyRunning = NSWorkspace.shared.runningApplications.contains {
+            $0.bundleIdentifier == "com.humansongs.clicky"
+        }
+        if heyClickyRunning {
+            print("OpenClicky: real HeyClicky.app is running — exiting to yield hotkeys/OAuth.")
+            NSApp.terminate(nil)
+            return
         }
 
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
         AppBundleConfiguration.registerDefaults()
 
         // H15: prune old voice-transcript message logs on launch so the plaintext
-        // PII on disk doesn't grow unbounded.
+        // PII on disk doesn't grow unbounded. Also re-prune every
+        // hour so long-running instances don't accumulate a
+        // full day's log before the next reboot.
         OpenClickyMessageLogStore.shared.pruneOldMessageLogs()
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in
+            OpenClickyMessageLogStore.shared.pruneOldMessageLogs()
+        }
+
+        // Layer-0 audit hook: forward every AX / AppleScript / CGEvent
+        // boundary from the OpenClickyContextService package into the
+        // in-process HeyClickyLog store so `curl /agent/log/tail`
+        // surfaces the runtime capture trace after each hotkey press.
+        OpenClickyContextServiceLogBridge.install()
 
         ClickyAnalytics.configure()
         ClickyAnalytics.trackAppOpened()
         OpenClickyDesktopNotificationCenter.shared.configure()
 
+        // xlb topic index: sync once at launch, then watch the library
+        // directory. `startWatchingIfEnabled()` previously had zero
+        // callers and nothing else synced, so `[xlb-context]` was never
+        // produced in production even with the Settings switch on —
+        // lookups ran against an empty sqlite file. Both calls no-op
+        // when the switch is off (AppBundleConfiguration.xlbEnabled()).
+        if AppBundleConfiguration.xlbEnabled() {
+            Task.detached(priority: .utility) {
+                do {
+                    _ = try await XLBTopicIndex.shared.syncIfNeeded()
+                } catch {
+                    print("OpenClicky: xlb initial sync failed — \(error.localizedDescription)")
+                }
+                await XLBTopicIndex.shared.startWatchingIfEnabled()
+            }
+        }
+
+        // Prime the locale manager before any SwiftUI hierarchy is
+        // instantiated. Idempotent; installs the bundle-swizzle once
+        // and honors the persisted UI language choice.
+        _ = OpenClickyLocaleManager.shared
+
         menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
         companionManager.start()
         companionManager.scheduleWidgetSnapshotPublish()
-        registerAsLoginItemIfNeeded()
+        reconcileLoginItemFromUserPreference()
         startSparkleUpdater()
+
+        // UX audit #337 P0-1: on first launch (before onboarding is
+        // complete), auto-open the menu-bar panel so a new user is
+        // not staring at a mystery status icon with no cue. Returning
+        // users see nothing new — the panel opens on click as before.
+        if !companionManager.hasCompletedOnboarding {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.menuBarPanelManager?.showPanelOnLaunch()
+            }
+        }
+
+        // Phase 7.5 F29 — open-connector Node subprocess. No-op unless
+        // the user has opted in via Settings; failures are surfaced in
+        // `OpenClickyConnectorSettings.lastError` rather than blocking
+        // app launch.
+        OpenClickyConnectorSettings.autostartIfEnabled()
+
+        // Phase 7.6a F30 — OpenCLI Node subprocess. Independent of F29
+        // (separate binary, port range, auth token). Same opt-in shape.
+        OpenClickyOpenCLISettings.autostartIfEnabled()
+
+        // Phase 7.6b F31 — OpenDia Node subprocess. Independent of
+        // F29/F30 (own binary, port range [56000,57000), auth token).
+        // Same opt-in shape; the browser extension is a user-installed
+        // Chrome/Firefox extension that connects as a WS client.
+        OpenClickyOpenDiaSettings.autostartIfEnabled()
+
+        // Diagnostic snapshot of every NSWindow the app currently owns.
+        // Used to hunt the "overlay stays on screen after dismiss" bug:
+        // after `curl /agent/log/tail | grep openclicky.window` runs,
+        // any install log without a matching dismiss log identifies the
+        // culprit fullscreen surface.
+        logWindowStartupSnapshot()
+    }
+
+    private func logWindowStartupSnapshot() {
+        // NSApp.windows may briefly include the SwiftUI Settings scene
+        // hidden proxy; that's intentional — we want the raw list.
+        struct WindowRow: Encodable {
+            let num: Int
+            let w: Int
+            let h: Int
+            let level: Int
+            let alpha: Double
+            let title: String
+            let visible: Bool
+            let cls: String
+        }
+        let rows: [WindowRow] = NSApp.windows.map { win in
+            WindowRow(
+                num: win.windowNumber,
+                w: Int(win.frame.width),
+                h: Int(win.frame.height),
+                level: win.level.rawValue,
+                alpha: Double(win.alphaValue),
+                title: String((win.title.isEmpty ? "" : win.title).prefix(80)),
+                visible: win.isVisible,
+                cls: String(describing: type(of: win))
+            )
+        }
+        let payload: String
+        if let data = try? JSONEncoder().encode(rows),
+           let str = String(data: data, encoding: .utf8) {
+            payload = str
+        } else {
+            payload = "[]"
+        }
+        HeyClickyLog.log(
+            "openclicky.window.startup_snapshot",
+            lane: "system",
+            direction: "internal",
+            [
+                "count": rows.count,
+                "windows": payload,
+            ]
+        )
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         companionManager.stop()
+        OpenClickyConnectorSubprocess.shared.stop()
+        OpenClickyConnectorOAuthCallback.shared.stop()
+        OpenClickyOpenCLISubprocess.shared.stop()
+        OpenClickyOpenDiaSubprocess.shared.stop()
+        // Free whisper.cpp contexts BEFORE AppKit calls exit(), so the
+        // ggml-metal static destructor doesn't race the still-running
+        // ggml_metal_rsets_init worker (SIGABRT on quit otherwise).
+        WhisperCppShutdown.freeAll()
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -164,18 +305,35 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDel
         companionManager.showLogViewerWindow()
     }
 
-    /// Registers the app as a login item so it launches automatically on
-    /// startup. Uses SMAppService which shows the app in System Settings >
-    /// General > Login Items, letting the user toggle it off if they want.
-    private func registerAsLoginItemIfNeeded() {
-        let loginItemService = SMAppService.mainApp
-        if loginItemService.status != .enabled {
-            do {
-                try loginItemService.register()
-                print("OpenClicky: Registered as login item")
-            } catch {
-                print("OpenClicky: Failed to register as login item: \(error)")
+    /// UserDefaults key backing the "Launch OpenClicky at login" toggle.
+    /// Absent = user has not yet decided (default OFF, we don't touch
+    /// SMAppService); true = user opted in (we ensure registered);
+    /// false = user opted out (we ensure unregistered).
+    static let launchAtLoginDefaultsKey = "openclicky.launchAtLogin"
+
+    /// Reconciles the SMAppService state with the user's explicit
+    /// preference. Called from `applicationDidFinishLaunching` — no
+    /// side effects until the user has toggled the preference.
+    /// Previously the app auto-registered itself as a login item on
+    /// every launch (opt-out), which surprised users. Now: strict
+    /// opt-in via Settings.
+    private func reconcileLoginItemFromUserPreference() {
+        guard UserDefaults.standard.object(forKey: Self.launchAtLoginDefaultsKey) != nil else {
+            // No decision recorded → do nothing. Do NOT touch
+            // SMAppService.mainApp — leaving the previous state (which
+            // for a fresh install is `.notRegistered`).
+            return
+        }
+        let desired = UserDefaults.standard.bool(forKey: Self.launchAtLoginDefaultsKey)
+        let service = SMAppService.mainApp
+        do {
+            if desired && service.status != .enabled {
+                try service.register()
+            } else if !desired && service.status == .enabled {
+                try service.unregister()
             }
+        } catch {
+            print("OpenClicky: login-item reconcile failed: \(error)")
         }
     }
 

@@ -1,0 +1,17 @@
+upstream: aaronjmars/opendia (MIT)
+branch: main
+sha: 304345754cc99b24c07a3289a2e27abd5a5c19bb
+subject: feat(sidepanel): external link to Everywhere Connector Manager
+
+Vendored files (unmodified from upstream):
+  opendia-mcp/server.js
+  opendia-mcp/package.json
+  opendia-mcp/LICENSE
+
+The Everywhere fork (hhsw2015/opendia experiment/replace-ab) referenced
+in the Phase 7.6b task brief was NOT vendored — its browser_* tool
+surface is captured in Everywhere/docs/specs/PARITY_MATRIX.md (parity
+matrix json sha ed2e10598c9064aecfaeb7cf21b540684db4be2c), and
+cursor-buddy/OpenClickyOpenDiaBridgeTools.swift registers all 120
+browser_* tools from that matrix. The extension itself decides which
+subset it implements — unknown tools return {ok:false, code:"UNKNOWN_TOOL"}.

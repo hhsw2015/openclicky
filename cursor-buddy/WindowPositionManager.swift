@@ -394,7 +394,7 @@ private struct PermissionDragAssistantView: View {
                             .fill(DS.Colors.accentSubtle)
                     )
 
-                Text(message)
+                Text(LocalizedStringKey(message))
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textPrimary)
 

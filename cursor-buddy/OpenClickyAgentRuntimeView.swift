@@ -301,7 +301,7 @@ private struct OpenClickyRuntimeSessionRow: View {
                     Circle()
                         .fill(statusColor)
                         .frame(width: 8, height: 8)
-                    Text(session.title)
+                    Text(LocalizedStringKey(session.title))
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(.primary)
                         .lineLimit(1)
@@ -314,7 +314,7 @@ private struct OpenClickyRuntimeSessionRow: View {
                             .background(Capsule().fill(Color.accentColor.opacity(0.15)))
                     }
                     Spacer()
-                    Text(session.status.label)
+                    Text(LocalizedStringKey(session.status.label))
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(statusColor)
                 }

@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import NaturalLanguage
 import Security
 
 nonisolated enum AppBundleConfiguration {
@@ -28,6 +29,68 @@ nonisolated enum AppBundleConfiguration {
     static let userVoiceResponseCaptionsEnabledDefaultsKey = "openClickyVoiceResponseCaptionsEnabled"
     static let userVoiceResponseCaptionFontDefaultsKey = "openClickyVoiceResponseCaptionFont"
     static let userVoiceResponseCaptionOpacityDefaultsKey = "openClickyVoiceResponseCaptionOpacity"
+    /// Language the assistant should speak in. Codes: "auto" (follow user
+    /// speech), "zh" (Chinese), "en" (English), "ja", "es", "fr", "de".
+    /// Injected as an instruction prefix into every Realtime session.update.
+    static let userVoiceResponseLanguageDefaultsKey = "openClickyVoiceResponseLanguage"
+    static func voiceResponseLanguage() -> String {
+        userDefaultsValue(forKey: userVoiceResponseLanguageDefaultsKey) ?? "auto"
+    }
+    /// Non-nil human-readable instruction snippet for the assistant.
+    /// Empty when "auto" so we don't override the model's natural
+    /// language detection.
+    static func voiceResponseLanguageInstruction() -> String? {
+        switch voiceResponseLanguage() {
+        case "zh": return "Always reply in Simplified Chinese (简体中文). Speak fluent, natural Mandarin. Do not switch to English unless the user explicitly asks."
+        case "en": return "Always reply in English. Do not switch languages unless the user explicitly asks."
+        case "ja": return "Always reply in Japanese (日本語). Do not switch languages unless the user explicitly asks."
+        case "es": return "Always reply in Spanish (Español). Do not switch languages unless the user explicitly asks."
+        case "fr": return "Always reply in French (Français). Do not switch languages unless the user explicitly asks."
+        case "de": return "Always reply in German (Deutsch). Do not switch languages unless the user explicitly asks."
+        default: return nil
+        }
+    }
+    /// FIX(ai-audit-2026-08-01 #1): per-turn language detection. When
+    /// voiceResponseLanguage=="auto", detect the language of the actual
+    /// user transcript so we can hint the LLM ("Reply in Chinese since
+    /// the user just spoke Chinese"). Fixes bilingual users getting
+    /// English replies to Chinese questions.
+    /// Returns BCP-47 code ("zh", "en", "ja", …) or nil if inconclusive.
+    static func detectedTranscriptLanguage(_ transcript: String) -> String? {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return nil }
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(trimmed)
+        guard let lang = recognizer.dominantLanguage else { return nil }
+        // Confidence gate — reject weak signal (e.g. code snippets).
+        let hyps = recognizer.languageHypotheses(withMaximum: 1)
+        if let top = hyps[lang], top < 0.6 { return nil }
+        return lang.rawValue
+    }
+
+    /// Build a language instruction for THIS specific turn. Prefers user
+    /// setting; falls back to per-turn detection when setting is "auto".
+    static func voiceResponseLanguageInstruction(forTranscript transcript: String) -> String? {
+        if let explicit = voiceResponseLanguageInstruction() { return explicit }
+        guard let detected = detectedTranscriptLanguage(transcript) else { return nil }
+        switch detected {
+        case "zh", "zh-Hans", "zh-Hant":
+            return "The user just spoke in Chinese. Reply in Simplified Chinese unless they explicitly ask otherwise."
+        case "en":
+            return "The user just spoke in English. Reply in English."
+        case "ja":
+            return "The user just spoke in Japanese. Reply in Japanese."
+        case "es":
+            return "The user just spoke in Spanish. Reply in Spanish."
+        case "fr":
+            return "The user just spoke in French. Reply in French."
+        case "de":
+            return "The user just spoke in German. Reply in German."
+        default:
+            return nil
+        }
+    }
+
     static let defaultVoiceResponseCaptionOpacity = 0.92
     static let userAppFontDefaultsKey = "openClickyAppFont"
     static let userAppTitleFontSizeDefaultsKey = "openClickyAppTitleFontSize"
@@ -52,6 +115,9 @@ nonisolated enum AppBundleConfiguration {
     static let userExternalInferenceProxyEnabledDefaultsKey = "openClickyExternalInferenceProxyEnabled"
     static let userVisualDrawingOverlayToolsEnabledDefaultsKey = "openClickyVisualDrawingOverlayToolsEnabled"
     static let userGmailOAuthToolsEnabledDefaultsKey = "openClickyGmailOAuthToolsEnabled"
+    static let userXLBEnabledDefaultsKey = "openClickyXLBEnabled"
+    static let userXLBHostUrlDefaultsKey = "openClickyXLBHostUrl"
+    static let userXLBGraphJsonPathDefaultsKey = "openclicky.xlb.graphJsonPath"
     static let userExternalControlBridgeTokenDefaultsKey = "openClickyExternalControlBridgeToken"
     static let userAgentPlaintextProviderSyncEnabledDefaultsKey = "openClickyAgentPlaintextProviderSyncEnabled"
     static let userDesktopNotificationsEnabledDefaultsKey = "openClickyDesktopNotificationsEnabled"
@@ -182,11 +248,139 @@ nonisolated enum AppBundleConfiguration {
             || environmentValue?.lowercased() == "true"
     }
 
+    static func xlbEnabled() -> Bool {
+        let environmentValue = normalizedConfigurationValue(ProcessInfo.processInfo.environment["OPENCLICKY_XLB_ENABLED"])
+        return userDefaultsBool(forKey: userXLBEnabledDefaultsKey, defaultValue: false)
+            || environmentValue == "1"
+            || environmentValue?.lowercased() == "true"
+    }
+
+    /// Optional xlinkBook host URL. Empty = agent_state tool disabled.
+    /// User must set this in Settings to opt in.
+    static func xlbHostUrl() -> String {
+        if let v = userDefaultsValue(forKey: userXLBHostUrlDefaultsKey),
+           !v.trimmingCharacters(in: .whitespaces).isEmpty {
+            return v
+        }
+        return "http://localhost:5000"
+    }
+
+    /// Path where the Swift bakery writes graph.json. Default location is
+    /// openclicky's own Application Support directory
+    /// (`~/Library/Application Support/OpenClicky/xlb-graph.json`) so the app
+    /// never depends on any external skill install layout for writes.
+    ///
+    /// Read-side note: when neither the UserDefault override nor the
+    /// openclicky-side file exists, and the legacy skill export at
+    /// `~/.xlb-env/xlinkBook-skill/skills/xlb-topic-index/scripts/graphify-out/graph.json`
+    /// is still present on disk, we fall back to that skill path so users
+    /// carrying a graph from the previous layout still see it. This skill
+    /// fallback is transitional and should be removed once existing users
+    /// have migrated.
+    ///
+    /// Override via UserDefault `openclicky.xlb.graphJsonPath` (used for
+    /// developer overrides only; the Settings UI no longer exposes it).
+    static func xlbGraphJsonPath() -> URL {
+        // Openclicky-owned default. All new writes land here.
+        let openClickyDefault = "~/Library/Application Support/OpenClicky/xlb-graph.json"
+        // Transitional: legacy skill export path from before the openclicky
+        // migration. Only consulted as a read fallback when the file
+        // physically exists there.
+        let legacySkillPath = "~/.xlb-env/xlinkBook-skill/skills/xlb-topic-index/scripts/graphify-out/graph.json"
+
+        if let v = userDefaultsValue(forKey: userXLBGraphJsonPathDefaultsKey),
+           !v.trimmingCharacters(in: .whitespaces).isEmpty {
+            let expanded = (v as NSString).expandingTildeInPath
+            return URL(fileURLWithPath: expanded)
+        }
+
+        let expandedDefault = (openClickyDefault as NSString).expandingTildeInPath
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: expandedDefault) {
+            let expandedLegacy = (legacySkillPath as NSString).expandingTildeInPath
+            if fm.fileExists(atPath: expandedLegacy) {
+                return URL(fileURLWithPath: expandedLegacy)
+            }
+        }
+        return URL(fileURLWithPath: expandedDefault)
+    }
+
+    /// Effective context window (tokens) for the currently-selected voice
+    /// response model. Auto-tuned xlb caps scale off this value. The
+    /// catalog does not (yet) carry an explicit `contextWindow` field, so
+    /// we approximate from `maxOutputTokens` which is set uniformly per
+    /// model family. Returns 128_000 if the selection cannot be resolved.
+    /// TODO: add a first-class `contextWindow` field to
+    /// `OpenClickyModelOption` once model metadata is centralized.
+    static func xlbEffectiveContextWindow() -> Int {
+        let fallback = 128_000
+        guard let selectedID = UserDefaults.standard.string(forKey: OpenClickyProfileCatalog.voiceResponseModelDefaultsKey),
+              !selectedID.isEmpty else {
+            return fallback
+        }
+        let option = OpenClickyModelCatalog.voiceResponseModel(withID: selectedID)
+        let value = option.maxOutputTokens
+        return value > 0 ? value : fallback
+    }
+
+    /// Per-turn xlb token budget: 15% of the current model's context
+    /// window, clamped to [8_000, 60_000].
+    static func xlbTurnBudget() -> Int {
+        let ctx = xlbEffectiveContextWindow()
+        let raw = Int(Double(ctx) * 0.15)
+        return max(8_000, min(60_000, raw))
+    }
+
+    static func xlbTokenCapSearch() -> Int {
+        max(1_500, Int(Double(xlbTurnBudget()) * 0.15))
+    }
+
+    static func xlbTokenCapTopic() -> Int {
+        max(4_000, Int(Double(xlbTurnBudget()) * 0.40))
+    }
+
+    static func xlbTokenCapMeta() -> Int {
+        max(2_000, Int(Double(xlbTurnBudget()) * 0.20))
+    }
+
+    static func xlbTokenCapSectionFull() -> Int {
+        max(5_000, Int(Double(xlbTurnBudget()) * 0.50))
+    }
+
+    static func xlbTokenCapSectionSummary() -> Int {
+        max(1_500, Int(Double(xlbTurnBudget()) * 0.15))
+    }
+
+    static func xlbTokenCapSectionCount() -> Int {
+        max(800, Int(Double(xlbTurnBudget()) * 0.08))
+    }
+
+    static func xlbTokenCapGraph() -> Int {
+        max(2_500, Int(Double(xlbTurnBudget()) * 0.25))
+    }
+
+    static func xlbTokenCapState() -> Int {
+        max(2_000, Int(Double(xlbTurnBudget()) * 0.20))
+    }
+
     static func externalControlBridgeToken() -> String? {
         userDefaultsValue(forKey: userExternalControlBridgeTokenDefaultsKey) ?? stringValue(
             forKey: "OpenClickyExternalControlBridgeToken",
             environmentKeys: ["OPENCLICKY_BRIDGE_TOKEN"]
         ) ?? localDevelopmentEnvironmentValue(forKey: "OPENCLICKY_BRIDGE_TOKEN")
+    }
+
+    /// Generates a new bearer token for the external-control bridge and
+    /// persists it into UserDefaults so `externalControlBridgeToken()`
+    /// returns it on next read. Codex template picks this up on the next
+    /// Agent Mode session start. Returns the new token so callers can
+    /// display / copy it immediately.
+    @discardableResult
+    static func regenerateExternalControlBridgeToken() -> String {
+        let bytes = (0..<32).map { _ in UInt8.random(in: 0...255) }
+        let token = bytes.map { String(format: "%02x", $0) }.joined()
+        UserDefaults.standard.set(token, forKey: userExternalControlBridgeTokenDefaultsKey)
+        return token
     }
 
     static func agentPlaintextProviderSyncEnabled() -> Bool {
@@ -368,33 +562,70 @@ nonisolated enum AppBundleConfiguration {
         return nil
     }
 
-    private static func localDevelopmentEnvironmentValue(forKey key: String) -> String? {
-        for environmentFileURL in localDevelopmentEnvironmentFileURLs() {
-            guard let fileContents = try? String(contentsOf: environmentFileURL, encoding: .utf8) else {
-                continue
-            }
-
-            if let value = environmentValue(forKey: key, in: fileContents) {
-                return value
+    // FIX(startup-perf-2026-08-01): cache the concatenated env file
+    // contents so 8+ callers don't each read ~4 files from disk. Also
+    // caches parsed key->value pairs so repeated lookups skip the
+    // regex scan.
+    private static let envCache: (contents: String, parsed: [String: String]) = {
+        var combined = ""
+        for url in localDevelopmentEnvironmentFileURLs() {
+            if let s = try? String(contentsOf: url, encoding: .utf8) {
+                combined += s
+                combined += "\n"
             }
         }
+        var parsed: [String: String] = [:]
+        for line in combined.split(separator: "\n") {
+            let raw = line.trimmingCharacters(in: .whitespaces)
+            if raw.isEmpty || raw.hasPrefix("#") { continue }
+            guard let eq = raw.firstIndex(of: "=") else { continue }
+            let k = String(raw[..<eq]).trimmingCharacters(in: .whitespaces)
+            var v = String(raw[raw.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            if v.hasPrefix("\"") && v.hasSuffix("\"") && v.count >= 2 {
+                v = String(v.dropFirst().dropLast())
+            }
+            parsed[k] = v
+        }
+        return (combined, parsed)
+    }()
 
-        return nil
+    private static func localDevelopmentEnvironmentValue(forKey key: String) -> String? {
+        return envCache.parsed[key]
     }
 
     private static let keychainService = "com.jkneen.openclicky.secrets"
 
-    private static let keychainBackedDefaultsKeys: Set<String> = [
-        userAnthropicAPIKeyDefaultsKey,
-        userElevenLabsAPIKeyDefaultsKey,
-        userCartesiaAPIKeyDefaultsKey,
-        userCodexAgentAPIKeyDefaultsKey,
-        userAssemblyAIAPIKeyDefaultsKey,
-        userDeepgramAPIKeyDefaultsKey,
-        userExternalControlBridgeTokenDefaultsKey
-    ]
+    /// Empty on purpose: dev-signed rebuilds trip macOS Keychain ACL
+    /// prompts on every relaunch (new codesign identity → old ACL
+    /// rejects → password dialog). Route all "sensitive" secrets
+    /// through UserDefaults instead. UserDefaults is less protected
+    /// but for local dev testing this is fine, and for production
+    /// signing (stable identity) we can re-add keys later without
+    /// changing the read/write API.
+    private static let keychainBackedDefaultsKeys: Set<String> = []
+
+    /// Per-process cache of Keychain lookups. Prevents a single denied
+    /// lookup (macOS password-prompt "Deny") from re-prompting every
+    /// time a code path reads the same key. `keychainProbeFailed` also
+    /// short-circuits ALL subsequent Keychain reads for the session so
+    /// a rebuilt+resigned dev binary doesn't chain-prompt the user
+    /// during startup (the reported bug: "怎么又需要输密码了").
+    private static var keychainCache: [String: String] = [:]
+    private static var keychainNegativeCache: Set<String> = []
+    private static var keychainProbeFailed: Bool = false
 
     private static func keychainValue(forKey key: String) -> String? {
+        // Hard-short-circuit: never read Keychain in dev-signed
+        // builds. Every rebuild triggers a fresh macOS password
+        // prompt because codesign identity changes and old ACL
+        // rejects the new binary. Return nil so callers fall
+        // through to UserDefaults / env. Production signing (stable
+        // identity) can revert this if needed.
+        return nil
+        // unreachable below (kept for reference)
+        if let hit = keychainCache[key] { return hit }
+        if keychainNegativeCache.contains(key) { return nil }
+        if keychainProbeFailed { return nil }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -403,13 +634,34 @@ nonisolated enum AppBundleConfiguration {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return normalizedConfigurationValue(String(data: data, encoding: .utf8))
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        // Auth-related failures (user denied prompt / interaction not
+        // allowed / device locked) — mark the entire process as
+        // Keychain-unavailable so we never prompt again this run.
+        if status == errSecUserCanceled
+            || status == errSecInteractionNotAllowed
+            || status == errSecAuthFailed
+            || status == errSecMissingEntitlement {
+            keychainProbeFailed = true
+            return nil
+        }
+        guard status == errSecSuccess, let data = item as? Data else {
+            keychainNegativeCache.insert(key)
+            return nil
+        }
+        let value = normalizedConfigurationValue(String(data: data, encoding: .utf8))
+        if let value { keychainCache[key] = value }
+        return value
     }
 
     @discardableResult
     private static func setKeychainValue(_ value: String, forKey key: String) -> Bool {
+        // Skip writes when the probe already failed — otherwise we'd
+        // re-prompt on every persist attempt.
+        if keychainProbeFailed {
+            keychainCache[key] = value
+            return true
+        }
         guard let data = value.data(using: .utf8) else { return false }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

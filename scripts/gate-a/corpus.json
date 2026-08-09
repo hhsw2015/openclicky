@@ -1,0 +1,164 @@
+{
+  "_doc": "Gate A corpus. Four arms per item, same gold intent.  arm1_zh_raw = deictic Chinese as spoken.  arm2_zh_grounded = Chinese with referents resolved (what E4B would emit if it answered in Chinese).  arm3_en_grounded = English with referents resolved (what E4B would emit if instructed to answer in English) -- this is the model's native domain.  arm4_en_raw = the untouched routelet holdout line, as an upper-bound control: if this arm does not score near the published accuracy, the harness itself is broken and no other arm's number means anything.",
+  "items": [
+    { "gold": "find_action", "arm4_en_raw": "where is the search bar",
+      "arm3_en_grounded": "where is the search bar in the Safari toolbar",
+      "arm2_zh_grounded": "Safari 工具栏里的搜索框在哪里",
+      "arm1_zh_raw": "搜索框在哪" },
+
+    { "gold": "find_action", "arm4_en_raw": "click the play button",
+      "arm3_en_grounded": "click the play button in the Spotify player",
+      "arm2_zh_grounded": "点击 Spotify 播放器里的播放按钮",
+      "arm1_zh_raw": "点这个播放" },
+
+    { "gold": "find_action", "arm4_en_raw": "click on the song Sicko Mode in spotify",
+      "arm3_en_grounded": "click the song Sicko Mode in the Spotify track list",
+      "arm2_zh_grounded": "点击 Spotify 歌曲列表里的 Sicko Mode",
+      "arm1_zh_raw": "点那首歌" },
+
+    { "gold": "find_action", "arm4_en_raw": "open the settings menu",
+      "arm3_en_grounded": "open the settings menu in the top-right corner",
+      "arm2_zh_grounded": "打开右上角的设置菜单",
+      "arm1_zh_raw": "打开这个设置" },
+
+    { "gold": "find_action", "arm4_en_raw": "scroll down to the bottom of the page",
+      "arm3_en_grounded": "scroll to the bottom of the current Chrome page",
+      "arm2_zh_grounded": "滚动到当前 Chrome 页面的底部",
+      "arm1_zh_raw": "往下滑到底" },
+
+    { "gold": "find_action", "arm4_en_raw": "press the submit button",
+      "arm3_en_grounded": "press the Submit button at the bottom of the form",
+      "arm2_zh_grounded": "点击表单底部的提交按钮",
+      "arm1_zh_raw": "按一下这个提交" },
+
+    { "gold": "find_action", "arm4_en_raw": "close this tab",
+      "arm3_en_grounded": "close the active Chrome tab showing GitHub",
+      "arm2_zh_grounded": "关闭当前显示 GitHub 的 Chrome 标签页",
+      "arm1_zh_raw": "把这个关掉" },
+
+    { "gold": "find_action", "arm4_en_raw": "where do i change my password",
+      "arm3_en_grounded": "where is the change password option in account settings",
+      "arm2_zh_grounded": "账户设置里改密码的选项在哪里",
+      "arm1_zh_raw": "在哪改密码" },
+
+    { "gold": "chat", "arm4_en_raw": "explain how transformers work",
+      "arm3_en_grounded": "explain how transformer neural networks work",
+      "arm2_zh_grounded": "解释一下 transformer 神经网络的原理",
+      "arm1_zh_raw": "讲讲这个原理" },
+
+    { "gold": "chat", "arm4_en_raw": "what is 5 + 5",
+      "arm3_en_grounded": "what is five plus five",
+      "arm2_zh_grounded": "五加五等于几",
+      "arm1_zh_raw": "五加五是多少" },
+
+    { "gold": "chat", "arm4_en_raw": "is it possible to skip songs on spotify",
+      "arm3_en_grounded": "is it possible to skip songs on Spotify",
+      "arm2_zh_grounded": "Spotify 可以跳过歌曲吗",
+      "arm1_zh_raw": "这个能跳过吗" },
+
+    { "gold": "chat", "arm4_en_raw": "where are the documentation for this function in rust?",
+      "arm3_en_grounded": "where is the Rust documentation for the read_to_string function",
+      "arm2_zh_grounded": "Rust 的 read_to_string 函数文档在哪里",
+      "arm1_zh_raw": "这个函数的文档呢" },
+
+    { "gold": "chat", "arm4_en_raw": "why is my code slow",
+      "arm3_en_grounded": "why is the sorting function in my code slow",
+      "arm2_zh_grounded": "我代码里的排序函数为什么慢",
+      "arm1_zh_raw": "这个为什么这么慢" },
+
+    { "gold": "chat", "arm4_en_raw": "what does this error mean",
+      "arm3_en_grounded": "what does the NullPointerException in the IDE console mean",
+      "arm2_zh_grounded": "IDE 控制台里的 NullPointerException 是什么意思",
+      "arm1_zh_raw": "这报错啥意思" },
+
+    { "gold": "chat", "arm4_en_raw": "how do i write a for loop in python",
+      "arm3_en_grounded": "how do I write a for loop in Python",
+      "arm2_zh_grounded": "Python 里怎么写 for 循环",
+      "arm1_zh_raw": "这个循环怎么写" },
+
+    { "gold": "chat", "arm4_en_raw": "tell me a joke",
+      "arm3_en_grounded": "tell me a joke",
+      "arm2_zh_grounded": "讲个笑话",
+      "arm1_zh_raw": "讲个笑话" },
+
+    { "gold": "memory", "arm4_en_raw": "remember that i prefer dark mode",
+      "arm3_en_grounded": "remember that I prefer dark mode",
+      "arm2_zh_grounded": "记住我喜欢深色模式",
+      "arm1_zh_raw": "记一下这个" },
+
+    { "gold": "memory", "arm4_en_raw": "note that the api key expires next week",
+      "arm3_en_grounded": "note that the API key expires next week",
+      "arm2_zh_grounded": "记下这个 API key 下周过期",
+      "arm1_zh_raw": "记下这个过期时间" },
+
+    { "gold": "memory", "arm4_en_raw": "what did i say about the database yesterday",
+      "arm3_en_grounded": "what did I say about the database yesterday",
+      "arm2_zh_grounded": "我昨天关于数据库说了什么",
+      "arm1_zh_raw": "我昨天说的那个" },
+
+    { "gold": "memory", "arm4_en_raw": "save this for later",
+      "arm3_en_grounded": "save the current Figma design link for later",
+      "arm2_zh_grounded": "把当前的 Figma 设计链接存下来备用",
+      "arm1_zh_raw": "把这个存一下" },
+
+    { "gold": "memory", "arm4_en_raw": "forget what i told you about the meeting",
+      "arm3_en_grounded": "forget what I told you about the Monday meeting",
+      "arm2_zh_grounded": "忘掉我跟你说的周一会议的事",
+      "arm1_zh_raw": "刚才那个忘了吧" },
+
+    { "gold": "memory", "arm4_en_raw": "keep in mind that i use vim keybindings",
+      "arm3_en_grounded": "keep in mind that I use vim keybindings",
+      "arm2_zh_grounded": "记住我用 vim 键位",
+      "arm1_zh_raw": "记住我用 vim" },
+
+    { "gold": "memory", "arm4_en_raw": "what do you remember about my project",
+      "arm3_en_grounded": "what do you remember about my OpenClicky project",
+      "arm2_zh_grounded": "你记得我的 OpenClicky 项目的什么",
+      "arm1_zh_raw": "你还记得我那个项目吗" },
+
+    { "gold": "memory", "arm4_en_raw": "store my email address",
+      "arm3_en_grounded": "store my work email address",
+      "arm2_zh_grounded": "存一下我的工作邮箱",
+      "arm1_zh_raw": "存下我邮箱" },
+
+    { "gold": "integration", "arm4_en_raw": "play the next song on spotify",
+      "arm3_en_grounded": "play the next song on Spotify",
+      "arm2_zh_grounded": "在 Spotify 播放下一首歌",
+      "arm1_zh_raw": "下一首" },
+
+    { "gold": "integration", "arm4_en_raw": "send a message to john on slack",
+      "arm3_en_grounded": "send a Slack message to John",
+      "arm2_zh_grounded": "在 Slack 上给 John 发条消息",
+      "arm1_zh_raw": "给他发个消息" },
+
+    { "gold": "integration", "arm4_en_raw": "add a meeting to my calendar tomorrow at 3pm",
+      "arm3_en_grounded": "add a calendar meeting tomorrow at 3pm",
+      "arm2_zh_grounded": "在日历里加个明天下午三点的会议",
+      "arm1_zh_raw": "明天三点加个会" },
+
+    { "gold": "integration", "arm4_en_raw": "search the web for swift concurrency",
+      "arm3_en_grounded": "search the web for Swift concurrency",
+      "arm2_zh_grounded": "上网搜一下 Swift 并发",
+      "arm1_zh_raw": "搜一下这个" },
+
+    { "gold": "integration", "arm4_en_raw": "create a new file called test.py",
+      "arm3_en_grounded": "create a new file named test.py",
+      "arm2_zh_grounded": "新建一个叫 test.py 的文件",
+      "arm1_zh_raw": "建个文件" },
+
+    { "gold": "integration", "arm4_en_raw": "pause the music",
+      "arm3_en_grounded": "pause the Spotify music",
+      "arm2_zh_grounded": "暂停 Spotify 的音乐",
+      "arm1_zh_raw": "暂停一下" },
+
+    { "gold": "integration", "arm4_en_raw": "set a timer for 20 minutes",
+      "arm3_en_grounded": "set a timer for twenty minutes",
+      "arm2_zh_grounded": "设置一个二十分钟的计时器",
+      "arm1_zh_raw": "定个二十分钟" },
+
+    { "gold": "integration", "arm4_en_raw": "commit these changes to git",
+      "arm3_en_grounded": "commit the staged changes to git",
+      "arm2_zh_grounded": "把暂存的改动提交到 git",
+      "arm1_zh_raw": "提交这些改动" }
+  ]
+}

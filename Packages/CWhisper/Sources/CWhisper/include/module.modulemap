@@ -1,0 +1,10 @@
+module CWhisper {
+    umbrella header "whisper.h"
+    export *
+    link "whisper"
+    link "ggml"
+    link "ggml-base"
+    link "ggml-cpu"
+    link "ggml-metal"
+    link "ggml-blas"
+}

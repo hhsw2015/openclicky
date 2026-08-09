@@ -5,6 +5,7 @@
 //  Created by thorfinn on 3/2/26.
 //
 
+import Foundation
 import Testing
 import CoreGraphics
 @testable import OpenClicky

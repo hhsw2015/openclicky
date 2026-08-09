@@ -32,6 +32,15 @@ final class ClaudeAgentSDKAPI {
     var model: String
     var maxOutputTokens: Int
 
+    /// When set, the Node bridge process is spawned with
+    /// `ANTHROPIC_BASE_URL` pointing at the given URL (typically a running
+    /// `MirageLocalRelay` on 127.0.0.1). All Claude Agent SDK HTTP goes
+    /// through the relay → aegis-proxy free-tier Claude. Leave `nil` for
+    /// the normal paid Anthropic path.
+    /// Set by the pipeline dispatcher when the active profile is
+    /// `.peekyFree`.
+    var mirageBaseURLOverride: URL?
+
     private static let persistentBridgeSystemPrompt = """
     You are OpenClicky's persistent local Claude Agent SDK voice response session.
     Keep the session warm and follow the current OpenClicky voice policy and context supplied with each user turn.
@@ -437,6 +446,22 @@ final class ClaudeAgentSDKAPI {
             fileManager: fileManager
         ).joined(separator: ":")
         environment["CLAUDE_AGENT_SDK_CLIENT_APP"] = "openclicky/1.0"
+
+        // Peeky Free / Mirage transport injection. When the calling profile
+        // is `.peekyFree` (Mirage), a caller has set
+        // `ClaudeAgentSDKAPI.mirageBaseURLOverride` on this instance to a
+        // running loopback relay URL. The Claude Agent SDK (Node bridge)
+        // respects `ANTHROPIC_BASE_URL` for its underlying HTTP client, so
+        // pointing it at the relay makes every SDK API call terminate at
+        // aegis-proxy free-tier Claude with the byte-exact mirage wire
+        // format — the agent loop stays in the SDK, only the transport is
+        // replaced. The dummy API key is required because the SDK env
+        // check refuses an empty value; the relay strips it and injects
+        // the rotating UUID before egress.
+        if let override = self.mirageBaseURLOverride {
+            environment["ANTHROPIC_BASE_URL"] = override.absoluteString
+            environment["ANTHROPIC_API_KEY"] = "sk-mirage-relay-dummy"
+        }
         return environment
     }
 

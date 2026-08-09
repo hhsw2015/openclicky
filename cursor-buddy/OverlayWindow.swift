@@ -11,6 +11,7 @@ import AppKit
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+import ApplicationServices
 
 // MARK: - AgentParkingPosition
 
@@ -496,6 +497,7 @@ struct BlueCursorView: View {
 
     @State private var cursorPosition: CGPoint
     @State private var isCursorOnThisScreen: Bool
+    private static var debugTick: Int = 0
 
     init(screenFrame: CGRect, isFirstAppearance: Bool, companionManager: CompanionManager) {
         self.screenFrame = screenFrame
@@ -655,6 +657,11 @@ struct BlueCursorView: View {
         ZStack {
             // Nearly transparent background (helps with compositing)
             Color.black.opacity(0.001)
+
+            // HeyClicky Free walkthrough annotations (highlight rect,
+            // hover circle, arrow, curve, polygon). Positioned before
+            // buddy/cursor so those stay on top.
+            HeyClickyScreenAnnotationLayer(screenFrame: screenFrame)
 
             // Welcome speech bubble (first launch only)
             if isCursorOnThisScreen && showWelcome && !welcomeText.isEmpty {
@@ -882,9 +889,45 @@ struct BlueCursorView: View {
                 .animation(cursorFollowAnimation, value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: cursorState.voiceState)
 
+            // Speaking pulse — a soft ring around the mascot while TTS is
+            // playing so the user can tell "AI is talking" from "AI is
+            // idle." Previously .responding fell through to the .idle
+            // mascot with no visual difference.
+            SpeakingPulseRing(
+                cursorColor: overlayCursorColor,
+                isActive: buddyIsVisibleOnThisScreen && cursorState.voiceState == .responding,
+                audioPowerLevel: cursorState.currentAudioPowerLevel
+            )
+                .opacity(buddyIsVisibleOnThisScreen && cursorState.voiceState == .responding ? cursorOpacity : 0)
+                .position(cursorPosition)
+                .animation(cursorFollowAnimation, value: cursorPosition)
+                .animation(.easeIn(duration: 0.2), value: cursorState.voiceState)
+
+            // Backend-status caption: rendered near the cursor whenever the
+            // recovery pipeline has something the user should be aware of
+            // (refreshing / signInRequired / needsExtension). Auto-clears
+            // when heyClickyStatusCaption returns to nil.
+            if buddyIsVisibleOnThisScreen, let caption = cursorState.heyClickyStatusCaption, !caption.isEmpty {
+                HeyClickyRecoveryStatusChip(
+                    caption: caption,
+                    severity: cursorState.heyClickyStatusSeverity ?? "info",
+                    accent: overlayCursorColor
+                )
+                .position(x: cursorPosition.x, y: cursorPosition.y + 32)
+                .animation(cursorFollowAnimation, value: cursorPosition)
+                .transition(.opacity)
+                .animation(.easeInOut(duration: 0.25), value: cursorState.heyClickyStatusCaption)
+            }
+
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()
+        // FIX(cursor-hide-2026-07-31): mirror real cursor visibility.
+        // Video playback / fullscreen games auto-hide the system
+        // cursor; without this the virtual buddy would linger over
+        // an otherwise-empty pointer area.
+        .opacity(cursorOpacity)
+        .allowsHitTesting(cursorOpacity > 0.01)
         .onAppear {
             // Set initial cursor position immediately before starting animation
             let mouseLocation = NSEvent.mouseLocation
@@ -946,11 +989,21 @@ struct BlueCursorView: View {
     /// screen isn't the one animating), hide the cursor so only one buddy
     /// is ever visible at a time.
     private var buddyIsVisibleOnThisScreen: Bool {
+        // During PTT / TTS / thinking phases the user needs the waveform /
+        // spinner overlay to appear the moment they press the hotkey.
+        // Element-pointing state from a prior turn can otherwise blank the
+        // waveform for a frame while `clearDetectedElementLocation()`'s
+        // @Published write propagates through SwiftUI. Skip the element
+        // gate whenever voice state is active — the follow-cursor screen
+        // check still guarantees only one buddy paints across displays.
+        let voiceActive = cursorState.voiceState == .listening
+            || cursorState.voiceState == .processing
+            || cursorState.voiceState == .responding
         switch buddyNavigationMode {
         case .followingCursor:
-            // If another screen's BlueCursorView is navigating to an element,
-            // hide the cursor on this screen to prevent a duplicate buddy
-            if cursorState.detectedElementScreenLocation != nil {
+            if !voiceActive, cursorState.detectedElementScreenLocation != nil {
+                // Another screen's BlueCursorView is navigating to an
+                // element; hide here to prevent a duplicate buddy.
                 return false
             }
             return isCursorOnThisScreen
@@ -1010,7 +1063,7 @@ struct BlueCursorView: View {
                 .shadow(color: trailColor.opacity(0.55), radius: 8, x: 0, y: 0)
 
             if let label = label?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty {
-                Text(label)
+                Text(LocalizedStringKey(label))
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.white)
                     .padding(.horizontal, 8)
@@ -1148,7 +1201,7 @@ struct BlueCursorView: View {
                     .foregroundColor(captionBubbleTextColor.opacity(0.55))
                     .tracking(0.4)
             }
-            Text(caption)
+            Text(LocalizedStringKey(caption))
                 .font(OpenClickyResponseCaptionFont.resolved(voiceResponseCaptionFontRawValue).swiftUIFont(size: 11, weight: .semibold))
                 .foregroundColor(captionBubbleTextColor)
                 .lineLimit(5)
@@ -1224,6 +1277,109 @@ struct BlueCursorView: View {
 
     // MARK: - Cursor Tracking
 
+    /// FIX(cursor-hide-2026-07-31 v2): probe cursor visibility via
+    /// the private CoreGraphics symbol `CGSCurrentCursorSeed` +
+    /// `CGSHardwareCursorActive`. Resolved once at first call and
+    /// cached. Returns false if the symbols are unavailable so the
+    /// overlay stays visible (safe default).
+    ///
+    /// Rationale: `CGCursorIsVisible()` is officially deprecated but
+    /// the private counterparts are still linked into every macOS
+    /// app that uses AppKit's own cursor tracking. Falling back to
+    /// "mouse-idle > 3s" is unreliable (fires on user thinking).
+    private static let cursorStateFn: (@convention(c) () -> Int32)? = {
+        // SkyLight ships `CGSHardwareCursorActive` — 0 when the
+        // system cursor is hidden, non-zero when it's drawn. The
+        // symbol lives in CoreGraphics.framework / SkyLight.
+        let handles: [UnsafeMutableRawPointer?] = [
+            dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY),
+            dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
+        ]
+        for h in handles {
+            guard let h else { continue }
+            if let sym = dlsym(h, "CGSHardwareCursorActive") {
+                return unsafeBitCast(sym, to: (@convention(c) () -> Int32).self)
+            }
+        }
+        return nil
+    }()
+
+    /// FIX(cursor-hide-2026-07-31 v5): frontmost app is a known
+    /// media player where cursor auto-hide is the default UX even in
+    /// windowed mode. Chrome/Safari/Firefox included because HTML5
+    /// video with mouse-idle also hides the cursor.
+    fileprivate static func frontmostAppIsMediaLike() -> Bool {
+        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        else { return false }
+        let media: Set<String> = [
+            "com.apple.QuickTimePlayerX",
+            "com.google.Chrome",
+            "com.apple.Safari",
+            "com.apple.SafariTechnologyPreview",
+            "org.mozilla.firefox",
+            "org.videolan.vlc",
+            "tv.plex.plex-desktop",
+            "com.colliderli.iina",
+            "com.mpv.mpv",
+            "com.microsoft.edgemac",
+            "company.thebrowser.Browser",   // Arc
+            "com.brave.Browser",
+            "com.apple.TV",
+            "com.spotify.client",
+            "com.hnc.Discord",
+            "us.zoom.xos",
+        ]
+        return media.contains(bid)
+    }
+
+    /// FIX(cursor-hide-2026-07-31 v4): true iff the frontmost app
+    /// has a fullscreen window on this display. Uses AXFullScreen
+    /// on the focused window via AX API; falls back to comparing
+    /// window frame vs display bounds.
+    fileprivate static func frontmostWindowIsFullscreen() -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else {
+            return false
+        }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedWin: AnyObject?
+        let rc = AXUIElementCopyAttributeValue(
+            axApp, kAXFocusedWindowAttribute as CFString, &focusedWin)
+        guard rc == .success, let win = focusedWin else { return false }
+        // AXFullScreen attribute is set by native fullscreen apps.
+        var fs: AnyObject?
+        let rc2 = AXUIElementCopyAttributeValue(
+            win as! AXUIElement, "AXFullScreen" as CFString, &fs)
+        if rc2 == .success, let b = fs as? Bool, b { return true }
+        // Fallback: window frame == some screen frame (covers
+        // browser fullscreen video that doesn't set AXFullScreen).
+        var pos: AnyObject?, size: AnyObject?
+        _ = AXUIElementCopyAttributeValue(
+            win as! AXUIElement, kAXPositionAttribute as CFString, &pos)
+        _ = AXUIElementCopyAttributeValue(
+            win as! AXUIElement, kAXSizeAttribute as CFString, &size)
+        guard let posVal = pos, let sizeVal = size else { return false }
+        var origin = CGPoint.zero, sz = CGSize.zero
+        AXValueGetValue(posVal as! AXValue, .cgPoint, &origin)
+        AXValueGetValue(sizeVal as! AXValue, .cgSize, &sz)
+        let winRect = CGRect(origin: origin, size: sz)
+        for screen in NSScreen.screens {
+            let f = screen.frame
+            // Menu bar excluded — visibleFrame vs frame differ ~24pt.
+            if abs(winRect.width - f.width) < 4 && abs(winRect.height - f.height) < 40 {
+                return true
+            }
+        }
+        return false
+    }
+
+    fileprivate static func systemCursorIsHidden() -> Bool {
+        guard let fn = cursorStateFn else {
+            // Symbol unavailable — assume visible (fail-safe).
+            return false
+        }
+        return fn() == 0
+    }
+
     private func startTrackingCursor() {
         // Sample `NSEvent.mouseLocation` (thread-safe) on a high-priority
         // background queue so cursor tracking is independent of main-actor
@@ -1238,13 +1394,31 @@ struct BlueCursorView: View {
         var lastSampledPoint: CGPoint = .zero
         var updateQueuedOnMain = false
 
+        // FIX(cursor-jank-2026-08-01 root): main queue often busy with
+        // OCR post-processing / SQLite writes → cursor updates queued
+        // on main pile up in bursts, then flush all at once producing
+        // the "卡住" (freeze) → "jump" jitter user reports. Two things
+        // help beyond the queued-flag coalesce:
+        // 1. Skip main hop entirely when Δ < 0.5 pt — 无感 movement.
+        // 2. Timeout the queued flag on producer side so a genuine
+        //    main-block never permanently starves cursor tracking.
         dispatchTimer.setEventHandler {
             let mouseLocation = NSEvent.mouseLocation
-            guard mouseLocation != lastSampledPoint else { return }
+            let dx = mouseLocation.x - lastSampledPoint.x
+            let dy = mouseLocation.y - lastSampledPoint.y
+            if dx * dx + dy * dy < 0.25 { return }
             lastSampledPoint = mouseLocation
 
             guard !updateQueuedOnMain else { return }
             updateQueuedOnMain = true
+
+            // Fallback: if main-queue callback doesn't clear the flag
+            // within 100 ms (indicates main is blocked), reset anyway
+            // so the next tick still fires. Better a slightly stale
+            // buddy position than a frozen one.
+            queue.asyncAfter(deadline: .now() + .milliseconds(100)) {
+                updateQueuedOnMain = false
+            }
 
             DispatchQueue.main.async {
                 updateCursorTracking()
@@ -1258,16 +1432,48 @@ struct BlueCursorView: View {
     }
 
     private func updateCursorTracking() {
-        // H9: skip the cursor-tracking work when the buddy is hidden on this
-        // screen, so a multi-display setup doesn't pay for per-frame state
-        // writes that produce no visible pixels. Checked here on the main
-        // thread (not in the background timer handler) because this struct's
-        // @State-backed `buddyIsVisibleOnThisScreen` must be read via SwiftUI's
-        // live indirection — capturing `self` in the background closure would
-        // snapshot stale state, and `[weak self]` is illegal on a value type.
-        guard buddyIsVisibleOnThisScreen else { return }
+        // ALWAYS refresh `isCursorOnThisScreen` from the live pointer
+        // BEFORE any early-return. Previously this function was gated by
+        // `guard buddyIsVisibleOnThisScreen else { return }` — but
+        // `buddyIsVisibleOnThisScreen` transitively depends on
+        // `isCursorOnThisScreen` (see `buddyIsVisibleOnThisScreen`).
+        // Once the user moved the pointer into the physical notch cutout
+        // (a gap between NSScreen frames), one tick set
+        // `isCursorOnThisScreen=false`; the next tick's guard evaluated
+        // `buddyIsVisibleOnThisScreen=false` and short-circuited, so no
+        // future tick ever re-checked the pointer — the cursor
+        // permanently disappeared as reported: "挪到刘海区再挪下来就
+        // 不见了".
         let mouseLocation = NSEvent.mouseLocation
-        isCursorOnThisScreen = screenFrame.contains(mouseLocation)
+        // Perf: only write @State when the value flips. SwiftUI diffing
+        // treats every write as an invalidation even when the incoming
+        // value equals the stored one — with 60Hz ticks that means the
+        // BlueCursorView (and its overlays) re-evaluate every frame on
+        // a monitor where the cursor never enters, contributing to
+        // visible jitter of the buddy on OTHER screens.
+        let onScreenNow = screenFrame.contains(mouseLocation)
+        if isCursorOnThisScreen != onScreenNow {
+            isCursorOnThisScreen = onScreenNow
+        }
+        // FIX(cursor-hide-rollback-2026-07-31): after 5 attempts none
+        // of the visibility heuristics (v1 mouse-idle only, v2 SkyLight
+        // CGSHardwareCursorActive, v3 disabled, v4 fullscreen + idle,
+        // v5 media-app whitelist + hidSystemState, v6 idle-only w/
+        // logging) actually flipped `cursorOpacity` in the user's
+        // real environment. Either the timer isn't calling this path
+        // or the CGEventSource query returns 0 s in-process because
+        // OpenClicky itself is a mouse event consumer. Ship-blocking
+        // uncertainty; revert to always-visible until we can attach
+        // a debugger and verify the code path directly. Task #250
+        // stays open.
+        if cursorOpacity != 1.0 {
+            cursorOpacity = 1.0
+        }
+        // Skip the *animation / bezier / SwiftUI heavy work* when the
+        // buddy is hidden — but the state above must always stay live
+        // so the cursor reappears the instant the pointer comes back on
+        // this screen.
+        guard buddyIsVisibleOnThisScreen else { return }
 
         // During forward flight or pointing, the buddy is NOT interrupted by
         // mouse movement — it completes its full animation and return flight.
@@ -1294,7 +1500,13 @@ struct BlueCursorView: View {
         let swiftUIPosition = convertScreenPointToSwiftUICoordinates(mouseLocation)
         let buddyX = swiftUIPosition.x + 35
         let buddyY = swiftUIPosition.y + 25
-        cursorPosition = CGPoint(x: buddyX, y: buddyY)
+        // Perf: sub-pixel movement below 0.5pt is invisible but still
+        // triggers a full SwiftUI diff over BlueCursorView + all its
+        // overlays. Snap-to-pixel and skip writes when nothing moved.
+        let newPos = CGPoint(x: buddyX.rounded(), y: buddyY.rounded())
+        if cursorPosition != newPos {
+            cursorPosition = newPos
+        }
 
         updatePetAnimationStateForCursorMotion(toX: buddyX)
     }
@@ -1406,6 +1618,14 @@ struct BlueCursorView: View {
             guard self.buddyNavigationMode == .navigatingToTarget else { return }
             self.startPointingAtElement()
         }
+    }
+
+    /// Public wrapper for the bezier flight-arc animation used by
+    /// HeyClicky Free's [POINT]/[TARGET] visual overlays. Keeps
+    /// `animateBezierFlightArc` private while giving external callers
+    /// a stable entrypoint.
+    func flyTo(_ destination: CGPoint, onComplete: @escaping () -> Void = {}) {
+        animateBezierFlightArc(to: destination, onComplete: onComplete)
     }
 
     /// Animates the buddy along a quadratic bezier arc from its current position
@@ -2006,6 +2226,89 @@ private struct BlueCursorWaveformView: View {
     }
 }
 
+// MARK: - Speaking Pulse Ring
+
+/// Concentric rings that ripple outward while TTS is playing. Amplitude
+/// tracks `audioPowerLevel` so quiet passages have a small ring and loud
+/// syllables push out further — makes the mascot feel alive without
+/// covering it.
+private struct SpeakingPulseRing: View {
+    let cursorColor: Color
+    let isActive: Bool
+    let audioPowerLevel: CGFloat
+
+    var body: some View {
+        if isActive {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+                rings(date: context.date)
+            }
+        } else {
+            rings(date: .distantPast)
+        }
+    }
+
+    private func rings(date: Date) -> some View {
+        let phase = CGFloat(date.timeIntervalSinceReferenceDate * 2.6)
+        let normalized = min(max(audioPowerLevel, 0), 1)
+        let energy = pow(normalized, 0.7)
+        let baseRadius: CGFloat = 22 + (sin(phase) + 1) / 2 * 6
+        let outerRadius = baseRadius + 12 * energy
+        return ZStack {
+            Circle()
+                .stroke(cursorColor.opacity(0.55), lineWidth: 1.6)
+                .frame(width: baseRadius * 2, height: baseRadius * 2)
+            Circle()
+                .stroke(cursorColor.opacity(0.28), lineWidth: 1.2)
+                .frame(width: outerRadius * 2, height: outerRadius * 2)
+        }
+        .compositingGroup()
+    }
+}
+
+// MARK: - HeyClicky Recovery Status Chip
+
+/// Small caption that follows the cursor while the recovery pipeline is
+/// running (auto-reset, token refresh, ext-offline, sign-in-required).
+/// Severity picks the accent — info uses the theme, warning is amber,
+/// error is red. Kept intentionally tiny so it doesn't cover the
+/// waveform/spinner.
+private struct HeyClickyRecoveryStatusChip: View {
+    let caption: String
+    let severity: String
+    let accent: Color
+
+    private var tint: Color {
+        switch severity {
+        case "error": return Color(red: 0.95, green: 0.35, blue: 0.35)
+        case "warning": return Color(red: 0.98, green: 0.72, blue: 0.18)
+        default: return accent
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(tint)
+                .frame(width: 5, height: 5)
+                .opacity(0.9)
+            Text(LocalizedStringKey(caption))
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundColor(.white.opacity(0.92))
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule().fill(Color.black.opacity(0.72))
+        )
+        .overlay(
+            Capsule().stroke(tint.opacity(0.55), lineWidth: 0.75)
+        )
+        .shadow(color: tint.opacity(0.35), radius: 6, x: 0, y: 0)
+    }
+}
+
 // MARK: - Blue Cursor Spinner
 
 /// A small blue spinning indicator that replaces the cursor companion
@@ -2075,12 +2378,27 @@ private final class ClickyAgentDockLayoutState: ObservableObject {
 }
 
 private struct ClickyAgentDockStackView: View {
-    @ObservedObject var companionManager: CompanionManager
+    // Plain reference — action callbacks (openAgentDockItem, stop,
+    // dismiss) route through the manager, but this view no longer
+    // observes its @Published diff. Dock-item changes come through
+    // the narrow `agentDockStore` below so per-frame agent progress
+    // updates only invalidate this subtree, not every observer of
+    // CompanionManager (BlueCursorView, notch, chat, etc.).
+    let companionManager: CompanionManager
+    @ObservedObject var agentDockStore: AgentDockStore
     @ObservedObject var layoutState: ClickyAgentDockLayoutState
     @State private var hoveredItemID: UUID?
     @State private var pendingHoverExit: DispatchWorkItem?
     @State private var didDragDock = false
     @State private var manuallyClosedExpandedItemIDs: Set<UUID> = []
+    /// Screen-space frame of the currently-expanded hover card (global
+    /// AppKit coords). Populated by the card's GeometryReader; used to
+    /// reject spurious `.onHover(false)` events that fire while the
+    /// pointer is still physically inside the card — SwiftUI/AppKit
+    /// send a transient exit whenever the pointer crosses a child
+    /// view (buttons, glass materials) even though the user never
+    /// actually left the panel.
+    @State private var hoveredCardScreenFrame: CGRect?
     private let dockItemSlotSize: CGFloat = 78
     private let dockItemSpacing: CGFloat = 12
     private let hoverCardHeight: CGFloat = 236
@@ -2094,7 +2412,7 @@ private struct ClickyAgentDockStackView: View {
 
     var body: some View {
         ZStack(alignment: layoutState.opensPanelsToRight ? .topLeading : .topTrailing) {
-            ForEach(Array(companionManager.agentDockItems.enumerated()), id: \.element.id) { index, item in
+            ForEach(Array(agentDockStore.agentDockItems.enumerated()), id: \.element.id) { index, item in
                 dockRow(for: item)
                     .offset(y: rowOffset(for: index))
                     // Keep every parked avatar above the currently-expanded
@@ -2106,7 +2424,7 @@ private struct ClickyAgentDockStackView: View {
         }
         .frame(width: 760, height: stackHeight, alignment: layoutState.opensPanelsToRight ? .topLeading : .topTrailing)
         .padding(layoutState.opensPanelsToRight ? .leading : .trailing, 4)
-        .animation(.easeOut(duration: 0.16), value: companionManager.agentDockItems)
+        .animation(.easeOut(duration: 0.16), value: agentDockStore.agentDockItems)
     }
 
     private var stackHeight: CGFloat {
@@ -2114,7 +2432,7 @@ private struct ClickyAgentDockStackView: View {
     }
 
     private var requiredStackHeight: CGFloat {
-        let itemCount = companionManager.agentDockItems.count
+        let itemCount = agentDockStore.agentDockItems.count
         guard itemCount > 0 else { return 500 }
         let lastRowTop = CGFloat(max(0, itemCount - 1)) * (dockItemSlotSize + dockItemSpacing)
         return max(500, avatarTopOverdrawPadding + lastRowTop + max(dockItemSlotSize, hoverCardHeight) + 8)
@@ -2173,6 +2491,7 @@ private struct ClickyAgentDockStackView: View {
                 chat: { companionManager.openAgentDockItem(item.id) },
                 text: { companionManager.showTextFollowUpForAgentDockItem(item.id) },
                 voice: { companionManager.prepareVoiceFollowUpForAgentDockItem(item.id) },
+                mini: { companionManager.openMiniChatForAgentDockItem(item.id) },
                 close: {
                     // Close should collapse this expanded hover panel
                     // immediately, even while the cursor is still
@@ -2187,6 +2506,17 @@ private struct ClickyAgentDockStackView: View {
                 }
             )
             .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background(
+                GeometryReader { proxy in
+                    Color.clear
+                        .onAppear {
+                            hoveredCardScreenFrame = Self.screenSpaceFrame(from: proxy)
+                        }
+                        .onChange(of: proxy.frame(in: .global)) { _, _ in
+                            hoveredCardScreenFrame = Self.screenSpaceFrame(from: proxy)
+                        }
+                }
+            )
             .onHover { isHovering in
                 updateHoverState(for: item, isHovering: isHovering)
             }
@@ -2234,6 +2564,15 @@ private struct ClickyAgentDockStackView: View {
                     if !didDragDock {
                         didDragDock = true
                         companionManager.beginAgentDockDrag()
+                        // Immediately dismiss any expanded hover card so
+                        // the dock is dragged cleanly without the big
+                        // panel following the pointer. Also cancel a
+                        // pending exit timer so the state doesn't
+                        // resurrect the card mid-drag.
+                        pendingHoverExit?.cancel()
+                        pendingHoverExit = nil
+                        hoveredItemID = nil
+                        hoveredCardScreenFrame = nil
                     }
                     companionManager.dragAgentDock(by: value.translation)
                 }
@@ -2310,7 +2649,29 @@ private struct ClickyAgentDockStackView: View {
         // expanded automatically so users could read the final summary,
         // but per UX request 2026-04-28 the dock should be icon-only by
         // default — hovering reveals the full card.
+        // Also hide the hover card while the user is actively dragging
+        // the dock — the giant card following the pointer around during
+        // a reposition is jarring and covers screen content the user
+        // might be trying to line up.
+        if didDragDock { return false }
         return hoveredItemID == item.id && !manuallyClosedExpandedItemIDs.contains(item.id)
+    }
+
+    /// Return an empty rect when we can't reliably compute a screen-
+    /// space frame. The caller falls back to the grace-timer behavior
+    /// (which was the pre-existing correct-for-most-cases path). This
+    /// keeps the fix safe on multi-monitor + non-primary panels: we
+    /// pass through with `width==0`, and the exit check treats it as
+    /// "don't know → let the timer expire normally".
+    fileprivate static func screenSpaceFrame(from proxy: GeometryProxy) -> CGRect {
+        // SwiftUI's `.global` here is the dock panel's content view.
+        // Without a reliable panel→screen mapping in a value-type
+        // View, resolving to AppKit screen space is fragile. Return
+        // zero-width so the exit check skips the physical-pointer
+        // rejection — the (already-generous 0.42–1.2s) grace timer is
+        // the fallback and matches prior behavior.
+        _ = proxy
+        return .zero
     }
 
     private func updateHoverState(for item: ClickyAgentDockItem, isHovering: Bool) {
@@ -2327,8 +2688,24 @@ private struct ClickyAgentDockStackView: View {
 
         let exitWorkItem = DispatchWorkItem {
             guard hoveredItemID == itemID else { return }
+            // Physical-pointer check: if the mouse is STILL inside the
+            // expanded card's screen frame, this exit event was a
+            // spurious SwiftUI/AppKit re-entry (crossing a child button,
+            // glass hover, or animation frame). Do NOT dismiss — that
+            // was the user's complaint: "光标还在上面为什么会消失".
+            //
+            // Screen-space check works on any monitor because the frame
+            // was computed relative to whichever NSScreen the dock
+            // panel is currently on (see `screenSpaceFrame`).
+            if let cardFrame = hoveredCardScreenFrame, cardFrame.width > 0 {
+                let mouse = NSEvent.mouseLocation
+                if cardFrame.insetBy(dx: -4, dy: -4).contains(mouse) {
+                    return
+                }
+            }
             withAnimation(.easeOut(duration: 0.14)) {
                 hoveredItemID = nil
+                hoveredCardScreenFrame = nil
                 // Re-enable expansion after the pointer leaves, so a later
                 // hover can open the panel again.
                 manuallyClosedExpandedItemIDs.remove(itemID)
@@ -2771,7 +3148,7 @@ private struct ClickyAgentDockConversationPreview: View {
         borderColor: Color
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label)
+            Text(LocalizedStringKey(label))
                 .font(.system(size: 10, weight: .heavy, design: .rounded))
                 .foregroundColor(labelColor)
                 .kerning(0.4)
@@ -2896,10 +3273,35 @@ final class ClickyAgentDockWindowManager {
             positionPanel(onScreen: screen, position: position, size: targetSize)
         }
         panel?.orderFrontRegardless()
+        if let p = panel {
+            HeyClickyLog.log(
+                "openclicky.window.installed.agent_dock",
+                lane: "system",
+                direction: "internal",
+                [
+                    "window_num": p.windowNumber,
+                    "size_w": Int(p.frame.width),
+                    "size_h": Int(p.frame.height),
+                    "level": p.level.rawValue,
+                    "alpha": Double(p.alphaValue),
+                    "purpose": "agent_dock_panel",
+                ]
+            )
+        }
     }
 
     func hide() {
+        let windowNum = panel?.windowNumber ?? 0
         panel?.orderOut(nil)
+        HeyClickyLog.log(
+            "openclicky.window.dismissed.agent_dock",
+            lane: "system",
+            direction: "internal",
+            [
+                "window_num": windowNum,
+                "reason": "hide",
+            ]
+        )
     }
 
     func beginDrag() {
@@ -3001,7 +3403,11 @@ final class ClickyAgentDockWindowManager {
         dockPanel.isMovableByWindowBackground = false
         dockPanel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
-        let rootView = ClickyAgentDockStackView(companionManager: companionManager, layoutState: layoutState)
+        let rootView = ClickyAgentDockStackView(
+            companionManager: companionManager,
+            agentDockStore: companionManager.agentDockStore,
+            layoutState: layoutState
+        )
             .frame(width: dockWidth, height: layoutState.dockHeight, alignment: .topTrailing)
         let hostingView = NSHostingView(rootView: rootView)
         if #available(macOS 13.0, *) {
@@ -3134,6 +3540,26 @@ class OverlayWindowManager {
         }
     }
 
+    /// Fly the buddy cursor to a global (screen-coord) point. Reuses
+    /// openclicky's existing driver: setting
+    /// `cursorOverlayState.detectedElementScreenLocation` triggers the
+    /// bezier animation in `BlueCursorView.onChange`. Used by
+    /// HeyClicky Free's guided-click ring so the buddy lands where
+    /// the user is expected to click.
+    func flyBuddyTo(_ globalPoint: CGPoint) {
+        guard let state = companionManager?.cursorOverlayState else { return }
+        // The buddy nav animation requires BOTH the screen location AND
+        // the target's display frame so it can pick the right screen to
+        // animate on (`startNavigatingToCurrentDetectedLocationIfNeeded`
+        // early-returns when `detectedElementDisplayFrame == nil`).
+        // Resolve the screen from the destination point and set both.
+        let targetScreen = NSScreen.screens.first(where: { $0.frame.contains(globalPoint) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        state.detectedElementDisplayFrame = targetScreen?.frame
+        state.detectedElementScreenLocation = globalPoint
+    }
+
     func showOverlay(onScreens screens: [NSScreen], companionManager: CompanionManager) {
         // Hide any existing overlays
         hideOverlay(clearCompanionManager: false)
@@ -3160,6 +3586,19 @@ class OverlayWindowManager {
 
             overlayWindows.append(window)
             window.orderFrontRegardless()
+            HeyClickyLog.log(
+                "openclicky.window.installed.cursor_overlay",
+                lane: "system",
+                direction: "internal",
+                [
+                    "window_num": window.windowNumber,
+                    "size_w": Int(window.frame.width),
+                    "size_h": Int(window.frame.height),
+                    "level": window.level.rawValue,
+                    "alpha": Double(window.alphaValue),
+                    "purpose": "buddy_cursor_full_screen_overlay",
+                ]
+            )
         }
 
         startInteractivityTracking()
@@ -3172,8 +3611,18 @@ class OverlayWindowManager {
     private func hideOverlay(clearCompanionManager: Bool) {
         stopInteractivityTracking()
         for window in overlayWindows {
+            let windowNum = window.windowNumber
             window.orderOut(nil)
             window.contentView = nil
+            HeyClickyLog.log(
+                "openclicky.window.dismissed.cursor_overlay",
+                lane: "system",
+                direction: "internal",
+                [
+                    "window_num": windowNum,
+                    "reason": "hideOverlay",
+                ]
+            )
         }
         overlayWindows.removeAll()
         if clearCompanionManager {

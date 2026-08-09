@@ -29,6 +29,16 @@ enum ChatWorkspaceArchiveStore {
     let createdAt: Date?
     let latestActivityAt: Date?
     let wasRelaunchResumeCandidate: Bool?
+    // Active-turn continuation state — mirrors HeyClicky-1.0.42's
+    // `CodexActiveTaskSnapshot`. If the server-side lease is still
+    // within `leaseExpiresAt` when the app restarts, we can resume by
+    // sending `turn/steer` with this turnId and pay 0 new quota.
+    // Nil for sessions that never had an active turn or that
+    // completed cleanly. All three MUST be present together for the
+    // steer path to fire on restore.
+    let activeTurnID: String?
+    let activeLeaseID: String?
+    let leaseExpiresAt: Date?
   }
 
   private static let key = "openClickyArchivedSessions"
@@ -73,7 +83,10 @@ enum ChatWorkspaceArchiveStore {
       lastSubmittedPrompt: session.lastSubmittedPromptText,
       createdAt: session.createdAt,
       latestActivityAt: session.latestActivityDate,
-      wasRelaunchResumeCandidate: false
+      wasRelaunchResumeCandidate: false,
+      activeTurnID: session.activeTurnID,
+      activeLeaseID: session.activeLeaseID,
+      leaseExpiresAt: session.leaseExpiresAt
     )
 
     snapshotPersistenceQueue.async {
@@ -113,7 +126,10 @@ enum ChatWorkspaceArchiveStore {
         lastSubmittedPrompt: session.lastSubmittedPromptText,
         createdAt: session.createdAt,
         latestActivityAt: session.latestActivityDate,
-        wasRelaunchResumeCandidate: session.isRelaunchResumeCandidate
+        wasRelaunchResumeCandidate: session.isRelaunchResumeCandidate,
+        activeTurnID: session.activeTurnID,
+        activeLeaseID: session.activeLeaseID,
+        leaseExpiresAt: session.leaseExpiresAt
       )
     }
     try? OpenClickyJSONFileStore.write(snapshots, to: relaunchableSnapshotsFileURL)
@@ -175,8 +191,10 @@ final class MiniChatPanelManager: NSObject {
     )
 
     // Standard window chrome — title bar + traffic lights, just smaller.
+    let defaultWidth: CGFloat = 640
+    let defaultHeight: CGFloat = 720
     let panel = NSPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
+      contentRect: NSRect(x: 0, y: 0, width: defaultWidth, height: defaultHeight),
       styleMask: [.titled, .closable, .miniaturizable, .resizable, .utilityWindow],
       backing: .buffered,
       defer: false
@@ -189,7 +207,7 @@ final class MiniChatPanelManager: NSObject {
     panel.isMovableByWindowBackground = false
     OpenClickyWindowLevels.applyPanelDialogLevel(to: panel)
     panel.collectionBehavior = [.fullScreenAuxiliary]
-    panel.hasShadow = true
+    panel.hasShadow = false
     panel.minSize = NSSize(width: 320, height: 400)
     OpenClickyLiquidGlassWindowSurface.install(
       hostingView: hosting,
@@ -199,12 +217,24 @@ final class MiniChatPanelManager: NSObject {
       strength: .expanded
     )
 
-    if let screen = NSScreen.openClickyActiveInteractionScreen() {
-      let visibleFrame = screen.visibleFrame.isEmpty ? screen.frame : screen.visibleFrame
-      let x = visibleFrame.maxX - 380 - 24
-      let y = visibleFrame.maxY - 520 - 24
-      panel.setFrameOrigin(NSPoint(x: x, y: y))
+    // Persist position + size across launches so the user only has to
+    // arrange the mini panel once. NSWindow's built-in frame autosave
+    // writes to UserDefaults (key = autosave name) and re-reads on the
+    // NEXT setFrameUsingName call. We share one key across all
+    // sessions — position matters, not per-session identity.
+    let autosaveKey = "OpenClickyMiniChatPanelFrame"
+    panel.setFrameAutosaveName("")
+    if !panel.setFrameUsingName(autosaveKey) {
+      // First time on this machine: center on the active screen.
+      if let screen = NSScreen.openClickyActiveInteractionScreen() {
+        let visibleFrame = screen.visibleFrame.isEmpty ? screen.frame : screen.visibleFrame
+        let x = visibleFrame.midX - defaultWidth / 2
+        let y = visibleFrame.midY - defaultHeight / 2
+        panel.setFrame(NSRect(x: x, y: y, width: defaultWidth, height: defaultHeight),
+                       display: false)
+      }
     }
+    panel.setFrameAutosaveName(autosaveKey)
 
     let delegate = MiniChatPanelDelegate { [weak self] in self?.close(sessionID: session.id) }
     panel.delegate = delegate
@@ -254,14 +284,14 @@ private struct MiniChatPanelView: View {
       Circle()
         .fill(DS.Colors.accentText.opacity(0.7))
         .frame(width: 8, height: 8)
-      Text(session.title)
-        .font(.system(size: 12, weight: .semibold))
+      Text(LocalizedStringKey(session.title))
+        .font(.system(size: 15, weight: .semibold))
         .foregroundColor(DS.Colors.textPrimary)
         .lineLimit(1)
       Spacer()
       Button(action: close) {
         Image(systemName: "xmark")
-          .font(.system(size: 10, weight: .semibold))
+          .font(.system(size: 13, weight: .semibold))
           .foregroundColor(DS.Colors.textSecondary)
       }
       .buttonStyle(.plain)
@@ -290,7 +320,7 @@ private struct MiniChatPanelView: View {
     HStack(spacing: 8) {
       TextField("Reply…", text: $draft, axis: .vertical)
         .textFieldStyle(.plain)
-        .font(.system(size: 12))
+        .font(.system(size: 14))
         .foregroundColor(DS.Colors.textPrimary)
         .lineLimit(1...4)
         .fixedSize(horizontal: false, vertical: true)
@@ -315,7 +345,7 @@ private struct MiniChatPanelView: View {
         }
       Button(action: send) {
         Image(systemName: "arrow.up.circle.fill")
-          .font(.system(size: 20))
+          .font(.system(size: 24))
           .foregroundColor(DS.Colors.accentText)
       }
       .buttonStyle(.plain)
@@ -337,13 +367,26 @@ private struct MiniChatBubble: View {
   let entry: CodexTranscriptEntry
 
   var body: some View {
+    switch entry.role {
+    case .command:
+      commandRow
+    case .system:
+      systemRow
+    case .plan:
+      planRow
+    case .user, .assistant:
+      chatRow
+    }
+  }
+
+  private var chatRow: some View {
     HStack {
       if entry.role == .user { Spacer(minLength: 24) }
       Text(entry.text)
-        .font(.system(size: 12))
+        .font(.system(size: 14))
         .foregroundColor(DS.Colors.textPrimary)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
         .background(
           RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(entry.role == .user
@@ -352,6 +395,55 @@ private struct MiniChatBubble: View {
         )
       if entry.role != .user { Spacer(minLength: 24) }
     }
+  }
+
+  /// Codex HUD renders `.command` entries in a monospaced font
+  /// (`CodexHUDWindowManager.swift:791`). Match that here so the tool
+  /// call badges look identical across surfaces.
+  private var commandRow: some View {
+    HStack(alignment: .top, spacing: 6) {
+      Image(systemName: entry.text.hasPrefix("←") ? "checkmark.circle" : "wrench.and.screwdriver")
+        .font(.system(size: 11, weight: .medium))
+        .foregroundColor(DS.Colors.textSecondary)
+        .padding(.top, 2)
+      Text(entry.text)
+        .font(.system(size: 12, weight: .medium, design: .monospaced))
+        .foregroundColor(DS.Colors.textPrimary)
+        .lineLimit(4)
+        .textSelection(.enabled)
+      Spacer(minLength: 0)
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 6)
+    .background(
+      RoundedRectangle(cornerRadius: 6, style: .continuous)
+        .fill(Color.white.opacity(0.03))
+    )
+  }
+
+  private var systemRow: some View {
+    HStack {
+      Spacer()
+      Text(entry.text)
+        .font(.system(size: 11))
+        .foregroundColor(DS.Colors.textSecondary.opacity(0.75))
+        .italic()
+      Spacer()
+    }
+    .padding(.vertical, 4)
+  }
+
+  private var planRow: some View {
+    Text(entry.text)
+      .font(.system(size: 13, weight: .medium))
+      .foregroundColor(DS.Colors.textSecondary)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+          .fill(DS.Colors.accentText.opacity(0.06))
+      )
   }
 }
 

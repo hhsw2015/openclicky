@@ -66,10 +66,10 @@ struct ClickyPermissionGuideSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(viewState.headline)
+                Text(LocalizedStringKey(viewState.headline))
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
-                Text(viewState.summary)
+                Text(LocalizedStringKey(viewState.summary))
                     .font(.system(size: 10))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -83,11 +83,11 @@ struct ClickyPermissionGuideSection: View {
                             .foregroundColor(step.status == .granted ? DS.Colors.success : DS.Colors.warning)
                             .frame(width: 15)
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(step.title)
+                            Text(LocalizedStringKey(step.title))
                                 .font(.system(size: 11, weight: .semibold))
                                 .foregroundColor(DS.Colors.textSecondary)
                             if viewState.primaryStep?.kind == step.kind {
-                                Text(step.detail)
+                                Text(LocalizedStringKey(step.detail))
                                     .font(.system(size: 9))
                                     .foregroundColor(DS.Colors.textTertiary)
                                     .lineLimit(2)
@@ -235,6 +235,15 @@ struct ClickyResponseCardCompactView: View {
     var card: ClickyResponseCard
     var actionHandlers = ClickyResponseCardActionHandlers()
 
+    /// SKI-parity: `openclicky.ski.tapToDismiss` UserDefault. When on
+    /// (SKI default), clicking anywhere on the card body dismisses it
+    /// even outside the small × button. The dedicated buttons above
+    /// still work regardless. Read once per render — a change in
+    /// Settings takes effect on next card show.
+    private var tapToDismissEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "openclicky.ski.tapToDismiss") as? Bool) ?? true
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 10) {
@@ -294,6 +303,10 @@ struct ClickyResponseCardCompactView: View {
                 }
                 .frame(maxHeight: 220, alignment: .top)
                 .mask(ClickyResponseCardScrollFadeMask())
+            }
+
+            if !card.widgets.isEmpty {
+                HeyClickyWidgetSlotView(widgets: card.widgets)
             }
 
             if !openableLinks.isEmpty {
@@ -370,6 +383,14 @@ struct ClickyResponseCardCompactView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.white.opacity(0.10), lineWidth: 1)
         )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Tap-to-dismiss (SKI-parity, task #313). Only fires when
+            // toggle is on; the explicit × button + suggestion buttons
+            // still route through their own onTap handlers.
+            guard tapToDismissEnabled, let dismiss = actionHandlers.dismiss else { return }
+            dismiss()
+        }
     }
 
 
@@ -400,7 +421,7 @@ struct ClickyResponseCardCompactView: View {
                     Image(systemName: systemImageName)
                         .font(.system(size: 10, weight: .semibold))
                 }
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 10, weight: .semibold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
@@ -444,7 +465,7 @@ struct ClickyHandoffQueueView: View {
                 Text("Handoff")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(DS.Colors.textSecondary)
-                Text(subtitle)
+                Text(LocalizedStringKey(subtitle))
                     .font(.system(size: 10))
                     .foregroundColor(DS.Colors.textTertiary)
                     .lineLimit(1)

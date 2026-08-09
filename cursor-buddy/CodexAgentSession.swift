@@ -234,9 +234,161 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
     let id: UUID
     let createdAt: Date
     let accentTheme: OpenClickyCore.ClickyAccentTheme
+
+    /// SKI-Mode shim marker. When non-nil the session is a lightweight
+    /// facade over a file-bridge CLI agent — no codex daemon behind it.
+    /// Contains (workspace path, upstream SKI session id) so
+    /// submitPromptFromUI can post text via OpenClickyFileBridge.
+    var skiBridge: (workspace: String, skiSessionID: String)? = nil
+
+    /// Force the shim to appear in the "Active" agents list even
+    /// before its first entry arrives. Without this, the main panel
+    /// filters out shim sessions (hasVisibleActivity=false when both
+    /// entries and status are empty) and the Chat button opens an
+    /// empty panel until the first tts.speak arrives.
+    func forceVisibleForSKIShim() {
+        if status == .stopped {
+            status = .ready
+        }
+    }
+
+    /// Update Codex-facing state fields for the SKI shim so the UI's
+    /// dock caption, activity lines, progress dot, and status summary
+    /// all render the same way as a real Codex session.
+    func updateSKIShimState(
+        status newStatus: CodexAgentSessionStatus?,
+        progressStage newStage: CodexAgentProgressStage?,
+        activityStatus: String?
+    ) {
+        if let newStatus, newStatus != status {
+            status = newStatus
+        }
+        if let newStage, newStage != progressStage {
+            progressStage = newStage
+        }
+        if let activityStatus, !activityStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var lines = activityStatusLines
+            if lines.last != activityStatus {
+                lines.append(activityStatus)
+                if lines.count > 40 { lines.removeFirst(lines.count - 40) }
+                activityStatusLines = lines
+            }
+        }
+    }
+
+    /// Directly assign transcript entries. Used by SKI shims to mirror
+    /// SKIModeConversationStore messages without going through the
+    /// codex process manager.
+    func setEntriesForSKIShim(_ newEntries: [CodexTranscriptEntry]) {
+        entries = newEntries
+        if !newEntries.isEmpty && status == .stopped {
+            status = .ready
+        }
+        let roleCounts = Dictionary(grouping: newEntries, by: { "\($0.role)" }).mapValues { $0.count }
+        let rolesStr = roleCounts.map { "\($0.key):\($0.value)" }.sorted().joined(separator: ",")
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice",
+            direction: "internal",
+            event: "openclicky.ski.shim_set_entries",
+            fields: [
+                "shim_id": id.uuidString.prefix(8).description,
+                "total": "\(newEntries.count)",
+                "roles": rolesStr
+            ]
+        )
+    }
+
+    /// Bypass codex process spawning for SKI shim sessions and forward
+    /// user text through the file bridge. Called by submitPromptFromUI
+    /// when skiBridge is set.
+    private func submitPromptViaSKIBridge(_ prompt: String) {
+        guard let bridge = skiBridge else { return }
+        entries.append(CodexTranscriptEntry(role: .user, text: prompt))
+        let workspaceURL = URL(fileURLWithPath: bridge.workspace)
+        // Route via CompanionManager so the utterance carries the same
+        // rich `context` (LTM/xlb/stash/window/mcp URL+token/hints)
+        // that the voice-response pipeline builds. Direct file-bridge
+        // call here would ship only raw text and rob the CLI of the
+        // capabilities the AI-response path enjoys.
+        NotificationCenter.default.post(
+            name: Notification.Name("com.openclicky.ski.textSubmitFromMiniChat"),
+            object: nil,
+            userInfo: [
+                "text": prompt,
+                "workspace": workspaceURL.path
+            ]
+        )
+    }
     @Published private(set) var status: CodexAgentSessionStatus = .stopped
     @Published private(set) var entries: [CodexTranscriptEntry] = []
     @Published private(set) var activeThreadID: String?
+    /// The current active turn id, learned from codex's `turn/started`
+    /// notification. Non-nil ONLY when a turn is actively running.
+    /// Cleared on turn/completed/failed. Used to route in-flight
+    /// follow-ups through `turn/steer` (0 quota) instead of
+    /// `turn/start` (new lease = +1 quota).
+    @Published private(set) var activeTurnID: String?
+    /// Objective queued by external caller (automation start) to be
+    /// set as the thread's durable goal at preamble completion.
+    /// Consumed once; cleared after use so re-runs don't overwrite
+    /// a goal that may have been manually adjusted.
+    internal var pendingThreadGoalObjective: String?
+    /// Server-side lease id from the last record-agent-launch response.
+    /// Non-nil ONLY while the lease has not been server-marked complete.
+    /// Persisted so restart can attempt turn/steer against the same
+    /// lease if it hasn't expired yet — 0 quota resume across app
+    /// crashes.
+    @Published private(set) var activeLeaseID: String?
+    /// Server-side lease expiry deadline. If Date() < leaseExpiresAt
+    /// on restore, we can still steer that turn.
+    @Published private(set) var leaseExpiresAt: Date?
+
+    /// True while `heyClickyFreePreamble` is actively running. The
+    /// credentials-refreshed observer checks this to avoid firing a
+    /// rekey that would race with, and destroy, the lease we're in
+    /// the middle of acquiring.
+    @Published internal var preambleInProgress: Bool = false
+
+    internal func setActiveLease(id: String?, expiresAt: Date?) {
+        activeLeaseID = id
+        leaseExpiresAt = expiresAt
+    }
+    /// Setter accessible to extension files (`+HeyClicky`) so they can
+    /// null the thread after teardown without breaking encapsulation.
+    func setActiveThreadID(_ id: String?) { activeThreadID = id }
+
+    /// Consolidated lifecycle log. Every meaningful state transition
+    /// (lease acquired, turn started, turn steered, turn completed,
+    /// lease released, memory restored) goes through this so `grep -E
+    /// codex.lifecycle` gives a linear timeline of what happened, why,
+    /// and how much quota it cost. Callers should keep the `action`
+    /// tag short and the `reason` line human-readable.
+    internal func logLifecycle(
+        action: String,
+        reason: String,
+        extra: [String: Any] = [:]
+    ) {
+        var payload: [String: Any] = [
+            "action": action,
+            "reason": reason,
+            "lease_prefix": String((activeLeaseID ?? currentHeyClickyLease?.leaseID ?? "-").prefix(8)),
+            "thread_prefix": String((activeThreadID ?? "-").prefix(8)),
+            "turn_prefix": String((activeTurnID ?? "-").prefix(8)),
+            "session_id_prefix": String(id.uuidString.prefix(8))
+        ]
+        for (k, v) in extra { payload[k] = v }
+        HeyClickyLog.log("codex.lifecycle", lane: "agent",
+                         direction: "internal", payload)
+    }
+
+    /// When the current thread has to be torn down (credentials refresh
+    /// / codex crash / turn-limit / quota reset), stash the prior
+    /// thread_id here so the next `heyClickyFreePreamble.launchThread`
+    /// can pass it back to the proxy for **thread resumption**. This is
+    /// what keeps the conversation continuous across an account reset:
+    /// the proxy re-hydrates message history from the old thread_id
+    /// onto the new account. Cleared once a fresh thread starts.
+    var pendingThreadResumeID: String?
     @Published private(set) var lastErrorMessage: String?
     @Published private(set) var latestResponseCard: ClickyResponseCard?
     @Published private(set) var stopReason: String?
@@ -256,6 +408,31 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
     @Published var specialistAgentSlug: String? = nil
     @Published var workingDirectoryPath: String = UserDefaults.standard.string(forKey: "clickyCodexWorkingDirectory")
         ?? FileManager.default.homeDirectoryForCurrentUser.path
+    /// F26 HIGH #1 substrate — set by `RouteDispatcher.spawnCodex` via
+    /// `CompanionManager.startVoiceAgentTask` when the Fable classifier
+    /// reports `progress_driven=true`. The F28 auto-continue observer
+    /// (Task #203, separate landing) will poll `<workdir>/progress.md`
+    /// and re-fire this session's turn until `completionMarker` appears.
+    /// F26 only propagates the fields; no observer is wired here.
+    @Published var progressDriven: Bool = false
+    /// Completion marker string the agent is instructed to write into
+    /// its progress file. When `progressDriven=true` and the parser did
+    /// not supply an explicit marker, callers substitute the
+    /// `AGENTS-longrun-template.md` default ("LAST_COMPLETED: DONE").
+    @Published var completionMarker: String? = nil
+    /// Optional project reference and slug carried on the [ROUTE] tag
+    /// so downstream tooling (progress observer, dock title, archival
+    /// notes) can attribute the session without re-parsing the prompt.
+    @Published var routeProjectRef: String? = nil
+    @Published var routeSlug: String? = nil
+    /// Openclicky task-planning contract substrate. When set, the child
+    /// codex process receives them as `OPENCLICKY_TASK_DIR` and
+    /// `OPENCLICKY_TASK_PROGRESS` env vars; AGENTS-longrun-template.md
+    /// tells codex to glob the directory and drive PROGRESS.md to
+    /// `LAST_COMPLETED: DONE`. Set by RouteDispatcher via
+    /// CompanionManager.dispatchRoutedAgentTask.
+    @Published var taskDir: String? = nil
+    @Published var taskProgressPath: String? = nil
     /// Browser-origin tasks carry only an origin and user goal, but retain a
     /// restricted execution policy as defense in depth if future context is
     /// added to that handoff.
@@ -389,7 +566,16 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
     }
 
     var canResumeAfterRelaunch: Bool {
-        wasRestoredAfterRelaunch && lastSubmittedPrompt != nil && !isTurnActiveForChatQueue
+        guard wasRestoredAfterRelaunch,
+              lastSubmittedPrompt != nil,
+              !isTurnActiveForChatQueue else { return false }
+        // Restored interrupted tasks, including HeyClicky Free tasks, get one
+        // automatic resume attempt per app run. CompanionManager records the
+        // session ID in `autoResumedRelaunchSessionIDs` before dispatch, so the
+        // periodic checker cannot spend another turn on the same restoration.
+        // The persisted `wasRelaunchResumeCandidate` flag still prevents
+        // completed or intentionally stopped sessions from being restarted.
+        return true
     }
 
     var isRelaunchResumeCandidate: Bool {
@@ -430,6 +616,10 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         lastSubmittedPrompt
     }
     private var currentLeasePaths: [String] = []
+    /// HeyClicky Free lease active for the current agent turn.
+    /// nil when running under BYOK / non-HeyClicky provider.
+    /// Accessed by `CodexAgentSession+HeyClicky.swift`.
+    var currentHeyClickyLease: HeyClickyTurnLease?
     private static let codexRuntimeCompatibilityFallbackModel = "gpt-5.4-mini"
     private static let assistantDeltaFlushDelayNanoseconds: UInt64 = 180_000_000
 
@@ -492,10 +682,51 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         status = archivedEntries.isEmpty ? .stopped : .ready
     }
 
-    func restoreInterruptedRelaunchState(entries restoredEntries: [CodexTranscriptEntry], activeThreadID restoredThreadID: String?, lastSubmittedPrompt restoredPrompt: String?, canResume: Bool = true) {
+    func restoreInterruptedRelaunchState(entries restoredEntries: [CodexTranscriptEntry],
+                                          activeThreadID restoredThreadID: String?,
+                                          lastSubmittedPrompt restoredPrompt: String?,
+                                          canResume: Bool = true,
+                                          restoredActiveTurnID: String? = nil,
+                                          restoredLeaseID: String? = nil,
+                                          restoredLeaseExpiresAt: Date? = nil) {
         stop(reason: "restored_after_relaunch")
         entries = restoredEntries
         activeThreadID = restoredThreadID
+        // NEVER restore activeTurnID across app restart. codex daemon
+        // is a new process — its in-memory activeTasks is empty.
+        // Sending turn/steer with a persisted turnId would be
+        // rejected by the new daemon ("no active turn to steer") and
+        // we'd fall back to turn/start (+1 quota wasted). Only the
+        // thread_id is a server-side concept and safe to keep.
+        // Note: leaseExpiresAt is kept for OBSERVABILITY only —
+        // useful in log to understand whether the server-side lease
+        // has expired, but never used as a steer decision input.
+        activeTurnID = nil
+        activeLeaseID = nil
+        leaseExpiresAt = nil
+        if restoredActiveTurnID != nil {
+            HeyClickyLog.log("codex.lease_not_restored_after_restart",
+                             lane: "agent", direction: "internal", [
+                "reason": "codex_daemon_reset",
+                "hadPersistedTurn": true,
+                "persistedExpiresIn": Int(restoredLeaseExpiresAt?.timeIntervalSinceNow ?? 0)
+            ])
+        }
+        // Stash the pre-restart thread_id so the next preamble sends
+        // `clicky_agent_thread_resumed:true + thread_id` to the proxy
+        // and the SAME server-side conversation is re-hydrated on the
+        // new codex process. Without this, restarting mid-task creates
+        // a brand-new backend thread and the assistant has no memory
+        // of the prior exchange (user's report: "他的这种记忆有没有
+        // 丢失呢？是不是在同一个设想里面呢？" — before this fix, yes,
+        // memory was lost across restart).
+        if let restoredThreadID, !restoredThreadID.isEmpty {
+            pendingThreadResumeID = restoredThreadID
+            HeyClickyLog.log("codex.thread_stashed_for_relaunch_resume",
+                             lane: "agent", direction: "internal", [
+                "thread_prefix": String(restoredThreadID.prefix(8))
+            ])
+        }
         lastSubmittedPrompt = restoredPrompt
         latestResponseCard = nil
         queuedFollowUpPrompts.removeAll()
@@ -515,7 +746,15 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
             "\(entry.role.rawValue): \(Self.spokenSnippet(from: entry.text, maxLength: 900))"
         }.joined(separator: "\n\n")
         wasRestoredAfterRelaunch = false
+        // Preserve the thread_id across app relaunch — the next preamble
+        // will pass it via `is_follow_up: true` so proxy re-hydrates the
+        // prior conversation history. Without this stash, restored
+        // sessions lose their cross-app-restart memory.
+        if let existing = activeThreadID, !existing.isEmpty {
+            pendingThreadResumeID = existing
+        }
         activeThreadID = nil
+        activeTurnID = nil
         submitPromptFromUI("""
         Resume this OpenClicky Agent Mode task after an app relaunch.
 
@@ -533,12 +772,200 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        // SKI shim sessions have no codex daemon — text is delivered
+        // to the external CLI agent through the file bridge instead.
+        if skiBridge != nil {
+            submitPromptViaSKIBridge(trimmed)
+            return
+        }
+
+        // Three-way dispatch (IDA HeyClicky-1.0.42 sub_1007B4688 launchTask):
+        //   [1] steerTask  — active turn exists → turn/steer (0 quota)
+        //   [2] resumeThread — thread known but no active turn → thread/resume + turn/start
+        //   [3] submitTask — brand-new thread → thread/start + turn/start
+        //
+        // Only [1] is free. Route the follow-up through turn/steer when
+        // codex has an active turn we can inject into. This maximizes
+        // per-quota output and prevents wasting a whole new turn on a
+        // trivial follow-up.
+        if isTurnActiveForChatQueue,
+           let turnID = activeTurnID, !turnID.isEmpty,
+           let threadID = activeThreadID, !threadID.isEmpty,
+           model.hasPrefix("heyclicky-free-") {
+            steerActiveTurn(with: trimmed, turnID: turnID, threadID: threadID)
+            return
+        }
+
         if isTurnActiveForChatQueue {
             queueFollowUp(trimmed)
             return
         }
 
         startPromptTurn(trimmed, screenContext: screenContext)
+    }
+
+    /// Set the thread's long-running OBJECTIVE. codex daemon injects
+    /// this into every subsequent model call so the model stays on
+    /// task across many turns (stronger than prompt-level "章程").
+    /// IDA HeyClicky-1.0.42 does NOT use this method — it's a codex
+    /// daemon feature that HeyClicky hasn't adopted yet, giving us a
+    /// drift-prevention edge.
+    /// - Parameters:
+    ///   - objective: the durable goal text (e.g. "Build todo-cli
+    ///     with 30 files per TASK.md; do not scope-creep").
+    ///   - tokenBudget: optional hard budget per turn. codex will
+    ///     compact/stop when a turn approaches this. Nil = server
+    ///     default.
+    func setThreadGoal(objective: String, tokenBudget: Int? = nil) async {
+        guard let threadID = activeThreadID, !threadID.isEmpty,
+              hasInitializedProcess else { return }
+        var params: [String: Any] = [
+            "threadId": threadID,
+            "objective": objective,
+            "status": "active"
+        ]
+        if let tb = tokenBudget { params["tokenBudget"] = tb }
+        do {
+            _ = try await processManager.sendRequest(method: "thread/goal/set", params: params)
+            HeyClickyLog.log("codex.thread_goal_set", lane: "agent",
+                             direction: "outgoing", [
+                "thread_prefix": String(threadID.prefix(8)),
+                "obj_len": objective.count,
+                "tokenBudget": tokenBudget ?? -1
+            ])
+        } catch {
+            HeyClickyLog.log("codex.thread_goal_set_failed", lane: "agent",
+                             direction: "error",
+                             ["error": String("\(error)".prefix(200))])
+        }
+    }
+
+    func clearThreadGoal() async {
+        guard let threadID = activeThreadID, !threadID.isEmpty,
+              hasInitializedProcess else { return }
+        do {
+            _ = try await processManager.sendRequest(method: "thread/goal/clear", params: [
+                "threadId": threadID
+            ])
+            HeyClickyLog.log("codex.thread_goal_cleared", lane: "agent",
+                             direction: "outgoing",
+                             ["thread_prefix": String(threadID.prefix(8))])
+        } catch {
+            HeyClickyLog.log("codex.thread_goal_clear_failed", lane: "agent",
+                             direction: "error",
+                             ["error": String("\(error)".prefix(200))])
+        }
+    }
+
+    /// Push context messages into thread history WITHOUT starting a
+    /// turn. Zero quota cost. Used for recovery scenarios: instead of
+    /// firing a "请继续之前的任务" replay (which turn/start = +1 quota),
+    /// inject the prior conversation as system context so the next
+    /// legitimate turn already has full context.
+    /// IDA HeyClicky-1.0.42 method: `thread/inject_items`.
+    /// Items are raw Responses API items — typical shape:
+    ///   {"type":"message","role":"user"|"assistant"|"system","content":[{"type":"input_text","text":"..."}]}
+    func injectContextItems(_ items: [[String: Any]], reason: String) async {
+        guard model.hasPrefix("heyclicky-free-"),
+              let threadID = activeThreadID, !threadID.isEmpty,
+              hasInitializedProcess,
+              !items.isEmpty else {
+            HeyClickyLog.log("codex.inject_items_skipped", lane: "agent",
+                             direction: "internal",
+                             ["reason": reason,
+                              "hasThread": activeThreadID?.isEmpty == false,
+                              "hasProcess": hasInitializedProcess])
+            return
+        }
+        HeyClickyLog.log("codex.inject_items_dispatch", lane: "agent",
+                         direction: "outgoing", [
+            "thread_prefix": String(threadID.prefix(8)),
+            "items_count": items.count,
+            "reason": reason
+        ])
+        do {
+            _ = try await processManager.sendRequest(method: "thread/inject_items", params: [
+                "threadId": threadID,
+                "items": items
+            ])
+            HeyClickyLog.log("codex.inject_items_ok", lane: "agent",
+                             direction: "incoming",
+                             ["thread_prefix": String(threadID.prefix(8))])
+        } catch {
+            HeyClickyLog.log("codex.inject_items_failed", lane: "agent",
+                             direction: "error",
+                             ["error": String("\(error)".prefix(200))])
+        }
+    }
+
+    /// Send a lightweight nudge into an active turn via `turn/steer`
+    /// (0-quota, same-lease continuation). Used by the watchdog when
+    /// a turn appears stuck to poke the model without killing codex.
+    /// No-op if no active turn/thread. Returns `true` if a nudge was
+    /// dispatched.
+    @discardableResult
+    func nudgeActiveTurn(reason: String) -> Bool {
+        guard let turnID = activeTurnID, !turnID.isEmpty,
+              let threadID = activeThreadID, !threadID.isEmpty else {
+            return false
+        }
+        let nudge = "[runtime nudge — \(reason)] You appear to be idle. Read PROGRESS.md and continue the next unchecked item. Chain tool calls. Do NOT summarize; do NOT ask questions; do NOT stop."
+        HeyClickyLog.log("codex.turn_nudge_dispatch", lane: "agent",
+                         direction: "outgoing", [
+            "reason": reason,
+            "turn_prefix": String(turnID.prefix(8)),
+            "thread_prefix": String(threadID.prefix(8))
+        ])
+        steerActiveTurn(with: nudge, turnID: turnID, threadID: threadID)
+        return true
+    }
+
+    private func steerActiveTurn(with prompt: String, turnID: String, threadID: String) {
+        logLifecycle(
+            action: "TURN_STEER_DISPATCHED",
+            reason: "reuse active turn (0 quota) instead of new turn",
+            extra: ["prompt_len": prompt.count]
+        )
+        HeyClickyLog.log("codex.turn_steer_dispatch", lane: "agent",
+                         direction: "outgoing", [
+            "thread_prefix": String(threadID.prefix(8)),
+            "turn_prefix": String(turnID.prefix(8)),
+            "prompt_len": prompt.count
+        ])
+        // Add to local transcript so UI mirrors what the model sees.
+        entries.append(CodexTranscriptEntry(role: .user, text: prompt))
+        lastSubmittedPrompt = prompt
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.processManager.sendRequest(method: "turn/steer", params: [
+                    "threadId": threadID,
+                    "expectedTurnId": turnID,
+                    "input": [
+                        ["type": "text", "text": prompt]
+                    ]
+                ])
+                HeyClickyLog.log("codex.turn_steer_ok", lane: "agent",
+                                 direction: "incoming", [
+                    "turn_prefix": String(turnID.prefix(8))
+                ])
+            } catch {
+                // Steer failed (turn ended between check + call, or codex
+                // rejected). Fall back to a fresh turn — expected during
+                // races. Kick startPromptTurn so the user's input isn't
+                // lost.
+                let msg = "\(error)"
+                HeyClickyLog.log("codex.turn_steer_failed_fallback",
+                                 lane: "agent", direction: "error",
+                                 ["error": String(msg.prefix(200))])
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.activeTurnID = nil
+                    self.startPromptTurn(prompt, screenContext: nil)
+                }
+            }
+        }
     }
 
     var isTurnActiveForChatQueue: Bool {
@@ -658,13 +1085,106 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
 
     @discardableResult
     func syncProviderConfigurationFromCurrentSettings() throws -> URL {
-        homeManager.workerBaseURL = ClickyCodexBackend.configuredWorkerBaseURL()
+        // HeyClicky Free lane MUST route codex at the heyclicky proxy
+        // (`.../agent/openai/v1`) with custom provider + apikey auth.
+        // If we let it fall back to the default OpenAI base URL, codex
+        // reads `~/.codex/auth.json` (ChatGPT tokens) and rejects
+        // heyclicky-free with "not supported when using Codex
+        // with a ChatGPT account". clicky-mac
+        // AgentSessionsBridge.swift:810-828 encodes the same rule.
+        if model.hasPrefix("heyclicky-free-"),
+           let proxyBase = try? AppBundleConfiguration.heyClickyProxyBaseURL() {
+            // Config template's openAICompatibleEndpoint appends "/v1",
+            // so we hand it the proxy root + "agent/openai" and end up
+            // with "<proxy>/agent/openai/v1" — the path the heyclicky
+            // proxy actually exposes to codex (clicky-mac config uses
+            // the exact same route).
+            let codexBase = proxyBase.appendingPathComponent("agent/openai", isDirectory: false)
+            homeManager.workerBaseURL = codexBase
+            HeyClickyLog.log("codex.config_worker_base_url", lane: "agent",
+                             direction: "internal", [
+                "stage": "S2_agent_process_launch",
+                "base_url": codexBase.absoluteString,
+                "reason": "heyclicky_lane_forces_proxy"
+            ])
+        } else {
+            homeManager.workerBaseURL = ClickyCodexBackend.configuredWorkerBaseURL()
+        }
         homeManager.model = model
         homeManager.reasoningEffort = UserDefaults.standard.string(forKey: "clickyCodexReasoningEffort") ?? homeManager.reasoningEffort
         return try homeManager.writeCodexConfigFromSettings()
     }
 
+    /// Insert a transcript row that originated from the remote
+    /// `/agent-messages` inbox (agent → client push). Skips duplicates
+    /// via the message id and preserves creation order. Called by
+    /// CompanionManager+HeyClicky after the long-poll returns.
+    func appendRemoteTranscriptEntry(role: CodexTranscriptEntry.Role, text: String, id: String) {
+        guard !text.isEmpty else {
+            HeyClickyLog.log("transcript.remote_skipped", lane: "agent", direction: "internal", [
+                "stage": "S4_message_ingress", "reason": "empty_text", "id": id
+            ])
+            return
+        }
+        if entries.contains(where: { $0.id == id }) {
+            HeyClickyLog.log("transcript.remote_dup", lane: "agent", direction: "internal", [
+                "stage": "S4_message_ingress", "id": id
+            ])
+            return
+        }
+        entries.append(CodexTranscriptEntry(
+            id: id,
+            role: role,
+            text: text,
+            createdAt: Date()
+        ))
+        HeyClickyLog.log("transcript.remote_appended", lane: "agent", direction: "internal", [
+            "stage": "S4_message_ingress",
+            "id": id,
+            "role": "\(role)",
+            "total_entries": entries.count
+        ])
+    }
+
     func stop(reason: String? = nil) {
+        // Clean turn end via turn/interrupt RPC before killing the
+        // daemon. Server-side lease is torn down cooperatively — the
+        // server marks the turn done, removes it from activeTasks,
+        // and (empirically) is friendlier about not double-billing on
+        // subsequent replay. Best-effort with a short timeout; if the
+        // RPC hangs (daemon dead / socket gone), fall through to
+        // process.stop() as before.
+        // IDA HeyClicky-1.0.42: RPC method is `turn/interrupt`,
+        // params `{threadId, turnId}`.
+        if let turnID = activeTurnID, let threadID = activeThreadID,
+           !turnID.isEmpty, !threadID.isEmpty,
+           hasInitializedProcess {
+            let capturedTurn = turnID
+            let capturedThread = threadID
+            let mgr = processManager
+            HeyClickyLog.log("codex.turn_interrupt_dispatch", lane: "agent",
+                             direction: "outgoing", [
+                "turn_prefix": String(capturedTurn.prefix(8)),
+                "reason": reason ?? "-"
+            ])
+            // Fire-and-forget with 2s cap so the stop() path stays
+            // responsive to UI.
+            Task.detached {
+                let interruptTask = Task {
+                    _ = try? await mgr.sendRequest(method: "turn/interrupt", params: [
+                        "threadId": capturedThread,
+                        "turnId": capturedTurn
+                    ])
+                }
+                let timeout = Task {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    interruptTask.cancel()
+                }
+                _ = await interruptTask.value
+                timeout.cancel()
+            }
+        }
+        heyClickyFreeTeardown(reason: reason)
         runGeneration &+= 1
         promptStartTask?.cancel()
         promptStartTask = nil
@@ -677,7 +1197,12 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         stopReason = reason
         processManager.stop()
         hasInitializedProcess = false
+        // Stash thread_id so a later replay can resume the same conversation.
+        if let existing = activeThreadID, !existing.isEmpty {
+            pendingThreadResumeID = existing
+        }
         activeThreadID = nil
+        activeTurnID = nil
         currentAssistantEntryID = nil
         currentLeasePaths = []
         status = .stopped
@@ -704,23 +1229,89 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
             }
 
             try requireCurrentRun(generation)
-            _ = try await processManager.sendRequest(method: "turn/start", params: [
-                "threadId": activeThreadID,
-                "input": [[
-                    "type": "text",
-                    "text": prompt,
-                    "text_elements": []
-                ]],
-                "cwd": workingDirectoryPath,
-                "approvalPolicy": executionApprovalPolicy,
-                "sandbox": executionSandboxMode,
-                "model": model,
-                "effort": homeManager.reasoningEffort,
-                "config": [
-                    "approval_policy": executionApprovalPolicy,
-                    "sandbox_mode": executionSandboxMode
-                ]
-            ])
+            // HeyClicky Free lane: turn/start params MUST carry
+            //   - `responsesapiClientMetadata` (4 clicky_agent_* fields)
+            //   - a `<clicky_agent_turn_lease_metadata>` prompt tag
+            //   - `sandboxPolicy: {type: "dangerFullAccess"}` object shape
+            //   - the real codex model id (`gpt-5.6-sol`), NOT the UI label
+            // Missing any of these = proxy HTTP 426 / codex_models_manager
+            // "Unsupported agent proxy path" / no assistantMessage emitted.
+            // IDA HeyClicky-1.0.40 literals at 0x1012a3730..0x1012a9340
+            // and clicky-mac CodexRPC.turnStart (:120-138) both encode
+            // exactly this shape.
+            if model.hasPrefix("heyclicky-free-"),
+               let lease = currentHeyClickyLease {
+                let leaseID = lease.leaseID
+                let turnID = lease.turnID
+                let taskID = UUID().uuidString.uppercased()
+                // Dispatch thread/goal/set right here — codex is
+                // spawned + initialized, activeThreadID committed,
+                // still BEFORE turn/start so the very first
+                // /responses call carries the goal. Only on the
+                // first turn of a new thread (not on follow-ups
+                // that reuse the same threadId).
+                if let objective = pendingThreadGoalObjective, !objective.isEmpty {
+                    await setThreadGoal(objective: objective, tokenBudget: 200_000)
+                    pendingThreadGoalObjective = nil
+                }
+                let metadataTag = "<clicky_agent_turn_lease_metadata>{\"clicky_agent_task_id\":\"\(taskID)\",\"clicky_agent_thread_id\":\"\(activeThreadID)\",\"clicky_agent_turn_id\":\"\(turnID)\",\"clicky_agent_turn_lease_id\":\"\(leaseID)\"}</clicky_agent_turn_lease_metadata>\n"
+                HeyClickyLog.log("codex.turn_start_dispatch", lane: "agent",
+                                 direction: "outgoing", [
+                    "stage": "S2_agent_process_launch",
+                    "model": ClickyCodexConfigTemplate.heyClickyRealCodexModel,
+                    "lease_prefix": String(leaseID.prefix(8)),
+                    "turn_prefix": String(turnID.prefix(8)),
+                    "task_prefix": String(taskID.prefix(8)),
+                    "prompt_len": prompt.count
+                ])
+                _ = try await processManager.sendRequest(method: "turn/start", params: [
+                    "threadId": activeThreadID,
+                    "sandboxPolicy": ["type": "dangerFullAccess"],
+                    "approvalPolicy": "never",
+                    "model": ClickyCodexConfigTemplate.heyClickyRealCodexModel,
+                    // `gpt-5.6-sol` is defined by codex with
+                    // `use_responses_lite = true`. The Responses-Lite
+                    // path REQUIRES `reasoning.context = "all_turns"` on
+                    // every turn — omitting it makes the proxy return
+                    //   X-OpenAI-Internal-Codex-Responses-Lite requires
+                    //   `reasoning.context` to be `all_turns`.
+                    // Value + effort fields are string literals baked
+                    // into the codex Rust source (found in the codex
+                    // binary at `all_turns`/`current_turn`).
+                    "reasoning": [
+                        "context": "all_turns",
+                        "effort": homeManager.reasoningEffort
+                    ],
+                    "responsesapiClientMetadata": [
+                        "clicky_agent_thread_id": activeThreadID,
+                        "clicky_agent_turn_id": turnID,
+                        "clicky_agent_task_id": taskID,
+                        "clicky_agent_turn_lease_id": leaseID
+                    ],
+                    "input": [[
+                        "type": "text",
+                        "text": metadataTag + prompt
+                    ]]
+                ])
+            } else {
+                _ = try await processManager.sendRequest(method: "turn/start", params: [
+                    "threadId": activeThreadID,
+                    "input": [[
+                        "type": "text",
+                        "text": prompt,
+                        "text_elements": []
+                    ]],
+                    "cwd": workingDirectoryPath,
+                    "approvalPolicy": executionApprovalPolicy,
+                    "sandbox": executionSandboxMode,
+                    "model": model,
+                    "effort": homeManager.reasoningEffort,
+                    "config": [
+                        "approval_policy": executionApprovalPolicy,
+                        "sandbox_mode": executionSandboxMode
+                    ]
+                ])
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -761,7 +1352,12 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
     private func restartProcessForCompatibilityFallback() {
         processManager.stop()
         hasInitializedProcess = false
+        // Preserve thread_id so next preamble can resume conversation.
+        if let existing = activeThreadID, !existing.isEmpty {
+            pendingThreadResumeID = existing
+        }
         activeThreadID = nil
+        activeTurnID = nil
     }
 
     private func isCurrentRun(_ generation: UInt64) -> Bool {
@@ -837,11 +1433,64 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
 
     private func ensureThread(for generation: UInt64) async throws {
         try requireCurrentRun(generation)
+        // Reuse everything if the codex child is still running with a
+        // known thread. This is the "same-lease multi-turn" fast path
+        // — no preamble, no record-agent-launch, no new credit. The
+        // caller (runPrompt) will still emit a turn/start RPC over
+        // the existing lease, which is 0 quota.
         if processManager.isRunning, activeThreadID != nil {
+            if currentHeyClickyLease != nil {
+                logLifecycle(
+                    action: "LEASE_REUSED_NO_NEW_CREDIT",
+                    reason: "codex alive + thread known + lease alive → next turn is 0 quota",
+                    extra: [:]
+                )
+            } else {
+                // Rare: thread known but lease already released. Turn/start
+                // will still work but this is worth flagging.
+                logLifecycle(
+                    action: "THREAD_ALIVE_BUT_LEASE_GONE",
+                    reason: "possible bug — thread survived but lease released; will 428 on turn/start",
+                    extra: [:]
+                )
+            }
             return
         }
 
         status = .starting
+
+        // HeyClicky Free preamble (spec §5.4). Fires only when the selected
+        // Codex agent model is a heyclicky-free-* entry. This is the SLOW
+        // path — it acquires a fresh lease (+1 credit). We only get here
+        // when the codex child died or the thread was torn down.
+        let didRunHeyClickyPreamble: Bool
+        if model.hasPrefix("heyclicky-free-") {
+            logLifecycle(
+                action: "PREAMBLE_STARTED_NEW_LEASE_INCOMING",
+                reason: "no reusable lease/thread — will spend +1 credit",
+                extra: [
+                    "had_process": processManager.isRunning,
+                    "had_thread": activeThreadID != nil,
+                    "had_lease": currentHeyClickyLease != nil,
+                    "has_resume_id": pendingThreadResumeID != nil
+                ]
+            )
+            try await heyClickyFreePreamble(generation: generation)
+            try requireCurrentRun(generation)
+            didRunHeyClickyPreamble = true
+        } else {
+            didRunHeyClickyPreamble = false
+        }
+        // Rollback marker: cleared on the success path just before the
+        // final `return` of ensureThread. If we exit with this still set,
+        // the downstream spawn didn't complete and the lease must be
+        // failed out.
+        var heyClickyPreambleNeedsRollback = didRunHeyClickyPreamble
+        defer {
+            if heyClickyPreambleNeedsRollback {
+                heyClickyFreeTeardown(reason: "ensure_thread_failed")
+            }
+        }
         let processManager = self.processManager
         let applicationSupportDirectory = homeManager.applicationSupportDirectory
         let workerBaseURL = homeManager.workerBaseURL
@@ -861,8 +1510,15 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         try requireCurrentRun(generation)
 
         let executable = try CodexRuntimeLocator.codexExecutableURL(bundle: .main)
+        let spawnTaskDir = self.taskDir
+        let spawnTaskProgressPath = self.taskProgressPath
         try await Task.detached(priority: .userInitiated) {
-            try processManager.start(executableURL: executable, codexHome: preparedLayout.homeDirectory)
+            try processManager.start(
+                executableURL: executable,
+                codexHome: preparedLayout.homeDirectory,
+                taskDir: spawnTaskDir,
+                taskProgressPath: spawnTaskProgressPath
+            )
         }.value
         try requireCurrentRun(generation)
 
@@ -909,11 +1565,18 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         \(ThreeDGenerationDispatcher.systemPromptInstruction)
         """
 
+        let isHeyClickyLane = model.hasPrefix("heyclicky-free-")
+        let effectiveModel = isHeyClickyLane
+            ? ClickyCodexConfigTemplate.heyClickyRealCodexModel
+            : model
+        let effectiveModelProvider = isHeyClickyLane
+            ? ClickyCodexConfigTemplate.heyClickyModelProviderID
+            : modelProviderID
         let threadStart: [String: Any]
         do {
             threadStart = try await processManager.sendRequest(method: "thread/start", params: [
-                "model": model,
-                "modelProvider": modelProviderID,
+                "model": effectiveModel,
+                "modelProvider": effectiveModelProvider,
                 "cwd": workingDirectoryPath,
                 "approvalPolicy": executionApprovalPolicy,
                 "sandbox": executionSandboxMode,
@@ -951,6 +1614,9 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
             activeThreadID = threadID
             status = .ready
             progressStage = .idle
+            // Success path: hand ownership of the lease off to the running
+            // session. The defer above will now do nothing.
+            heyClickyPreambleNeedsRollback = false
         } else {
             throw CodexRPCError(message: "Codex app-server did not return a thread id.")
         }
@@ -958,6 +1624,43 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
 
     private func ensureCodexAuthentication(for generation: UInt64) async throws {
         try requireCurrentRun(generation)
+
+        // HeyClicky Free lane: actively login with apiKey so codex writes
+        // its own auth.json inside our CodexHome (auth_mode:"apikey" +
+        // OPENAI_API_KEY:<heyclicky JWT>). Without this, codex reads the
+        // symlinked ChatGPT auth from ~/.codex/auth.json (or falls back
+        // to it) and rejects heyclicky-free with "not supported
+        // when using Codex with a ChatGPT account". The clicky-mac
+        // reverse-engineering notes captured this exact requirement.
+        if model.hasPrefix("heyclicky-free-") {
+            let apiKey = AppBundleConfiguration.openAIAPIKey() ?? ""
+            let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            HeyClickyLog.log("codex.login_apikey_starting", lane: "agent",
+                             direction: "internal", [
+                "stage": "S2_agent_process_launch",
+                "have_key": !trimmed.isEmpty,
+                "key_len": trimmed.count
+            ])
+            if !trimmed.isEmpty {
+                do {
+                    _ = try await processManager.sendRequest(
+                        method: "account/login/start",
+                        params: ["type": "apiKey", "apiKey": trimmed]
+                    )
+                    HeyClickyLog.log("codex.login_apikey_ok", lane: "agent",
+                                     direction: "incoming",
+                                     ["stage": "S2_agent_process_launch"])
+                } catch {
+                    HeyClickyLog.log("codex.login_apikey_failed", lane: "agent",
+                                     direction: "error", [
+                        "stage": "S2_agent_process_launch",
+                        "error": "\(error)"
+                    ])
+                }
+            }
+            return
+        }
+
         let modelProviderID = homeManager.modelProviderID
         guard modelProviderID == ClickyCodexConfigTemplate.defaultModelProviderID else { return }
         guard !codexConfigPrefersAPIKeyAuth() else { return }
@@ -984,6 +1687,243 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         throw CodexRPCError(message: "OpenClicky found no Codex ChatGPT login. Finish the Codex sign-in that just opened, then start the Agent task again.")
     }
 
+    /// Smart 402 handler. Refuses to burn a reset when the server
+    /// still has quota left — instead refreshes the access token and
+    /// re-keys the running codex. Only if `/me/plan` shows we are
+    /// actually at cap does it fall through to `attemptReset`.
+    func handle402MidChat(errorText: String) async {
+        let lower = errorText.lowercased()
+        // Classify: IDA HeyClicky-1.0.40 gives us the exact wire codes.
+        //   agent_turn_limit_exceeded (0x1012a9650) — one turn ran too
+        //     long; recover by dropping the stale lease and letting
+        //     the next follow-up acquire a fresh one, no reset needed.
+        //   session expired (0x1012ce6b2) — auth token stale;
+        //     refresh + rekey.
+        //   quota_exhausted (already in heartbeat whitelist) — real cap;
+        //     attemptReset via extension.
+        //   extra_usage_approval — turn cost cap; autoContinue.
+        if lower.contains("agent_turn_limit_exceeded") || lower.contains("turn limit") {
+            HeyClickyLog.log("codex.quota_402_route_turn_limit", lane: "agent",
+                             direction: "internal", [:])
+            // Stash thread for resume, tear down, and auto-continue.
+            // Without the auto-continue, user's reply is stranded.
+            if let existing = self.activeThreadID, !existing.isEmpty {
+                self.pendingThreadResumeID = existing
+            }
+            self.heyClickyFreeTeardown(reason: "agent_turn_limit_exceeded")
+            self.activeThreadID = nil
+            HeyClickyLog.log("codex.turn_limit_teardown_ok", lane: "agent",
+                             direction: "internal", [:])
+            // Post notification for CompanionManager to auto-send
+            // "请继续" — CodexAgentSession has no direct handle back
+            // to companion.submitAgentPrompt, but the app-level
+            // observer in CompanionManager+HeyClicky picks this up.
+            NotificationCenter.default.post(
+                name: .heyClickyRequestAutoContinueReplay,
+                object: nil,
+                userInfo: ["session_id": self.id.uuidString]
+            )
+            return
+        }
+        // agent_extra_effort_required: proxy wants approval to spend
+        // more of the $1.5 per-turn cost cap. HeyClicky.app auto
+        // approves by default. Fire /agent/turn-lease/{id}/continue
+        // with extra_usage_approval:true so codex's paused /responses
+        // stream resumes. No teardown, no thread reset — same turn
+        // keeps flowing.
+        if lower.contains("agent_extra_effort_required")
+            || lower.contains("extra_usage_approval")
+            || lower.contains("extra effort") {
+            HeyClickyLog.log("codex.quota_402_route_extra_effort", lane: "agent",
+                             direction: "internal",
+                             ["had_lease": currentHeyClickyLease != nil ? "yes" : "no"])
+            if let lease = currentHeyClickyLease {
+                do {
+                    try await HeyClickyTurnLeaseClient.shared.autoContinue(leaseID: lease.leaseID)
+                    HeyClickyLog.log("codex.extra_effort_approved", lane: "agent",
+                                     direction: "internal", [:])
+                } catch HeyClickyProxyError.quotaExhausted {
+                    // Proxy refused to approve extra usage because the
+                    // account is truly out of quota — escalate to
+                    // single-account reset (same email, re-auth via
+                    // Chrome ext to open a fresh 25-turn window).
+                    HeyClickyLog.log("codex.extra_effort_escalate_reset", lane: "agent",
+                                     direction: "internal", [
+                        "reason": "continue_returned_402_or_429"
+                    ])
+                    await MainActor.run {
+                        _ = HeyClickyAccountResetManager.shared.attemptReset(
+                            reason: "extra_effort_denied_quota_exhausted"
+                        )
+                    }
+                } catch {
+                    HeyClickyLog.log("codex.extra_effort_approve_failed", lane: "agent",
+                                     direction: "error", ["error": "\(error)"])
+                }
+            } else {
+                HeyClickyLog.log("codex.extra_effort_no_lease", lane: "agent",
+                                 direction: "error",
+                                 ["reason": "cannot_approve_without_lease"])
+            }
+            return
+        }
+        if lower.contains("session expired") || lower.contains("token expired")
+            || lower.contains("unauthorized") || lower.contains("401") {
+            HeyClickyLog.log("codex.quota_402_route_refresh_rekey", lane: "agent",
+                             direction: "internal", [:])
+            _ = try? await HeyClickySessionAuthenticator.shared.refresh()
+            // rekey happens automatically via .clickyHeyClickyCredentialsRefreshed observer
+            return
+        }
+        // Fall back to plan check — only reset if we ACTUALLY have no
+        // quota left. Blind reset destroys the conversation for a
+        // stale token that just needed a refresh.
+        let plan = await HeyClickyPlanClient.shared.refresh()
+        let atCap: Bool
+        if let plan {
+            atCap = plan.agentsUsed >= plan.agentsCap && plan.agentsCap > 0
+            HeyClickyLog.log("codex.quota_402_plan_check", lane: "agent", direction: "internal", [
+                "agents_used": plan.agentsUsed,
+                "agents_cap": plan.agentsCap,
+                "at_cap": atCap
+            ])
+        } else {
+            atCap = false
+            HeyClickyLog.log("codex.quota_402_plan_unknown", lane: "agent", direction: "internal", [
+                "assume": "not_at_cap_will_refresh"
+            ])
+        }
+        if atCap {
+            HeyClickyLog.log("codex.quota_402_route_reset", lane: "agent",
+                             direction: "internal", [:])
+            _ = HeyClickyAccountResetManager.shared.attemptReset(
+                reason: "quota_exhausted_402_midchat"
+            )
+        } else {
+            HeyClickyLog.log("codex.quota_402_route_refresh_rekey_default", lane: "agent",
+                             direction: "internal", [:])
+            _ = try? await HeyClickySessionAuthenticator.shared.refresh()
+        }
+    }
+
+    /// Rekey the still-running codex app-server after HeyClicky
+    /// refreshed the Supabase access token. Without this, codex keeps
+    /// sending the OLD JWT as `OPENAI_API_KEY` on every /responses call
+    /// and the proxy returns HTTP 402 forever — the user had to
+    /// force-relaunch (sign out+in) to unstick it.
+    /// Also releases the stale lease + nulls activeThreadID so the
+    /// next follow-up prompt re-runs `heyClickyFreePreamble` and
+    /// acquires a fresh lease against the new account. Without that,
+    /// after a full account reset the session keeps calling into a
+    /// dead thread on the old account and hangs forever.
+    func rekeyLiveCodexWithFreshJWT() async {
+        guard model.hasPrefix("heyclicky-free-") else { return }
+        // Prefer BYOK OpenAI key (if user has one); otherwise use the
+        // HeyClicky session JWT as the bearer, matching what
+        // CodexProcessManager injects at spawn. Previously this only
+        // read openAIAPIKey → in the pure heyclicky lane the key was
+        // always empty so rekey silently skipped and the live codex
+        // kept using its stale spawn-time JWT, causing 401 storms.
+        let byokKey = AppBundleConfiguration.openAIAPIKey()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // In the heyclicky lane the correct bearer for codex is the
+        // SHORT-LIVED per-account ephemeral minted via
+        // /agent/session-token, NOT the Supabase JWT. Force a fresh
+        // mint before rekey so a rekey after credentials refresh
+        // pushes the current ephemeral (else we send the same JWT
+        // that caused the 401 in the first place).
+        var ephemeral: String?
+        do {
+            ephemeral = try await HeyClickySessionTokenClient.shared.mintCodexToken(launchSource: .codex)
+        } catch {
+            HeyClickyLog.log("codex.rekey_ephemeral_mint_failed", lane: "agent",
+                             direction: "error", ["error": "\(error)"])
+        }
+        let apiKey: String
+        if let byokKey, !byokKey.isEmpty {
+            apiKey = byokKey
+        } else if let eph = ephemeral, !eph.isEmpty {
+            apiKey = eph
+        } else if let jwt = AppBundleConfiguration.heyClickySessionAccessToken()?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !jwt.isEmpty {
+            apiKey = jwt
+        } else {
+            HeyClickyLog.log("codex.rekey_skipped", lane: "agent", direction: "internal", [
+                "reason": "no_api_key_and_no_ephemeral_and_no_jwt"
+            ])
+            return
+        }
+        HeyClickyLog.log("codex.rekey_starting", lane: "agent", direction: "outgoing", [
+            "key_len": apiKey.count,
+            "had_thread": activeThreadID != nil ? "yes" : "no",
+            "had_lease": currentHeyClickyLease != nil ? "yes" : "no",
+            "process_running": processManager.isRunning
+        ])
+        // If codex is not running, there's nothing to rekey — the next
+        // preamble will spawn it fresh with the current JWT via env.
+        // Do NOT nuke thread/lease in this branch: there is nothing
+        // stale to invalidate, and clearing forces the next preamble
+        // to acquire a fresh lease (+1 credit wasted).
+        guard processManager.isRunning else {
+            HeyClickyLog.log("codex.rekey_skipped_not_running", lane: "agent",
+                             direction: "internal", [
+                "had_thread": activeThreadID != nil ? "yes" : "no",
+                "had_lease": currentHeyClickyLease != nil ? "yes" : "no"
+            ])
+            return
+        }
+
+        var rekeyOk = false
+        do {
+            _ = try await processManager.sendRequest(
+                method: "account/login/start",
+                params: ["type": "apiKey", "apiKey": apiKey]
+            )
+            HeyClickyLog.log("codex.rekey_ok", lane: "agent", direction: "incoming", [:])
+            rekeyOk = true
+        } catch {
+            HeyClickyLog.log("codex.rekey_failed", lane: "agent", direction: "error", [
+                "error": "\(error)"
+            ])
+        }
+
+        // ONLY nuke thread/lease if we actually rekeyed the running
+        // codex child — that's the exact case where the child now
+        // authenticates as a different upstream identity and any
+        // lease/thread bound to the old identity is dead. If the
+        // rekey call FAILED, the child is still on the old identity
+        // and its lease/thread are still valid, so keep them alive.
+        // Stashing the current thread_id lets the next
+        // launchThread send `thread_id + clicky_agent_thread_resumed:true`
+        // and the proxy resumes the SAME conversation on the new account.
+        if rekeyOk {
+            logLifecycle(
+                action: "LEASE_NUKED_BY_REKEY",
+                reason: "codex child re-authenticated with new identity — old lease dead — next submit spends +1 credit",
+                extra: [
+                    "stashed_for_resume": pendingThreadResumeID != nil,
+                    "resume_prefix": String((pendingThreadResumeID ?? "").prefix(8))
+                ]
+            )
+            if let existing = activeThreadID, !existing.isEmpty {
+                pendingThreadResumeID = existing
+            }
+            heyClickyFreeTeardown(reason: "credentials_refreshed")
+            activeThreadID = nil
+            activeTurnID = nil
+            HeyClickyLog.log("codex.thread_cleared_for_rekey", lane: "agent", direction: "internal", [
+                "stashed_for_resume": pendingThreadResumeID != nil ? "yes" : "no",
+                "resume_prefix": String((pendingThreadResumeID ?? "").prefix(8))
+            ])
+        } else {
+            HeyClickyLog.log("codex.rekey_keeping_thread_and_lease", lane: "agent",
+                             direction: "internal", [
+                "had_thread": activeThreadID != nil ? "yes" : "no",
+                "had_lease": currentHeyClickyLease != nil ? "yes" : "no"
+            ])
+        }
+    }
+
     private func codexConfigPrefersAPIKeyAuth() -> Bool {
         let configFile = homeManager.codexHomeDirectory.appendingPathComponent("config.toml", isDirectory: false)
         guard let configText = try? String(contentsOf: configFile, encoding: .utf8) else { return false }
@@ -1005,6 +1945,15 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         case "turn/started":
             status = .running
             progressStage = .starting
+            lastErrorMessage = nil
+            if let tid = CodexJSON.string(params["turnId"]) {
+                activeTurnID = tid
+            }
+            logLifecycle(
+                action: "TURN_STARTED",
+                reason: "codex daemon notified turn started",
+                extra: ["cost": "0_quota_within_current_lease"]
+            )
         case "item/agentMessage/delta":
             let itemID = CodexJSON.string(params["itemId"]) ?? UUID().uuidString
             let delta = CodexJSON.string(params["delta"]) ?? ""
@@ -1042,30 +1991,294 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
                 role: .command,
                 text: summary
             )
+        case "thread/status/changed":
+            // Codex daemon explicit thread lifecycle signal:
+            //   notLoaded | idle | systemError | active
+            // `active` carries `activeFlags`: waitingOnApproval or
+            // waitingOnUserInput. `waitingOnUserInput` is the true
+            // signal that the turn produced its response and is
+            // parked expecting a NEW user prompt. Log so upper
+            // layers can gate follow-up dispatch on this signal
+            // instead of guessing from progressStage.
+            if let statusDict = params["status"] as? [String: Any] {
+                let statusType = (statusDict["type"] as? String) ?? "?"
+                let flags = (statusDict["activeFlags"] as? [String]) ?? []
+                HeyClickyLog.log("codex.thread_status_changed", lane: "agent",
+                                 direction: "incoming", [
+                    "thread_prefix": String((params["threadId"] as? String ?? "").prefix(8)),
+                    "status": statusType,
+                    "flags": flags.joined(separator: ",")
+                ])
+                // If the turn is truly idle waiting on user, clear
+                // activeTurnID so the next submit takes the
+                // record-agent-launch path (a real new turn) — since
+                // turn/steer would be rejected with "no active turn."
+                // 500ms debounce: sometimes turn/completed arrives
+                // slightly AFTER status_changed=idle. If the user
+                // submits in that ~0.5s window, we still want to try
+                // steer (it's cheap to fail). Wait, then clear.
+                if statusType == "idle" || (statusType == "active" && flags.contains("waitingOnUserInput")) {
+                    if activeTurnID != nil {
+                        let currentTurn = activeTurnID
+                        Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                            guard let self else { return }
+                            // Only clear if it's STILL the same turn
+                            // — a new turn/started between now and
+                            // the 500ms mark means we should keep it.
+                            if self.activeTurnID == currentTurn {
+                                HeyClickyLog.log("codex.active_turn_cleared_by_status",
+                                                 lane: "agent", direction: "internal",
+                                                 ["reason": "\(statusType)/\(flags)",
+                                                  "delayed": "500ms"])
+                                self.activeTurnID = nil
+                            }
+                        }
+                    }
+                }
+            }
+        case "account/rateLimits/updated":
+            // Server-pushed per-account quota snapshot. Format from
+            // codex daemon: params.rateLimits is an array of buckets.
+            // Structure varies by upstream; log raw for now so we have
+            // observable data to decide when to preemptively swap
+            // accounts before hitting the hard 25/25 cap.
+            if let rl = params["rateLimits"] {
+                HeyClickyLog.log("codex.rate_limits_updated", lane: "agent",
+                                 direction: "incoming",
+                                 ["snapshot": String(describing: rl).prefix(300).description])
+            }
+        case "thread/tokenUsage/updated":
+            // Codex daemon reports running token usage per turn.
+            // total.input + total.output = cumulative token spent this
+            // turn. modelContextWindow = hard ceiling for this thread.
+            // Use as advisory quota signal — the closer to the ceiling
+            // we are, the more likely next /responses call will hit
+            // extra_effort_required or turn_limit_exceeded. We log it
+            // for observability; higher layers can decide to wrap up.
+            if let usage = params["tokenUsage"] as? [String: Any] {
+                let ctxWindow = (usage["modelContextWindow"] as? Int) ?? -1
+                var totalIn = -1, totalOut = -1
+                if let total = usage["total"] as? [String: Any] {
+                    totalIn = (total["input_tokens"] as? Int) ?? -1
+                    totalOut = (total["output_tokens"] as? Int) ?? -1
+                }
+                HeyClickyLog.log("codex.token_usage_updated", lane: "agent",
+                                 direction: "incoming", [
+                    "turn_prefix": String((params["turnId"] as? String ?? "").prefix(8)),
+                    "totalIn": totalIn,
+                    "totalOut": totalOut,
+                    "totalAll": (totalIn>0 && totalOut>0) ? totalIn+totalOut : -1,
+                    "ctxWindow": ctxWindow,
+                    "pctUsed": (ctxWindow>0 && totalIn>0 && totalOut>0)
+                                 ? String(format:"%.1f",Double(totalIn+totalOut)*100.0/Double(ctxWindow))
+                                 : "-"
+                ])
+            }
         case "turn/completed":
             flushPendingAssistantDeltas()
             currentAssistantEntryID = nil
             status = .ready
             progressStage = .completed
             persistCompletedTurnMemoryIfNeeded()
+            logLifecycle(
+                action: "TURN_COMPLETED",
+                reason: "codex emitted stop; lease may still be alive for next turn",
+                extra: [
+                    "lease_still_alive": currentHeyClickyLease != nil,
+                    "next_action_should_be": currentHeyClickyLease != nil
+                        ? "reuse_this_lease_for_next_turn_0_quota"
+                        : "acquire_new_lease_next_submit_1_quota"
+                ]
+            )
+            activeTurnID = nil
             Task { await OpenClickyAgentFileLeaseCoordinator.shared.releaseLeases(for: id) }
             currentLeasePaths = []
             if !queuedFollowUpPrompts.isEmpty {
                 let nextPrompt = queuedFollowUpPrompts.removeFirst()
                 startPromptTurn(nextPrompt, screenContext: nil)
             }
+            // F28 (Task #204) — progress-driven auto-continue.
+            // Sole trigger site for the progress-driven variant of
+            // .heyClickyRequestAutoContinueReplay: fire only after the
+            // model has cleanly ended a turn without writing the DONE
+            // marker to PROGRESS.md. The observer body in
+            // CompanionManager+HeyClicky treats `.completed` as
+            // fire-worthy iff `session.progressDriven == true` and the
+            // marker is absent — see the extended
+            // `hasInterruptedInFlightTurn` gate at
+            // CompanionManager+HeyClicky.swift ~ :404.
+            //
+            // Lane gate mirrors that observer (heyclicky-free-only) so
+            // Anthropic / OpenAI / Codex-direct sessions stay opt-out.
+            // Marker semantics (whole-line, case-sensitive, missing
+            // file => not done) are handled by OpenClickyProgressMarkerCheck.
+            if progressDriven,
+               !workingDirectoryPath.isEmpty,
+               model.hasPrefix("heyclicky-free-") {
+                let marker = completionMarker ?? "LAST_COMPLETED: DONE"
+                // Prefer the explicit task-progress path threaded through by
+                // RouteDispatcher (variant A writes to
+                // <workdir>/.openclicky/task/PROGRESS.md, NOT
+                // <workdir>/PROGRESS.md). Fall back to the workdir root only
+                // for legacy sessions that never had taskProgressPath set.
+                // See docs/ROADMAP/.review-notes/task-planning-pipeline-2026-07-23.md HIGH #2.
+                let progressPath: String
+                if let tp = taskProgressPath, !tp.isEmpty {
+                    progressPath = tp
+                } else {
+                    progressPath = (workingDirectoryPath as NSString)
+                        .appendingPathComponent("PROGRESS.md")
+                }
+                // Move the file read + regex off @MainActor. The check
+                // is pure (no shared state) so a detached task is safe;
+                // this prevents PROGRESS.md I/O from stalling the UI
+                // when disk is slow. See perf-audit 2026-07-23 MEDIUM #3.
+                let sessionIDString = id.uuidString
+                Task { [weak self] in
+                    let markerFound = await Task.detached {
+                        OpenClickyProgressMarkerCheck.isDone(
+                            path: progressPath,
+                            marker: marker
+                        )
+                    }.value
+                    guard self != nil else { return }
+                    HeyClickyLog.log(
+                        "openclicky.f28.progress_check",
+                        lane: "agent",
+                        direction: "internal",
+                        [
+                            "session_id_prefix": String(sessionIDString.prefix(8)),
+                            "progress_path": progressPath,
+                            "marker": marker,
+                            "marker_found": markerFound
+                        ]
+                    )
+                    if !markerFound {
+                        NotificationCenter.default.post(
+                            name: .heyClickyRequestAutoContinueReplay,
+                            object: nil,
+                            userInfo: [
+                                "session_id": sessionIDString,
+                                "source": "f28_progress_driven"
+                            ]
+                        )
+                    }
+                }
+            }
             // Chime intentionally NOT played here. CompanionManager owns
             // the audio choreography and plays the chime *after* any
             // in-flight TTS finishes, so the chime can't cut the
             // acknowledgement speech. See `playAgentDoneChimeAfterCurrentTTS`.
         case "error":
+            // Preserve the RAW error text (before user-facing wrapper)
+            // so status-code / error-string classifiers below can see
+            // "428", "agent_turn_lease_required", etc. The
+            // `userFacingErrorMessage` wrapper collapses those into
+            // friendly captions and loses the signal.
+            let rawErrorText = Self.notificationErrorMessage(from: params) ?? ""
             let text = Self.userFacingErrorMessage(
-                from: Self.notificationErrorMessage(from: params) ?? "Codex app-server emitted an error."
+                from: rawErrorText.isEmpty ? "Codex app-server emitted an error." : rawErrorText
             )
+            // Also mine `params.error` sub-dict directly — some codex
+            // versions put the numeric code under `error.code` /
+            // `error.status` that don't survive the readable-message
+            // extractor. Concatenate everything we can find.
+            var classifierText = rawErrorText
+            if let errDict = params["error"] as? [String: Any] {
+                for key in ["code", "status", "type", "message", "error"] {
+                    if let v = errDict[key] {
+                        classifierText += " \(v)"
+                    }
+                }
+            }
+            if let msgDict = params["message"] as? [String: Any] {
+                for key in ["code", "status", "type", "message"] {
+                    if let v = msgDict[key] {
+                        classifierText += " \(v)"
+                    }
+                }
+            }
+            let lowerClassifier = classifierText.lowercased()
+            // Persist the full server error text to the observability log
+            // so 402/429/quota/schema failures are diagnosable from the
+            // JSONL file. The paramsSummary path collapses this away.
+            HeyClickyLog.log("codex.rpc_error_text", lane: "agent", direction: "incoming", [
+                "stage": "S2_agent_process_launch",
+                "turn_prefix": String((params["turnId"] as? String ?? "").prefix(8)),
+                "errorRaw": String(text.prefix(400)),
+                "classifierText": String(classifierText.prefix(400)),
+                "raw_params_keys": params.keys.sorted().joined(separator: ",")
+            ])
+            // 402 mid-chat: HeyClicky proxy returns 402 for THREE
+            // different conditions and each needs a different fix:
+            //   a) auth token stale     → refresh + rekey codex (no
+            //                              reset — user still has quota)
+            //   b) turn cost cap        → auto-continue (extra_usage
+            //                              approval — user still has quota)
+            //   c) real quota exhausted → attempt account reset
+            // Blindly resetting on any 402 destroys the conversation
+            // when quota is still available (user's original complaint:
+            // "余额没用完不能直接重置吧").
+            if model.hasPrefix("heyclicky-free-"),
+               (classifierText.contains("402") || lowerClassifier.contains("payment required")
+                    || lowerClassifier.contains("quota") || lowerClassifier.contains("upgrade")
+                    || lowerClassifier.contains("agent_turn_limit")) {
+                HeyClickyLog.log("codex.quota_402_detected", lane: "agent", direction: "incoming", [
+                    "text_head": String(text.prefix(120))
+                ])
+                let capturedText = classifierText
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.handle402MidChat(errorText: capturedText)
+                }
+            }
+            // 428 Precondition Required + `agent_turn_lease_required`:
+            // codex hit `/responses` without a valid lease. This happens
+            // when the current lease was completed/failed but codex kept
+            // pushing to the same turn stream. Fix: teardown so the
+            // NEXT prompt re-runs the whole preamble (fresh lease +
+            // fresh thread resume) — mirrors the turn_limit path.
+            if model.hasPrefix("heyclicky-free-"),
+               (classifierText.contains("428") || lowerClassifier.contains("agent_turn_lease_required")
+                    || lowerClassifier.contains("precondition required")) {
+                HeyClickyLog.log("codex.turn_lease_428_detected", lane: "agent",
+                                 direction: "incoming", [
+                    "text_head": String(text.prefix(120))
+                ])
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    // Stash thread for resume, tear down lease, then
+                    // post the auto-continue-replay signal so
+                    // CompanionManager submits "请继续" against this
+                    // session (same as the turn_limit branch).
+                    if let existing = self.activeThreadID, !existing.isEmpty {
+                        self.pendingThreadResumeID = existing
+                    }
+                    self.heyClickyFreeTeardown(reason: "agent_turn_lease_required_428")
+                    self.setActiveThreadID(nil)
+                    HeyClickyLog.log("codex.turn_lease_428_teardown_ok", lane: "agent",
+                                     direction: "internal", [:])
+                    NotificationCenter.default.post(
+                        name: .heyClickyRequestAutoContinueReplay,
+                        object: nil,
+                        userInfo: ["session_id": self.id.uuidString]
+                    )
+                }
+            }
             lastErrorMessage = text
             status = .failed(text)
             progressStage = .failed
-            entries.append(CodexTranscriptEntry(role: .system, text: text))
+            // If the failure text is a transient recovery caption
+            // (auto-recovery is in flight), DON'T pollute the transcript
+            // history — it would be read back later as
+            // `latestActivitySummary` for the dock even after recovery
+            // succeeded, permanently pinning "网络恢复中…" on the card.
+            // The recovery is a temporary UI state, not a persistent
+            // conversation event.
+            if !Self.isTransientRecoveryCaptionForTranscript(text) {
+                entries.append(CodexTranscriptEntry(role: .system, text: text))
+            }
             appendActivityStatusLine("Stopped: \(Self.spokenSnippet(from: text, maxLength: 100))")
         case "account/login/completed":
             if CodexJSON.bool(params["success"]) == true {
@@ -1116,6 +2329,7 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
         lastErrorMessage = message
         currentAssistantEntryID = nil
         activeThreadID = nil
+        activeTurnID = nil
         hasInitializedProcess = false
         status = .failed(message)
         OpenClickyMessageLogStore.shared.append(
@@ -1164,7 +2378,89 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
     }
 
     nonisolated static func userFacingErrorMessage(from rawMessage: String) -> String {
-        CodexRPCErrorMessage.readableMessage(from: rawMessage) ?? rawMessage
+        // Full raw text always goes to log via `codex.rpc_error_text`.
+        // Here we only render a friendly HUD caption. The user wants to
+        // feel like they're on an unlimited account, so wire-level
+        // codes never surface — instead we show a short reassurance
+        // like "正在刷新 Token…" or "正在为你续上额度…" and let the
+        // auto-recovery machinery deal with the actual failure.
+        if let friendly = friendlyRecoveryCaption(for: rawMessage) {
+            return friendly
+        }
+        return CodexRPCErrorMessage.readableMessage(from: rawMessage) ?? rawMessage
+    }
+
+    /// Classifies raw error text and returns a friendly, action-hint
+    /// caption when the app is silently recovering behind the scenes.
+    /// Returns nil for genuinely unknown errors — those fall through
+    /// to the raw readable message.
+    nonisolated private static func friendlyRecoveryCaption(from raw: String) -> String? {
+        return friendlyRecoveryCaption(for: raw)
+    }
+    nonisolated private static func friendlyRecoveryCaption(for raw: String) -> String? {
+        let lower = raw.lowercased()
+        // extra_effort = 本 turn 已用 cost 到 $1.5 cap；autoContinue
+        // 会替用户 approve 继续同一 turn，跟"额度用完"不同。
+        if lower.contains("agent_extra_effort_required")
+            || lower.contains("extra_usage_approval")
+            || lower.contains("extra effort") {
+            return "正在自动继续…"
+        }
+        // 真正的账号额度用完（agents 25/25），auto-reset 后台换账号。
+        if lower.contains("quota") || lower.contains("payment required")
+            || raw.contains("402") || lower.contains("upgrade") {
+            return "正在为你自动续期额度…"
+        }
+        // Auth token 过期 - refresh + rekey
+        if lower.contains("session expired") || lower.contains("token expired")
+            || lower.contains("unauthorized") || raw.contains("401")
+            || lower.contains("invalid_issuer") {
+            return "正在自动重新连接…"
+        }
+        // 单 turn 时长 cap - teardown + 新 turn 上继续
+        if lower.contains("agent_turn_limit_exceeded") || lower.contains("turn limit") {
+            return "正在自动继续下一段…"
+        }
+        // 428 Precondition — lease 过期/缺失，teardown 后自动重新开一 turn
+        if lower.contains("agent_turn_lease_required")
+            || (raw.contains("428") && lower.contains("precondition")) {
+            return "正在自动重新开启会话…"
+        }
+        // 网络抖动 - codex 内部重试 Reconnecting 1/5..5/5
+        if lower.contains("timed out") || lower.contains("stream disconnected")
+            || lower.contains("reconnecting") || lower.contains("nsurlerror") {
+            return "网络恢复中…"
+        }
+        // HeyClickyProxyError 枚举漏到 UI — Swift 默认把 enum
+        // 印成 "OpenClicky.HeyClickyProxyError error 4." 这种鬼话。
+        // 每个 case 都是能自动恢复的，用户看到裸枚举 index 会以为坏了。
+        // 4=malformedResponse (代理返回 body 不符预期), 3=transportError,
+        // 2=upstreamUnavailable, 1=quotaExhausted, 0=unauthorized。
+        if lower.contains("heyclickyproxyerror") {
+            if raw.contains("error 4") || lower.contains("malformedresponse") {
+                return "服务响应异常，正在自动重试…"
+            }
+            if raw.contains("error 3") || lower.contains("transporterror") {
+                return "网络恢复中…"
+            }
+            if raw.contains("error 2") || lower.contains("upstreamunavailable") {
+                return "服务暂时不可用，正在自动重试…"
+            }
+            if raw.contains("error 1") || lower.contains("quotaexhausted") {
+                return "正在为你自动续期额度…"
+            }
+            if raw.contains("error 0") || lower.contains("unauthorized") {
+                return "正在自动重新连接…"
+            }
+            // Fallback for future enum growth.
+            return "正在自动恢复…"
+        }
+        // codex app-server 没启动 → rekey 尝试时 abort。这是我们内部
+        // 的一个 no-op case，用户不该看到"is not running"文字。
+        if lower.contains("codex app-server is not running") {
+            return "正在启动会话…"
+        }
+        return nil
     }
 
     nonisolated static func shouldRetryWithCompatibilityFallback(_ message: String) -> Bool {
@@ -2228,6 +3524,29 @@ final class CodexAgentSession: ObservableObject, Identifiable, BrowserWorkspaceA
     private static func sanitizedReturnedTaskTitle(_ value: String) -> String? {
         let cleaned = nounBasedTaskTitle(from: value, maximumCharacters: 44, maximumWords: 5)
         return cleaned.isEmpty ? nil : cleaned
+    }
+
+    /// Matches the recovery-caption phrases produced by
+    /// `friendlyRecoveryCaption`. Used to skip persisting these in the
+    /// transcript so a resolved recovery doesn't leave a permanent
+    /// "网络恢复中…" system entry that the dock keeps rendering.
+    nonisolated static func isTransientRecoveryCaptionForTranscript(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let recoveryPhrases = [
+            "正在自动继续",
+            "正在为你自动续期额度",
+            "正在自动重新连接",
+            "正在自动继续下一段",
+            "网络恢复中",
+            "服务响应异常，正在自动重试",
+            "服务暂时不可用，正在自动重试",
+            "正在自动恢复",
+            "正在启动会话",
+            "正在自动重新开启会话",
+            "服务响应异常"
+        ]
+        return recoveryPhrases.contains(where: { trimmed.contains($0) })
     }
 
     private static func latestActivitySummary(from entries: [CodexTranscriptEntry]) -> String? {

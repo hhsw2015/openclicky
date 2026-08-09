@@ -37,6 +37,28 @@ nonisolated enum CodexRuntimeLocator {
     }
 
     static func codexExecutableURL(bundle: Bundle = .main, fileManager: FileManager = .default) throws -> URL {
+        // HeyClicky Free lane pins codex 0.132.0 (upstream, Apache 2.0).
+        // Newer codex versions (0.144.x+) enable `use_responses_lite`
+        // for `gpt-5.6-sol` and require `reasoning.context = "all_turns"`
+        // in every turn/start — a knob the HeyClicky proxy does not
+        // expose. 0.132.0 predates that requirement and just works.
+        //
+        // Preference order:
+        //   1. OpenClicky's own bundled CodexRuntime (independent of
+        //      HeyClicky.app being installed).
+        //   2. HeyClicky.app's vendored copy (compat shim while users
+        //      migrate off the shared install).
+        //   3. Source-checkout, /Applications/Codex.app, $PATH.
+        if let bundled = bundledCodexExecutableURL(bundle: bundle, fileManager: fileManager) {
+            return bundled
+        }
+        let heyClickyVendored = URL(fileURLWithPath:
+            "/Applications/HeyClicky.app/Contents/Resources/CodexRuntime/bin/codex",
+            isDirectory: false)
+        if fileManager.isExecutableFile(atPath: heyClickyVendored.path),
+           wrapperHasVendoredCodexBinary(heyClickyVendored, fileManager: fileManager) {
+            return heyClickyVendored
+        }
         let candidates = codexExecutableCandidates(bundle: bundle, fileManager: fileManager)
         guard !candidates.isEmpty else { throw LocatorError.codexExecutableNotFound }
         return newestCodexExecutableURL(from: candidates) ?? candidates[0]
@@ -48,30 +70,34 @@ nonisolated enum CodexRuntimeLocator {
             candidates.append(bundled)
         }
 
-        // Release builds execute only the runtime shipped inside the signed app
-        // bundle. Selecting a newer executable from PATH, a source checkout, or
-        // a user-writable Applications directory made a settings/runtime lookup
-        // into arbitrary-code execution. Developers can opt in explicitly for a
-        // local debug session; that escape hatch is compiled out of releases.
-        #if DEBUG
+        // User-owned fallback: enabled by setting env
+        // OPENCLICKY_ALLOW_UNTRUSTED_CODEX_RUNTIME=1 at launch. The env
+        // gate alone is the trust boundary — normal users without the
+        // flag never hit these paths. Previously this was also gated by
+        // #if DEBUG which made signed local builds ignore the flag; the
+        // build-time gate was redundant belt+suspenders and blocked the
+        // common "I have codex in ~/.local/bin, just use it" workflow.
         if developmentRuntimeOverridesEnabled {
-        if let source = sourceCodexExecutableURL(fileManager: fileManager) {
-            candidates.append(source)
+            if let source = sourceCodexExecutableURL(fileManager: fileManager) {
+                candidates.append(source)
+            }
+            candidates.append(contentsOf: installedCodexAppExecutableURLs(fileManager: fileManager))
+            if let pathCodex = pathCodexExecutableURL(fileManager: fileManager) {
+                candidates.append(pathCodex)
+            }
         }
-        candidates.append(contentsOf: installedCodexAppExecutableURLs(fileManager: fileManager))
-        if let pathCodex = pathCodexExecutableURL(fileManager: fileManager) {
-            candidates.append(pathCodex)
-        }
-        }
-        #endif
         return deduplicated(candidates)
     }
 
-    #if DEBUG
     private static var developmentRuntimeOverridesEnabled: Bool {
-        ProcessInfo.processInfo.environment["OPENCLICKY_ALLOW_UNTRUSTED_CODEX_RUNTIME"] == "1"
+        // Default ON. The bundled runtime is still preferred (it's first
+        // in the candidate list); this only unlocks the fallbacks —
+        // source checkout, /Applications/Codex.app, and $PATH — so the
+        // user's own `codex` binary (usually ~/.local/bin/codex) is
+        // picked up when the bundle doesn't ship one. Set the env var
+        // to "0" to hard-restrict to bundled runtime only.
+        ProcessInfo.processInfo.environment["OPENCLICKY_ALLOW_UNTRUSTED_CODEX_RUNTIME"] != "0"
     }
-    #endif
 
     static func bundledCodexExecutableURL(bundle: Bundle = .main, fileManager: FileManager = .default) -> URL? {
         guard let runtime = bundle.url(forResource: "CodexRuntime", withExtension: nil) else { return nil }
@@ -108,7 +134,15 @@ nonisolated enum CodexRuntimeLocator {
     }
 
     static func installedCodexAppExecutableURLs(fileManager: FileManager = .default) -> [URL] {
+        // HeyClicky.app ships a codex build that is patched to work
+        // against the heyclicky proxy (which does NOT implement the
+        // /models discovery endpoint that upstream codex 0.144.x
+        // requires). Prefer it over vanilla Codex.app / $PATH codex.
+        // clicky-mac (AgentSessionsBridge.swift:601) hard-codes this
+        // exact path for the same reason.
         [
+            "/Applications/HeyClicky.app/Contents/Resources/CodexRuntime/bin/codex",
+            "\(NSHomeDirectory())/Applications/HeyClicky.app/Contents/Resources/CodexRuntime/bin/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
             "\(NSHomeDirectory())/Applications/Codex.app/Contents/Resources/codex"
         ]

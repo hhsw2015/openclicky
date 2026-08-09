@@ -79,7 +79,7 @@ struct OpenClickyAutomationsSettingsSection: View {
       .labelsHidden()
 
       VStack(alignment: .leading, spacing: 3) {
-        Text(a.name)
+        Text(LocalizedStringKey(a.name))
           .font(.system(size: 13, weight: .semibold))
         HStack(spacing: 6) {
           Text(a.schedule.displayString)
@@ -160,7 +160,7 @@ private struct AutomationEditorSheet: View {
         VStack(alignment: .leading, spacing: 4) {
           Text("Schedule").font(.system(size: 11, weight: .medium))
           Picker("", selection: $kind) {
-            ForEach(ScheduleKind.allCases) { k in Text(k.label).tag(k) }
+            ForEach(ScheduleKind.allCases) { k in Text(LocalizedStringKey(k.label)).tag(k) }
           }
           .pickerStyle(.segmented)
 
@@ -198,7 +198,7 @@ private struct AutomationEditorSheet: View {
       }
 
       if let error {
-        Text(error).font(.system(size: 11)).foregroundColor(.red)
+        Text(LocalizedStringKey(error)).font(.system(size: 11)).foregroundColor(.red)
       }
 
       HStack {
@@ -238,7 +238,7 @@ private struct AutomationEditorSheet: View {
 
   private func labeled(_ label: String, placeholder: String, text: Binding<String>) -> some View {
     VStack(alignment: .leading, spacing: 3) {
-      Text(label).font(.system(size: 11, weight: .medium))
+      Text(LocalizedStringKey(label)).font(.system(size: 11, weight: .medium))
       TextField(placeholder, text: text).textFieldStyle(.roundedBorder).font(.system(size: 12))
     }
   }

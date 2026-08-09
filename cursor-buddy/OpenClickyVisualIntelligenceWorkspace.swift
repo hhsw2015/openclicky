@@ -122,7 +122,7 @@ struct OpenClickyVisualIntelligenceWorkspaceView: View {
             .frame(width: 42, height: 42)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(selectedTab.title)
+                Text(LocalizedStringKey(selectedTab.title))
                     .font(.system(size: 20, weight: .semibold, design: .rounded))
                     .foregroundColor(DS.Colors.textPrimary)
                 Text("Camera understanding, OCR, object identification, and meeting notes with mic/camera/screen/computer-audio inputs.")
@@ -154,7 +154,7 @@ struct OpenClickyVisualIntelligenceWorkspaceView: View {
                         Image(systemName: tab.systemImageName)
                             .font(.system(size: 13, weight: .semibold))
                             .frame(width: 18)
-                        Text(tab.title)
+                        Text(LocalizedStringKey(tab.title))
                             .font(.system(size: 13, weight: .semibold))
                         Spacer()
                     }
@@ -299,7 +299,7 @@ struct OpenClickyVisualIntelligenceWorkspaceView: View {
         VStack(alignment: .leading, spacing: 12) {
             Picker("Camera", selection: $cameraController.selectedCameraID) {
                 ForEach(cameraController.availableCameras) { camera in
-                    Text(camera.displayName).tag(camera.id)
+                    Text(LocalizedStringKey(camera.displayName)).tag(camera.id)
                 }
                 if cameraController.availableCameras.isEmpty {
                     Text("No camera found").tag("")
@@ -459,7 +459,7 @@ struct OpenClickyVisualIntelligenceWorkspaceView: View {
             cameraPrompt = prompt
             analyzeCamera()
         } label: {
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .font(.system(size: 12, weight: .semibold))
                 .frame(maxWidth: .infinity)
                 .frame(height: 32)
@@ -496,7 +496,7 @@ struct OpenClickyVisualIntelligenceWorkspaceView: View {
 
     private func meetingTextPanel(title: String, text: String, placeholder: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(DS.Colors.textPrimary)
             ScrollView {
@@ -513,10 +513,10 @@ struct OpenClickyVisualIntelligenceWorkspaceView: View {
 
     private func valueLine(_ title: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline) {
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .foregroundColor(DS.Colors.textSecondary)
             Spacer()
-            Text(value)
+            Text(LocalizedStringKey(value))
                 .foregroundColor(DS.Colors.textTertiary)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -528,7 +528,7 @@ struct OpenClickyVisualIntelligenceWorkspaceView: View {
         HStack(spacing: 5) {
             Image(systemName: systemImageName)
                 .font(.system(size: 10, weight: .semibold))
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .font(.system(size: 11, weight: .semibold))
         }
         .foregroundColor(color)
@@ -541,7 +541,7 @@ struct OpenClickyVisualIntelligenceWorkspaceView: View {
     }
 
     private func warningText(_ message: String) -> some View {
-        Text(message)
+        Text(LocalizedStringKey(message))
             .font(.system(size: 11, weight: .medium))
             .foregroundColor(.orange)
             .fixedSize(horizontal: false, vertical: true)

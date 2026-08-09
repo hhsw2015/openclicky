@@ -97,7 +97,7 @@ struct MemoryDrawerView: View {
                   Image(systemName: "bubble.left.and.bubble.right")
                     .font(.system(size: 10))
                     .foregroundColor(DS.Colors.textSecondary)
-                  Text(ref.title)
+                  Text(LocalizedStringKey(ref.title))
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textPrimary)
                     .lineLimit(1)

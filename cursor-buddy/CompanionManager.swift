@@ -21,6 +21,7 @@ import OpenClickyUI
 @preconcurrency import OpenClickyBrowser
 import OpenClickyMarkdown
 import OpenClickyMemory
+import OpenClickyContextService
 
 enum CompanionVoiceState: String {
     case idle
@@ -73,6 +74,28 @@ final class CursorOverlayState: ObservableObject {
     @Published var circleSelectSnapLabel: String?
     @Published var activeControlGlowRect: CGRect?
     @Published var activeControlGlowLabel: String?
+    /// Whatever the auto-recovery machinery wants the user to see right
+    /// now: "正在为你自动续期额度…" during reset, "正在自动重新连接…"
+    /// during token refresh, nil when everything's nominal. Overlay +
+    /// notch bind here so the *actual* backend state is reflected the
+    /// moment it happens — not lagging until Settings is opened.
+    @Published var heyClickyStatusCaption: String? {
+        didSet {
+            statusCaptionStoreRef?.heyClickyStatusCaption = heyClickyStatusCaption
+        }
+    }
+    /// Short severity marker: "info" | "warning" | "error". Drives
+    /// overlay accent tint (info=cursor color, warning=amber, error=red).
+    @Published var heyClickyStatusSeverity: String? {
+        didSet {
+            statusCaptionStoreRef?.heyClickyStatusSeverity = heyClickyStatusSeverity
+        }
+    }
+
+    /// Weak reference so mutations here mirror into the narrow
+    /// StatusCaptionStore without creating a retain cycle. Set by
+    /// `CompanionManager.init`.
+    weak var statusCaptionStoreRef: StatusCaptionStore?
 }
 
 enum ClickyAgentDockStatus: Equatable {
@@ -467,8 +490,24 @@ private final class OpenClickyWakeWordAudioDucker {
 @MainActor
 final class CompanionManager: ObservableObject {
     let cursorOverlayState = CursorOverlayState()
+    /// Narrow store for high-frequency cursor / voice-state fields.
+    /// Points at the same instance as `cursorOverlayState`; exposed
+    /// separately so new call sites can adopt the more descriptive
+    /// `hotPathState` name. See `HotPathState.swift`.
+    var hotPathState: HotPathState { cursorOverlayState }
+    /// Narrow store for agent dock / handoff queue mutations. Views
+    /// that only care about dock progress observe this instead of the
+    /// whole CompanionManager. Kept in sync via `didSet` mirrors.
+    let agentDockStore = AgentDockStore()
+    /// Narrow store for status-caption / home-chat streaming updates.
+    /// Kept in sync via `didSet` mirrors.
+    let statusCaptionStore = StatusCaptionStore()
     @Published var voiceState: CompanionVoiceState = .idle {
         didSet {
+            // FIX(task #326 F7): skip redundant no-op transitions — the
+            // notchCaptureWindowManager.updateVoiceState side-effect
+            // rebuilds NSView tracking areas / subviews on every call.
+            guard oldValue != voiceState else { return }
             cursorOverlayState.voiceState = voiceState
             notchCaptureWindowManager.updateVoiceState(Self.notchVoicePhase(for: voiceState), audioPowerLevel: currentAudioPowerLevel)
             if voiceState == .idle, oldValue != .idle {
@@ -588,6 +627,12 @@ final class CompanionManager: ObservableObject {
     let wakeWordManager = OpenClickyWakeWordManager()
     private let wakeWordAudioDucker = OpenClickyWakeWordAudioDucker()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
+    /// Phase 7 Layer 4 UX: five context-awareness hotkeys
+    /// (SnapshotContext / ClearContextStash / AgentPickElement /
+    /// Whiteboard / LinkRect). All bindings default unbound — the tap
+    /// runs but is a no-op until the user configures at least one
+    /// binding in the Context Awareness settings tab.
+    let contextAwarenessHotkeys = OpenClickyContextHotkeys()
     let overlayWindowManager = OverlayWindowManager()
     let notchCaptureWindowManager = OpenClickyNotchCaptureWindowManager()
     let agentDockWindowManager = ClickyAgentDockWindowManager()
@@ -600,19 +645,75 @@ final class CompanionManager: ObservableObject {
     let codexHomeManager = CodexHomeManager()
     let nativeComputerUseController = OpenClickyNativeComputerUseController()
     let backgroundComputerUseController = OpenClickyBackgroundComputerUseController()
-    @Published private(set) var codexAgentSessions: [CodexAgentSession]
+    @Published private(set) var codexAgentSessions: [CodexAgentSession] {
+        didSet { agentDockStore.codexAgentSessions = codexAgentSessions }
+    }
     @Published private(set) var activeCodexAgentSessionID: UUID
     /// Session IDs the user has archived from the chat sidebar. Persisted to UserDefaults.
     /// Archived sessions remain in `codexAgentSessions` so transcripts/state are preserved;
     /// the sidebar simply hides them under an Archived section.
     @Published private(set) var archivedSessionIDs: Set<UUID> = ChatWorkspaceArchiveStore.load()
+    /// Session IDs the user has actively engaged with **this app run**
+    /// (start-agent, HUD prompt, dock click, replay etc.). Auto-replay
+    /// on `.failed` transitions is gated by this set so sessions
+    /// hydrated from disk but never touched are not resurrected on
+    /// launch. Populated by `submitAgentPrompt`, `startNewAgentSession`,
+    /// automation-start handler.
+    internal var userEngagedSessionIDs: Set<UUID> = []
     let codexHUDWindowManager = CodexHUDWindowManager()
     let wikiViewerPanelManager = WikiViewerPanelManager()
     @Published private(set) var bundledKnowledgeIndex = OpenClickyCore.WikiManager.Index.empty
     @Published var latestVoiceResponseCard: ClickyResponseCard?
-    @Published private(set) var homeChatEntries: [CodexTranscriptEntry] = []
+    /// HeyClicky Free tool-call widgets from the most recent turn. Consumed
+    /// by the AI response pipeline when it constructs `latestVoiceResponseCard`
+    /// so the card view can render a widget slot. Cleared before each new turn.
+    var pendingHeyClickyWidgets: [WidgetPayload] = []
+    /// When true, `HeyClickyChatToolCallClient.analyzeVoiceResponse`
+    /// must skip all UI side effects (clipboard write, typing, walkthrough
+    /// beats, captions, widgets) and just return the model's text. Set by
+    /// `handleAutomationSimulateVoiceTurn` / sensor `simulate_voice_turn`
+    /// for the duration of the test call so synthetic prompts do not
+    /// pollute the user's screen / clipboard / focus.
+    var suppressVoiceResponseSideEffects: Bool = false
+
+    /// The capture context of the screenshot that was just sent to
+    /// `/chat-tool-call`. Populated by `HeyClickyChatToolCallClient`
+    /// before dispatch; walkthrough-beat rescale reads it back so the
+    /// beat coordinates land on the ACTUAL capture's coordinate space
+    /// (window frame or full-screen frame) rather than a wrong screen.
+    /// Cleared by the pipeline after the response is fully rendered.
+    struct HeyClickyCaptureContext {
+        /// AppKit global frame of the region the screenshot covers.
+        /// For a full-screen capture this equals `NSScreen.frame`.
+        /// For a focused-window capture this is the window's global
+        /// AppKit frame (bottom-left origin, in points).
+        let displayFrame: CGRect
+        /// Pixel dimensions of the screenshot AS SENT to the server —
+        /// walkthrough.beats coordinates arrive in this space.
+        let screenshotWidth: Int
+        let screenshotHeight: Int
+        /// 1-based NSScreen index containing displayFrame (for cross-
+        /// screen resolution when beat.screen is nil).
+        let nsScreenIndex: Int?
+        /// True when the capture was of a specific focused window
+        /// (not the whole screen). Rendering may want to visually mark
+        /// out-of-window beats differently.
+        let isWindowCapture: Bool
+    }
+    var pendingHeyClickyCaptureContext: HeyClickyCaptureContext?
+
+    /// Wall-clock timestamp of the first streamed chunk in the current
+    /// mirage (Peeky Free) turn. Nil while thinking, set the moment
+    /// Claude emits its first `text_delta` event. The notch heartbeat
+    /// reads this to flip the caption from "thinking" → "responding".
+    var mirageFirstChunkAt: Date? = nil
+    @Published private(set) var homeChatEntries: [CodexTranscriptEntry] = [] {
+        didSet { statusCaptionStore.homeChatEntries = homeChatEntries }
+    }
     @Published private(set) var isHomeChatModeActive = false
-    @Published var handoffQueue: [HandoffQueuedRegionScreenshot] = []
+    @Published var handoffQueue: [HandoffQueuedRegionScreenshot] = [] {
+        didSet { agentDockStore.handoffQueue = handoffQueue }
+    }
     /// Sealed circle-while-talking stroke from the most recent PTT hold, awaiting voice/agent attach.
     private(set) var pendingCircleSelectStroke: CircleSelectSealedStroke?
     /// Crop capture started at PTT release so the final transcript can attach without extra latency.
@@ -623,7 +724,9 @@ final class CompanionManager: ObservableObject {
     /// Live partial transcript while PTT is held — used to bias circle snap to spoken items.
     private var circleSelectLivePartialTranscript: String = ""
     let circleSelectSession = CircleSelectSession()
-    @Published private(set) var agentDockItems: [ClickyAgentDockItem] = []
+    @Published private(set) var agentDockItems: [ClickyAgentDockItem] = [] {
+        didSet { agentDockStore.agentDockItems = agentDockItems }
+    }
     /// Cursor-following speech bubble with Apple/Codex/Claude selector chips.
     /// Caption text still mirrors onto the full-screen cursor overlay when
     /// voice-response captions are enabled; this panel is the interactive path.
@@ -871,12 +974,36 @@ final class CompanionManager: ObservableObject {
     /// short system responses, filler library. Switching providers in
     /// Settings takes effect on the next utterance.
     var voiceTTSClient: any OpenClickyTTSClient {
+        // Pure lookup. tokenProvider wiring for the paid vs mirage
+        // Cartesia lane happens exactly once in `setTTSProvider` (and on
+        // boot via `bindCartesiaTokenProviderForCurrentProvider()`), so
+        // reading `voiceTTSClient` never mutates the shared client state.
         switch selectedTTSProvider {
         case .openAIRealtime: return openAIRealtimeSpeechClient
         case .elevenLabs: return elevenLabsTTSClient
-        case .cartesia:   return cartesiaTTSClient
-        case .deepgram:   return activeDeepgramTTSClient
+        case .cartesia, .mirageCartesia: return cartesiaTTSClient
+        case .deepgram: return activeDeepgramTTSClient
         case .microsoftEdge: return microsoftEdgeTTSClient
+        }
+    }
+
+    /// Wire (or clear) the Cartesia mirage tokenProvider based on the
+    /// active provider. Called by `setTTSProvider` on every switch and
+    /// once at boot to establish the correct closure before any TTS
+    /// call resolves the client.
+    func bindCartesiaTokenProviderForCurrentProvider() {
+        switch selectedTTSProvider {
+        case .mirageCartesia:
+            cartesiaTTSClient.tokenProvider = { @Sendable in
+                try await MirageCartesiaClient.shared.currentToken()
+            }
+        case .cartesia:
+            cartesiaTTSClient.tokenProvider = nil
+        default:
+            // Other providers do not use cartesiaTTSClient; clear the
+            // closure defensively so it cannot linger across a lane
+            // change back into either Cartesia mode.
+            cartesiaTTSClient.tokenProvider = nil
         }
     }
 
@@ -890,6 +1017,7 @@ final class CompanionManager: ObservableObject {
         case .cartesia:   return "CartesiaTTSClient"
         case .deepgram:   return "DeepgramTTSClient"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient"
+        case .mirageCartesia: return "MirageCartesiaTTSClient"
         }
     }
 
@@ -900,6 +1028,7 @@ final class CompanionManager: ObservableObject {
         case .cartesia:   return "CartesiaTTSClient.speakText"
         case .deepgram:   return "DeepgramTTSClient.speakText"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient.speakText"
+        case .mirageCartesia: return "MirageCartesiaTTSClient.speakText"
         }
     }
 
@@ -910,6 +1039,7 @@ final class CompanionManager: ObservableObject {
         case .cartesia:   return "CartesiaTTSClient.beginStreamingResponse"
         case .deepgram:   return "DeepgramTTSClient.beginStreamingResponse"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient.beginStreamingResponse"
+        case .mirageCartesia: return "MirageCartesiaTTSClient.beginStreamingResponse"
         }
     }
 
@@ -946,12 +1076,19 @@ final class CompanionManager: ObservableObject {
     }
 
     func setTTSProvider(_ provider: OpenClickyTTSProvider) {
+        setTTSProvider(provider, deferred: true)
+    }
+
+    /// Set the TTS provider. `deferred=true` (default, from SwiftUI Picker
+    /// bindings) hops through DispatchQueue.main.async to avoid
+    /// "Publishing changes from within view updates" — see
+    /// `setTTSProvider(_:)` for the SwiftUI-safe entry point. `deferred=false`
+    /// runs synchronously; used by `applyProfile` so a same-turn
+    /// caller reading `selectedTTSProvider` sees the new value before
+    /// `applyProfile` returns.
+    func setTTSProvider(_ provider: OpenClickyTTSProvider, deferred: Bool) {
         guard selectedTTSProvider != provider else { return }
-        // Defer the @Published mutation to the next runloop tick — the
-        // SwiftUI Picker invokes this from within a view update, and
-        // setting `selectedTTSProvider` synchronously triggers a publish
-        // mid-render ("Publishing changes from within view updates...").
-        DispatchQueue.main.async { [weak self] in
+        let work: @MainActor () -> Void = { [weak self] in
             guard let self else { return }
             self.voiceTTSClient.stopPlayback()
             self.selectedTTSProvider = provider
@@ -959,8 +1096,33 @@ final class CompanionManager: ObservableObject {
             if provider == .deepgram {
                 self.invalidateDeepgramTTSClient(reason: "tts_provider_switched")
             }
+            // Re-wire Cartesia's tokenProvider closure so the paid vs
+            // mirage lane sees the correct auth path. This is the ONLY
+            // place that decides that mapping now; `voiceTTSClient` is a
+            // pure getter, no side effects on read.
+            self.bindCartesiaTokenProviderForCurrentProvider()
             self.voiceTTSClient.warmUpConnection()
             FillerPhraseLibrary.shared.prepare(client: self.voiceTTSClient)
+            // Warm on component activation (not just profile switch). If
+            // the user picks mirage Cartesia from the Advanced Providers
+            // tab while staying on HeyClicky Free, the mirage lane still
+            // needs its token pre-minted so the first sentence does not
+            // pay the ~1-2 s (up to 20 s) aegis-proxy cold-start.
+            if provider == .mirageCartesia {
+                Task.detached(priority: .utility) {
+                    await MirageCartesiaClient.shared.warm()
+                }
+            }
+        }
+        if deferred {
+            DispatchQueue.main.async(execute: work)
+        } else {
+            // Synchronous variant. Caller must be on the main actor
+            // AND must not be inside a SwiftUI view update (otherwise
+            // we would publish changes mid-render). `applyProfile` is
+            // the only in-tree caller and it always runs from a Task
+            // or notification handler.
+            work()
         }
     }
 
@@ -1103,6 +1265,26 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Log a user utterance to the vault (Screen History `transcript`
+    /// row) even when no assistant reply is available yet — journaling
+    /// mode, SKI-Mode pending-agent turns, cancelled sessions, etc.
+    /// Idempotent by string; ConversationLogger de-dupes on segment id.
+    func rememberUserUtteranceOnly(_ userTranscript: String, reason: String) {
+        let trimmed = userTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return }
+        ConversationLogger.log(trimmed, by: .user)
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice",
+            direction: "internal",
+            event: "openclicky.ltm.user_utterance_logged",
+            fields: [
+                "reason": reason,
+                "textLen": String(trimmed.count),
+                "preview": String(trimmed.prefix(60))
+            ]
+        )
+    }
+
     func rememberVoiceExchange(userTranscript: String, assistantResponse: String, reason: String) {
         let trimmedUserTranscript = userTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedAssistantResponse = assistantResponse.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1134,6 +1316,12 @@ final class CompanionManager: ObservableObject {
             userTranscript: trimmedUserTranscript,
             assistantResponse: trimmedAssistantResponse
         ))
+        // Persist both sides into Screen History as transcript rows so
+        // future queries against `openrewind.transcript` / `.search`
+        // can retrieve past voice conversations. This turns Ask Rewind
+        // into a true long-term memory for the assistant.
+        ConversationLogger.log(trimmedUserTranscript, by: .user)
+        ConversationLogger.log(trimmedAssistantResponse, by: .assistant)
         compactVoiceConversationHistoryIfNeeded(reason: reason)
         OpenClickyMessageLogStore.shared.appendConversationTurn(
             lane: "voice",
@@ -1480,6 +1668,9 @@ final class CompanionManager: ObservableObject {
     private var pendingSystemAnnouncementSessionID: UUID?
     private var speakingSystemAnnouncementSessionID: UUID?
     private var silencedAgentSpeechSessionIDs: Set<UUID> = []
+    /// Insertion order for `silencedAgentSpeechSessionIDs`, so the set can be
+    /// evicted FIFO rather than growing for the lifetime of the process.
+    private var silencedAgentSpeechSessionOrder: [UUID] = []
     private var liveHandledComputerUseFingerprints: Set<String> = []
     private var lastAgentProgressNarrationAt: Date?
     /// The phrase last spoken for each running agent session, keyed by
@@ -1499,6 +1690,12 @@ final class CompanionManager: ObservableObject {
 
     private var processingWatchdogTask: Task<Void, Never>?
     private static let processingWatchdogTimeout: TimeInterval = 30
+
+    /// Guard token so a transient recovery caption ("网络恢复中…",
+    /// "正在为你自动续期额度…") only auto-clears if no newer status
+    /// overwrites it. Compared inside the auto-clear Task; a mismatch
+    /// means a newer post landed and this clear should abort.
+    var cursorOverlayCaptionAutoClearToken: String?
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var shiftDoubleTapCancellable: AnyCancellable?
@@ -1607,11 +1804,23 @@ final class CompanionManager: ObservableObject {
             guard !archivedSessionIDs.contains(snapshot.id) else { return nil }
             let accentTheme = ClickyAccentTheme(rawValue: snapshot.accentThemeRawValue) ?? .blue
             let session = CodexAgentSession(id: snapshot.id, title: snapshot.title, accentTheme: accentTheme)
+            // Strip any transient recovery-caption `system` entries that
+            // got persisted last session (before we stopped writing them
+            // to the transcript). Otherwise `latestActivityText` will
+            // keep resurfacing "网络恢复中…" every launch even after all
+            // real recovery paths cleared their state.
+            let cleanEntries = snapshot.entries.filter { entry in
+                guard entry.role == .system else { return true }
+                return !CodexAgentSession.isTransientRecoveryCaptionForTranscript(entry.text)
+            }
             session.restoreInterruptedRelaunchState(
-                entries: snapshot.entries,
+                entries: cleanEntries,
                 activeThreadID: snapshot.activeThreadID,
                 lastSubmittedPrompt: snapshot.lastSubmittedPrompt,
-                canResume: snapshot.wasRelaunchResumeCandidate ?? false
+                canResume: snapshot.wasRelaunchResumeCandidate ?? false,
+                restoredActiveTurnID: snapshot.activeTurnID,
+                restoredLeaseID: snapshot.activeLeaseID,
+                restoredLeaseExpiresAt: snapshot.leaseExpiresAt
             )
             return session
         }
@@ -1620,9 +1829,38 @@ final class CompanionManager: ObservableObject {
     private static func restoredInterruptedDockItems(from sessions: [CodexAgentSession]) -> [ClickyAgentDockItem] {
         sessions.map { session in
             let prompt = session.lastSubmittedPromptText?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let resumeCaption = session.canResumeAfterRelaunch
-                ? "Open to resume this task after relaunch."
-                : "Restored after relaunch."
+            // A restored heyclicky-free session that had an in-flight
+            // prompt when the app died IS an interrupted state — not a
+            // "failed" task in any meaningful sense. UI must say so
+            // exactly so the user knows a single tap resumes it.
+            // Everything else (completed / stopped / no-prompt) uses
+            // the neutral "Restored after relaunch" copy.
+            let hadInflightWork = (prompt?.isEmpty == false)
+                && session.progressStage != .completed
+            let isPausedResumable = hadInflightWork
+            let progressLabel: String
+            let dockCaption: String
+            let progressStep: String
+
+            if isPausedResumable {
+                progressLabel = "Paused"
+                dockCaption = "Task interrupted by app restart. Tap to resume."
+                progressStep = "Tap to resume where the agent left off."
+            } else {
+                progressLabel = session.canResumeAfterRelaunch ? "Interrupted" : session.progressStage.label
+                // Filter out transient recovery captions ("网络恢复中…") that
+                // were persisted last session mid-recovery — those states
+                // died with the app and lying about them here misleads the
+                // user into waiting for something that isn't happening.
+                let persistedActivity = session.latestActivityDisplaySummary ?? session.latestActivitySummary
+                let cleanedActivity = Self.isTransientRecoveryCaption(persistedActivity) ? nil : persistedActivity
+                let fallback = session.canResumeAfterRelaunch
+                    ? "Open to resume this task after relaunch."
+                    : "Restored after relaunch."
+                dockCaption = cleanedActivity ?? fallback
+                progressStep = cleanedActivity ?? fallback
+            }
+
             return ClickyAgentDockItem(
                 id: session.id,
                 sessionID: session.id,
@@ -1630,10 +1868,13 @@ final class CompanionManager: ObservableObject {
                 userInstruction: prompt?.isEmpty == false ? (prompt ?? session.title) : session.title,
                 accentTheme: session.accentTheme,
                 status: .failed,
-                progressStageLabel: session.canResumeAfterRelaunch ? "Interrupted" : session.progressStage.label,
-                progressStepText: session.latestActivityDisplaySummary ?? session.latestActivitySummary ?? resumeCaption,
-                activityStatusLines: session.activityStatusLines.isEmpty ? [resumeCaption] : session.activityStatusLines,
-                caption: session.latestActivityDisplaySummary ?? session.latestActivitySummary ?? resumeCaption,
+                progressStageLabel: progressLabel,
+                progressStepText: progressStep,
+                activityStatusLines: {
+                    let filtered = session.activityStatusLines.filter { !Self.isTransientRecoveryCaption($0) }
+                    return filtered.isEmpty ? [dockCaption] : filtered
+                }(),
+                caption: dockCaption,
                 suggestedNextActions: session.latestResponseCard?.suggestedNextActions ?? [],
                 createdAt: session.createdAt
             )
@@ -1644,6 +1885,11 @@ final class CompanionManager: ObservableObject {
 
     init(runtimeMode: OpenClickyCompanionRuntimeMode = .menuBar) {
         self.runtimeMode = runtimeMode
+        // Wire the CursorOverlayState -> StatusCaptionStore back-ref so
+        // heyClicky status caption/severity edits mirror into the
+        // narrow StatusCaptionStore. Weak on the CursorOverlayState
+        // side to avoid a retain cycle.
+        cursorOverlayState.statusCaptionStoreRef = statusCaptionStore
         let restoredVoiceArchive = UserDefaults.standard
             .string(forKey: Self.compactedVoiceConversationArchiveDefaultsKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1679,6 +1925,79 @@ final class CompanionManager: ObservableObject {
         OpenClickyAutomationStore.shared.bind(companion: self)
         // Seed bundled built-in specialist agents on first launch.
         OpenClickyAgentStore.shared.seedBuiltinsFromBundleIfNeeded()
+        // Phase 4 Step 2: wire the route dispatcher so parsed [ROUTE]
+        // JSON (or the context-signal fallback) can reach the codex
+        // spawn path without a static import cycle.
+        RouteDispatcher.shared.companionManager = self
+        // Stage 10: assist agent uses this CompanionManager's
+        // configured LLM as its inner transport.
+        AssistAgentBridge.shared.companion = self
+        // Screen History — boot the embedded OpenRewind bridge only when
+        // the user enabled it in Settings. Safe to call every launch; a
+        // disabled bridge returns immediately.
+        OpenRewindBridge.bootIfEnabled()
+        // Prime the Screen History window manager so it starts listening
+        // for `screenHistoryOpenSearch` notifications.
+        _ = ScreenHistoryWindowManager.shared
+        // Screen History hotkeys go through OpenClickyContextHotkeys
+        // (CGEventTap) — the same tap that services PTT / pick-element.
+        // No extra install needed here; actions are wired in
+        // performAction() dispatch.
+        // Notch/menubar can post .screenHistoryOpenSettings; open the
+        // Settings window in response.
+        NotificationCenter.default.addObserver(
+            forName: .screenHistoryOpenSettings,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.showSettingsWindow() }
+        }
+        // Route assist-agent progress into the notch status pill so
+        // the user sees per-round updates without opening the panel.
+        AssistAgentRegistry.shared.notchCaptionSink = { [weak self] caption in
+            self?.notchCaptureWindowManager.updateBackendStatusCaption(caption)
+        }
+        // Live caption during PTT — as realtime streams transcription
+        // deltas, echo them onto the notch so the user can SEE we're
+        // hearing them, before the full transcript settles. Feels
+        // like Siri's live dictation UI.
+        NotificationCenter.default.addObserver(
+            forName: .heyClickyRealtimeUserTranscriptPartial,
+            object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let text = note.userInfo?["text"] as? String,
+                  !text.isEmpty else { return }
+            // show_preview toggle: when the user turned off live
+            // partial captions in SKI Settings, skip the mid-utterance
+            // updates. The final transcript still lands via the
+            // heyClickyRealtimeUserTranscript observer below.
+            let inSKI = OpenClickyProfileCatalog.activeProfile().id == "ski_mode"
+            let showPreview = UserDefaults.standard.object(forKey: "openclicky.ski.showPreview") as? Bool ?? true
+            if inSKI && !showPreview { return }
+            self.notchCaptureWindowManager.updateBackendStatusCaption(text)
+        }
+        NotificationCenter.default.addObserver(
+            forName: .heyClickyRealtimeUserTranscript,
+            object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let text = note.userInfo?["text"] as? String,
+                  !text.isEmpty else { return }
+            self.notchCaptureWindowManager.updateBackendStatusCaption(text)
+            // FIX(task #305 2026-08-04): the Realtime lane never wrote
+            // final user transcripts to the LTM vault. Task #260 wired
+            // the observer but forgot the ConversationLogger call —
+            // Realtime utterances only landed in the vault when
+            // rememberVoiceExchange fired later (which needs an
+            // assistant reply, and skips entirely on quick "hmm"s /
+            // cancels / SKI fire-and-forget). Log the user side here;
+            // rememberUserUtteranceOnly dedupes at the trimmed-string
+            // level so if the assistant reply arrives afterwards the
+            // second log is dropped by ConversationLogger's segment
+            // key rather than being a duplicate row.
+            self.rememberUserUtteranceOnly(text, reason: "heyclicky_realtime_final")
+        }
     }
 
     /// Whether the blue cursor overlay is currently visible on screen.
@@ -1735,11 +2054,23 @@ final class CompanionManager: ObservableObject {
         }
         if shouldAutoFollowCursor {
             if agentDockFollowTimer == nil {
-                let timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+                // 5 Hz was chosen for "buttery" cursor tracking, but
+                // it churns CoreGraphics repositioning at every tick
+                // whether the cursor moved or not. Drop to 2 Hz + gate
+                // on cursor delta so we only reposition when needed.
+                // Long-running agents (hours) shed hundreds of
+                // thousands of wasted repositions this way.
+                var lastCursor: NSPoint = NSEvent.mouseLocation
+                let timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                     Task { @MainActor [weak self] in
                         guard let self else { return }
                         guard !self.agentDockItems.isEmpty else { return }
                         guard !self.agentDockWindowManager.hasUserPinnedFrame else { return }
+                        let cur = NSEvent.mouseLocation
+                        let moved = hypot(cur.x - lastCursor.x,
+                                          cur.y - lastCursor.y) > 8
+                        if !moved { return }
+                        lastCursor = cur
                         self.showAgentDockWindowNearCurrentScreen()
                     }
                 }
@@ -1765,6 +2096,30 @@ final class CompanionManager: ObservableObject {
     private var realtimeBidirectionalVoiceStartedAsInterrupt = false
     private static let quickShortcutInterruptSilenceThreshold: TimeInterval = 1.25
     private var realtimeBidirectionalVoiceTurnGeneration: UInt64 = 0
+    // Track last-flushed assistant transcript per realtime turn so streaming
+    // deltas only get logged to LTM once as the final sentence.
+    private var realtimeAssistantLoggedGeneration: UInt64 = 0
+    private var realtimeAssistantLoggedText: String = ""
+    private var realtimeAssistantFlushWorkItem: DispatchWorkItem?
+
+    /// Debounces streaming assistant transcript deltas: waits ~800ms of
+    /// silence, then commits the final text to ConversationLogger once.
+    func stampRealtimeAssistantTranscript(_ text: String, generation: UInt64) {
+        realtimeAssistantFlushWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.realtimeBidirectionalVoiceTurnGeneration == generation else { return }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            if self.realtimeAssistantLoggedGeneration == generation,
+               self.realtimeAssistantLoggedText == trimmed { return }
+            self.realtimeAssistantLoggedGeneration = generation
+            self.realtimeAssistantLoggedText = trimmed
+            ConversationLogger.log(trimmed, by: .assistant)
+        }
+        realtimeAssistantFlushWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: item)
+    }
 
     private static func initialVoiceResponseModelID() -> String {
         let defaults = UserDefaults.standard
@@ -1795,10 +2150,23 @@ final class CompanionManager: ObservableObject {
         selectedModel = resolvedModel
         UserDefaults.standard.set(resolvedModel, forKey: "selectedVoiceResponseModel")
 
+        // Rewire the Realtime WS client whenever the lane changes so
+        // HeyClicky Free selections get the proxy-minted ephemeral
+        // instead of the user's BYOK OpenAI key.
+        applyHeyClickyRealtimeHookIfNeeded()
+
         if OpenClickyModelCatalog.isSpeechModelID(resolvedModel) {
             selectedSpeechModel = resolvedModel
             UserDefaults.standard.set(resolvedModel, forKey: "openClickySpeechModel")
             if selectedVoiceResponseModel.provider == .openAI {
+                openAIRealtimeSpeechClient.model = resolvedModel
+                setTTSProvider(.openAIRealtime)
+                openAIRealtimeSpeechClient.warmUpConnection()
+                warmRealtimeVoiceInputIfNeeded(reason: "voice_model_selected")
+            } else if selectedVoiceResponseModel.provider == .heyclickyFree {
+                // HeyClicky Free realtime speech: reuse OpenAI Realtime
+                // WS transport, but the Authorization Bearer is a
+                // proxy-minted ephemeral (hook wired above).
                 openAIRealtimeSpeechClient.model = resolvedModel
                 setTTSProvider(.openAIRealtime)
                 openAIRealtimeSpeechClient.warmUpConnection()
@@ -1832,6 +2200,27 @@ final class CompanionManager: ObservableObject {
             }
         case .deepgram:
             deepgramVoiceAgentClient.warmUpConnection()
+        case .heyclickyFree:
+            // Proxy-managed; nothing local to warm.
+            break
+        case .peekyFree:
+            // Free-tier Claude via aegis-proxy. MirageBackendClient's URLSession
+            // (or NIO client) opens its connection lazily on first request; no
+            // pre-warm to run here — the trial-tier quota is precious and we
+            // do not want to burn one on a warm-up ping.
+            //
+            // But do bootstrap the on-device intent classifier so the first
+            // classify call doesn't pay the 100-300ms head.json + tokenizer
+            // + ORT session build. Free — never touches the network / quota.
+            Task.detached(priority: .utility) {
+                _ = await OpenClickyIntentClassifier.shared.bootstrap()
+            }
+            // Peeky parity: pre-mint Deepgram proxy token + open TLS
+            // channel so first PTT doesn't lose 1.5s to cold-start.
+            Task.detached(priority: .utility) {
+                await MirageDeepgramClient.shared.warm()
+            }
+            break
         }
     }
 
@@ -1883,6 +2272,13 @@ final class CompanionManager: ObservableObject {
                 voiceID: AppBundleConfiguration.deepgramTTSVoice(),
                 thinkModel: AppBundleConfiguration.deepgramVoiceAgentThinkModel()
             )
+        case .heyclickyFree:
+            break
+        case .peekyFree:
+            // The mirage backend keeps its own model+headers configuration
+            // internal to MirageBackendClient (see `normalizeBody` and
+            // `wireHeaders`); nothing external to sync here.
+            break
         }
     }
 
@@ -2063,6 +2459,28 @@ final class CompanionManager: ObservableObject {
         handleWidgetDeepLink(url)
     }
 
+    /// Send an OAuth callback URL to the real HeyClicky.app when it arrived
+    /// on our LaunchServices binding but we didn't initiate the sign-in.
+    /// Lets both apps coexist on the same machine sharing clicky:// scheme.
+    fileprivate func forwardOAuthCallbackToHeyClickyApp(_ url: URL) {
+        let ws = NSWorkspace.shared
+        guard let appURL = ws.urlForApplication(withBundleIdentifier: "com.humansongs.clicky") else {
+            HeyClickyLog.log("oauth.callback_forward_failed", lane: "system", direction: "error", [
+                "reason": "heyclicky_app_not_installed"
+            ])
+            return
+        }
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = true
+        ws.open([url], withApplicationAt: appURL, configuration: cfg) { _, err in
+            if let err = err {
+                HeyClickyLog.log("oauth.callback_forward_failed", lane: "system", direction: "error", [
+                    "error": "\(err)"
+                ])
+            }
+        }
+    }
+
     func publishWidgetSnapshot() {
         agentMenuBarStatusManager.scheduleSync(companionManager: self)
         widgetStateStore.publishSnapshot(from: self)
@@ -2074,6 +2492,34 @@ final class CompanionManager: ObservableObject {
     }
 
     func handleWidgetDeepLink(_ url: URL) {
+        // HeyClicky OAuth uses clicky:// or heyclicky:// per IDA-verified
+        // scheme registrations. Any host == auth-callback routes to the
+        // Supabase implicit-flow token consumer — but ONLY when the sign-in
+        // was started from OpenClicky itself. Otherwise we forward the URL
+        // to the real HeyClicky.app so both apps can coexist on the same
+        // machine without stealing each other's OAuth callbacks.
+        if (url.scheme == "clicky" || url.scheme == "heyclicky"),
+           url.host == "auth-callback" {
+            let pending = AppBundleConfiguration.heyClickyPendingSignInStartedAt()
+            let isMine = pending != nil && Date().timeIntervalSince(pending!) < 600
+            if !isMine {
+                // Forward to the real HeyClicky.app; abort our own handling.
+                HeyClickyLog.log("oauth.callback_forwarded", lane: "system", direction: "outgoing", [
+                    "reason": "no_pending_sign_in",
+                    "target_bundle": "com.humansongs.clicky"
+                ])
+                forwardOAuthCallbackToHeyClickyApp(url)
+                return
+            }
+            do {
+                try HeyClickyOAuthHandler.shared.consumeCallbackURL(url)
+            } catch {
+                // Silent — Supabase may occasionally deliver an
+                // error fragment; the log store captured intent.
+            }
+            return
+        }
+
         guard url.scheme == "openclicky" else { return }
 
         switch url.host {
@@ -2116,7 +2562,19 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: AppBundleConfiguration.userAdvancedModeDefaultsKey)
         if !enabled {
             codexHUDWindowManager.hide()
+            stopAgentMessagesPolling()
         }
+    }
+
+    /// Public hide path callable from anywhere in the UI. Also stops
+    /// the /agent-messages long-poll so we don't burn requests while
+    /// the HUD isn't visible.
+    func hideCodexHUD() {
+        HeyClickyLog.log("agent.hud_hiding", lane: "agent", direction: "internal", [
+            "stage": "S3_hud_opens"
+        ])
+        codexHUDWindowManager.hide()
+        stopAgentMessagesPolling()
     }
 
     func setAnthropicAPIKey(_ apiKey: String) {
@@ -2173,6 +2631,15 @@ final class CompanionManager: ObservableObject {
 
     func setVoiceTranscriptionProvider(_ providerID: String) {
         buddyDictationManager.setTranscriptionProvider(providerID)
+        // Warm on component activation. Picking mirage Deepgram from
+        // Advanced Providers while staying on a non-mirage profile still
+        // needs the token pre-minted + TLS opened so the first PTT press
+        // does not lose its opening syllables to cold-start latency.
+        if providerID == BuddyTranscriptionProviderID.mirageDeepgram.rawValue {
+            Task.detached(priority: .utility) {
+                await MirageDeepgramClient.shared.warm()
+            }
+        }
     }
 
     func setCodexAgentAPIKey(_ apiKey: String) {
@@ -2250,6 +2717,68 @@ final class CompanionManager: ObservableObject {
     func start() {
         loadBundledKnowledgeIndex()
         refreshAllPermissions()
+        SKIModeDockMirror.shared.attach(companionManager: self)
+        SKIModeHotkeyMonitor.shared.start()
+        SKIModeHandsFreeSession.shared.reconcile()
+        wireSKIModeHotkeyHandlers()
+        wireSKIModeHandsFreeHandler()
+        wireSKIModeMiniChatTextHandler()
+        wireMirageMiniChatTextHandler()
+        wirePTTLongTermMemoryLogger()
+        // Peeky parity: warm the Deepgram proxy token + TLS immediately on
+        // start when mirage is the active profile, so the very first PTT
+        // press after app launch doesn't pay the 2s cold-start (which was
+        // eating the first ~2s of the user's actual voice recording).
+        if OpenClickyProfileCatalog.activeProfile().id == "mirage" {
+            Task.detached(priority: .utility) {
+                await MirageDeepgramClient.shared.warm()
+                await MirageCartesiaClient.shared.warm()
+                _ = await OpenClickyIntentClassifier.shared.bootstrap()
+            }
+        }
+        // Play TTS + surface a response card for any tts.speak the CLI
+        // agent writes to commands.jsonl, whether or not it was the reply
+        // to a PTT utterance. Unsolicited agent turns work too.
+        NotificationCenter.default.addObserver(
+            forName: SKIModeConversationStore.agentDidSpeak,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice",
+                direction: "internal",
+                event: "openclicky.ski.agentDidSpeak_received",
+                fields: ["textPreview": String((note.userInfo?["text"] as? String ?? "").prefix(60))]
+            )
+            guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                await self?.speakSKIModeAgentReply(text)
+            }
+        }
+        // CLI signalled `agent.done` — its turn is over even if the
+        // last tts.speak is still finishing playback. Clear the in-
+        // flight flag so the next pipeline call can return the UI to
+        // .idle. Don't force .idle here — TTS playback may still be
+        // running; speakSKIModeAgentReply's completion path handles
+        // that transition.
+        NotificationCenter.default.addObserver(
+            forName: SKIModeConversationStore.turnDidFinish,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.isSKITurnInFlight = false
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "internal",
+                event: "openclicky.ski.turn_did_finish_observed",
+                fields: [:]
+            )
+            // If nothing else is running, drop the pill.
+            if self.voiceState == .processing {
+                self.voiceState = .idle
+                self.notchCaptureWindowManager.updateBackendStatusCaption(nil)
+            }
+        }
         // Warm ScreenCaptureKit's window enumeration so the first
         // screenshot after a key press doesn't pay the cold-start tax.
         CompanionScreenCaptureUtility.prewarmShareableContent()
@@ -2272,11 +2801,17 @@ final class CompanionManager: ObservableObject {
             startWakeWordListeningIfNeeded(reason: "startup")
         }
         bindAgentSessionObservation()
+        // F27 review Issue 2 — start the external-control bridge BEFORE
+        // auto-resuming codex sessions. rmcp's `startup_timeout_sec` in
+        // config.toml also cushions the race, but binding the listener
+        // first eliminates the ECONNREFUSED window entirely when the
+        // bridge lands on its primary port. Bind-fallback still takes
+        // extra ms; the config `startup_timeout_sec = 10` covers that.
+        startExternalControlBridgeIfNeeded()
         startRelaunchableAgentAutoResumeChecks()
         if runtimeMode == .menuBar, !agentDockItems.isEmpty {
             showAgentDockWindowNearCurrentScreen()
         }
-        startExternalControlBridgeIfNeeded()
         if runtimeMode == .menuBar && isTutorModeEnabled {
             startTutorIdleObservation()
         }
@@ -2318,7 +2853,19 @@ final class CompanionManager: ObservableObject {
             if selectedVoiceResponseModel.provider == .codex || AppBundleConfiguration.openAIAPIKey() == nil {
                 codexVoiceSession.warmUp(systemPrompt: currentVoiceResponseSystemPrompt())
             }
+        case .heyclickyFree:
+            break
+        case .peekyFree:
+            // Free-tier Claude via aegis-proxy. Skip warm-up so we never spend
+            // one of the ~20-turn daily quota on a probe request; the first
+            // real user turn opens the connection.
+            break
         }
+        // Wire the Cartesia mirage tokenProvider closure for whatever
+        // provider the user booted into. `setTTSProvider` handles this on
+        // every subsequent switch; we mirror it here so the very first
+        // TTS call after launch resolves the right auth path.
+        bindCartesiaTokenProviderForCurrentProvider()
         // Force-init the active TTS provider and prime its TLS
         // handshake. The first sentence's TTS request would otherwise
         // pay the cold-connect tax synchronously inside the streaming
@@ -2334,9 +2881,24 @@ final class CompanionManager: ObservableObject {
         // still granted, show the cursor overlay immediately. If permissions
         // were revoked (e.g. signing change), don't show the cursor — the
         // panel will show the permissions UI instead.
-        if hasCompletedOnboarding && isClickyCursorEnabled {
+        // The cursor is meant to be ALWAYS on screen (idle mascot, or
+        // waveform/spinner/ring during voice). Any gate here that skips
+        // `showCursorOverlayIfAvailable` at boot means the user can
+        // launch OpenClicky and see nothing — which they've correctly
+        // flagged as broken. Only the actual permission / user toggle
+        // may withhold it:
+        //   - isClickyCursorEnabled: explicit user preference
+        //   - hasAccessibilityPermission: enforced inside
+        //     `showCursorOverlayIfAvailable` (cursor can't follow the
+        //     real system pointer without it). Backfilled from the
+        //     permission-polling refresh once granted.
+        if isClickyCursorEnabled {
             showCursorOverlayIfAvailable()
         }
+
+        // HeyClicky Free subsystems (F2 review action): bridge server,
+        // quota-fallback router, observers, proactive refresh loop.
+        startHeyClickyFreeSubsystems()
     }
 
     /// Called by BlueCursorView after the buddy finishes its pointing
@@ -2443,14 +3005,50 @@ final class CompanionManager: ObservableObject {
 
     private func startExternalControlBridgeIfNeeded() {
         guard externalControlBridgeServer == nil else { return }
+        // Publish self so sensor tools (like openclicky_simulate_voice_turn)
+        // can reach app-level state without threading a full reference
+        // through every static dispatch site.
+        OpenClickyExternalControlBridgeServer.setCompanionManagerAnchor(self)
         let server = OpenClickyExternalControlBridgeServer { [weak self] command in
             guard let self else {
                 return .error(503, "OpenClicky is not ready")
             }
             return await self.handleExternalControlCommand(command)
         }
+        // F27 review Issue 1 — if the bind-fallback ladder lands the
+        // bridge on a port other than the one baked into the current
+        // config.toml, re-render so codex reconnects to the correct
+        // URL on next spawn. Callback fires on the bridge queue; hop
+        // to the main actor for CodexHomeManager access.
+        server.onPortResolved = { [weak self] boundPort in
+            Task { @MainActor [weak self] in
+                self?.rewriteCodexConfigIfPortChanged(boundPort: boundPort)
+                self?.openClickyMCPBridgePort = boundPort
+            }
+        }
         externalControlBridgeServer = server
         server.start()
+    }
+
+    /// F27 fix — re-render `config.toml` when the bridge binds on a
+    /// port different from what the last config write assumed. Reads
+    /// the file, checks for the current bound URL, and writes only if
+    /// the port has drifted. Failures are logged but non-fatal: the
+    /// next full `prepare(bundle:)` will overwrite the config anyway.
+    private func rewriteCodexConfigIfPortChanged(boundPort: UInt16) {
+        let expectedURL = "http://127.0.0.1:\(boundPort)/mcp/sensor"
+        let configFile = codexHomeManager.codexHomeDirectory
+            .appendingPathComponent("config.toml", isDirectory: false)
+        if let existing = try? String(contentsOf: configFile, encoding: .utf8),
+           existing.contains(expectedURL) {
+            return
+        }
+        do {
+            _ = try codexHomeManager.writeCodexConfigFromSettings()
+            print("OpenClicky: re-rendered CodexHome config.toml for bridge port \(boundPort)")
+        } catch {
+            print("OpenClicky: failed to re-render CodexHome config.toml for port \(boundPort): \(error)")
+        }
     }
 
     private func handleExternalControlCommand(_ command: OpenClickyExternalControlCommand) async -> OpenClickyExternalControlResponse {
@@ -2496,7 +3094,823 @@ final class CompanionManager: ObservableObject {
             return .accepted(["notified": true, "identifier": identifier])
         case .unavailable(let statusCode, let body):
             return OpenClickyExternalControlResponse(statusCode: statusCode, body: body)
+        case .automationRawThreadLaunch(let threadID, let content, let isFollowUp):
+            // Directly POST /codex-thread-launch with a caller-
+            // specified thread_id, to probe whether the server
+            // hydrates prior conversation history for the current
+            // account. Used to test cross-account thread ownership.
+            do {
+                let payload: [String: Any] = [
+                    "user_prompt": content,
+                    "thread_id": threadID,
+                    "role": "text",
+                    "content": content,
+                    "is_follow_up": isFollowUp,
+                    "is_demo": false,
+                    "is_proactive": false,
+                    "proactive_suggestion_id": NSNull()
+                ]
+                let body = try JSONSerialization.data(withJSONObject: payload)
+                let (data, resp) = try await HeyClickyProxyClient.shared.postJSON(
+                    path: AppBundleConfiguration.heyClickyThreadLaunchPath(),
+                    body: body,
+                    includeDictationReceipt: false
+                )
+                let respBody = String(data: data, encoding: .utf8) ?? "<binary>"
+                return .ok([
+                    "ok": true,
+                    "status": resp.statusCode,
+                    "responseBody": respBody
+                ])
+            } catch {
+                return .error(500, "raw thread-launch failed: \(error)")
+            }
+        case .automationAccountReset(let reason):
+            // Single-account quota reset: same email, wipe local
+            // session + drive Chrome ext through OAuth again to open
+            // a fresh 25-turn window. Sync entry returns quickly;
+            // completion fires `.heyClickyCredentialsRefreshed`.
+            let ok = HeyClickyAccountResetManager.shared.attemptReset(reason: reason)
+            return .ok([
+                "ok": ok,
+                "reason": reason,
+                "note": "Reset dispatched; listen on credentials-refreshed for completion."
+            ])
+        case .automationFollowUpAgent(let sessionIDStr, let prompt):
+            guard let uuid = UUID(uuidString: sessionIDStr),
+                  let session = codexAgentSessions.first(where: { $0.id == uuid }) else {
+                return .error(404, "session not found: \(sessionIDStr)")
+            }
+            submitAgentPrompt(prompt, to: session, includeScreenContext: false)
+            return .ok([
+                "ok": true,
+                "sessionID": sessionIDStr,
+                "acceptedPromptLen": prompt.count
+            ])
+        case .automationStartAgent(let title, let prompt, let workingDir, let reasoningEffort):
+            return await handleAutomationStartAgent(title: title, prompt: prompt, workingDir: workingDir, reasoningEffort: reasoningEffort)
+        case .automationStopAgent(let sessionIDStr):
+            return handleAutomationStopAgent(sessionIDStr: sessionIDStr)
+        case .automationSessionState(let sessionIDStr):
+            return handleAutomationSessionState(sessionIDStr: sessionIDStr)
+        case .automationListSessions:
+            return handleAutomationListSessions()
+        case .automationInjectFault(let kind, let sessionIDStr):
+            return await handleAutomationInjectFault(kind: kind, sessionIDStr: sessionIDStr)
+        case .automationSimulateVoiceTurn(let transcript):
+            return await handleAutomationSimulateVoiceTurn(transcript: transcript)
+        case .automationSimulateSKIUtterance(let transcript):
+            return await handleAutomationSimulateSKIUtterance(transcript: transcript)
+        case .automationSetActiveProfile(let profileID):
+            return handleAutomationSetActiveProfile(profileID: profileID)
+        case .automationLogTail(let count):
+            return handleAutomationLogTail(count: count)
+        case .automationDeleteSession(let sessionIDStr):
+            return handleAutomationDeleteSession(sessionIDStr: sessionIDStr)
+        case .automationDeleteSessionsByTitleContains(let needle):
+            return handleAutomationDeleteSessionsByTitleContains(needle)
+        case .automationTriggerOAuthLogin(let email):
+            return await handleAutomationTriggerOAuthLogin(email: email)
+        case .automationAuthStatus:
+            return handleAutomationAuthStatus()
+        case .automationFreePlan(let query, let systemContext, let saveToPath, let sessionName, let appendToFile):
+            return await handleAutomationFreePlan(query: query, systemContext: systemContext, saveToPath: saveToPath, sessionName: sessionName, appendToFile: appendToFile)
+        case .automationFreePlanClear(let sessionName):
+            HeyClickyFreePlanningClient.shared.clearSession(name: sessionName)
+            return .ok(["cleared": sessionName])
+        case .automationFreeConsult(let query, let systemContext, let sessionName, let imagePath, let capabilities):
+            return await handleAutomationFreeConsult(query: query, systemContext: systemContext, sessionName: sessionName, imagePath: imagePath, capabilities: capabilities)
         }
+    }
+
+    /// Rich advisor-tool dispatch. Returns text + structured channels
+    /// (point/typing/walkthrough/widgets) so MCP callers can build
+    /// UI-automation or multimodal flows on top.
+    @MainActor
+    private func handleAutomationFreeConsult(
+        query: String,
+        systemContext: String?,
+        sessionName: String?,
+        imagePath: String?,
+        capabilities: [String]
+    ) async -> OpenClickyExternalControlResponse {
+        var request = HeyClickyFreePlanningClient.PlanRequest(
+            query: query,
+            systemContext: systemContext,
+            sessionName: sessionName,
+            timeoutSeconds: 120
+        )
+        request.imagePath = imagePath
+        request.capabilities = capabilities.isEmpty ? ["clipboard_copy"] : capabilities
+        do {
+            let result = try await HeyClickyFreePlanningClient.shared.generatePlan(request)
+            var body: [String: Any] = [
+                "text": result.text,
+                "textLen": result.text.count,
+                "channel": "msgs",
+                "session": sessionName ?? "",
+                "hasImage": (imagePath?.isEmpty == false)
+            ]
+            if let clip = result.clipboardText, !clip.isEmpty {
+                body["clipboardText"] = clip
+            }
+            if let pt = result.point {
+                body["point"] = pt
+            }
+            if let ty = result.typing {
+                body["typing"] = ty
+            }
+            let ws = result.widgets
+            if !ws.isEmpty {
+                body["widgets"] = ws
+            }
+            let beats = result.walkthroughBeats
+            if !beats.isEmpty {
+                body["walkthroughBeats"] = beats
+            }
+            return .ok(body)
+        } catch {
+            return .error(502, "advisor consult failed: \(error)")
+        }
+    }
+
+    /// Free-tier planning via the msgs channel. Zero agent credit;
+    /// consumes 1 msgs quota (25/day). Response text is returned
+    /// inline and optionally written to a file so a downstream Codex
+    /// agent can read it as TASK.md / architecture doc. When
+    /// `sessionName` is set, prior turns are threaded through the
+    /// query prefix so the model can continue a multi-part document.
+    @MainActor
+    private func handleAutomationFreePlan(
+        query: String,
+        systemContext: String?,
+        saveToPath: String?,
+        sessionName: String?,
+        appendToFile: Bool
+    ) async -> OpenClickyExternalControlResponse {
+        do {
+            let result = try await HeyClickyFreePlanningClient.shared.generatePlan(
+                .init(query: query, systemContext: systemContext, sessionName: sessionName, timeoutSeconds: 120)
+            )
+            var savedTo = ""
+            if let path = saveToPath, !path.isEmpty {
+                let url = URL(fileURLWithPath: path)
+                let parent = url.deletingLastPathComponent()
+                try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+                if appendToFile,
+                   let existing = try? String(contentsOf: url, encoding: .utf8) {
+                    let combined = existing + "\n\n" + result.text
+                    try combined.write(to: url, atomically: true, encoding: .utf8)
+                } else {
+                    try result.text.write(to: url, atomically: true, encoding: .utf8)
+                }
+                savedTo = path
+            }
+            return .ok([
+                "text": result.text,
+                "textLen": result.text.count,
+                "savedTo": savedTo,
+                "channel": "msgs",
+                "session": sessionName ?? ""
+            ])
+        } catch {
+            return .error(502, "free plan failed: \(error)")
+        }
+    }
+
+    @MainActor
+    private func handleAutomationAuthStatus() -> OpenClickyExternalControlResponse {
+        let token = AppBundleConfiguration.heyClickySessionAccessToken()
+        let signedIn = (token?.isEmpty == false)
+        let expires = AppBundleConfiguration.heyClickySessionExpiresAt()
+        let extAlive = HeyClickyChromeBridgeServer.shared.isExtensionAlive
+        // Expose a short prefix + suffix so automation can spot-check
+        // the actual bearer without leaking the full JWT.
+        let preview: String
+        if let t = token, t.count > 24 {
+            preview = "\(t.prefix(12))...\(t.suffix(8))"
+        } else {
+            preview = token ?? ""
+        }
+        return .ok([
+            "signedIn": signedIn,
+            "tokenLen": token?.count ?? 0,
+            "tokenPreview": preview,
+            "expiresAt": expires?.timeIntervalSince1970 ?? 0,
+            "chromeExtAlive": extAlive
+        ])
+    }
+
+    @MainActor
+    private func handleAutomationTriggerOAuthLogin(email: String?) async -> OpenClickyExternalControlResponse {
+        guard HeyClickyChromeBridgeServer.shared.isExtensionAlive else {
+            return .error(503, "Chrome extension not connected on :3011")
+        }
+        // Build authorize URL WITHOUT the signedIn precondition —
+        // reachable when the local session is fully wiped.
+        let authorizeURL: URL
+        do {
+            let base = try AppBundleConfiguration.heyClickyOAuthAuthorizeURL()
+            var comps = URLComponents(url: base, resolvingAgainstBaseURL: false)!
+            var items = comps.queryItems ?? []
+            if !items.contains(where: { $0.name == "prompt" }) {
+                items.append(URLQueryItem(name: "prompt", value: "select_account"))
+            }
+            if let email, !email.isEmpty, !items.contains(where: { $0.name == "login_hint" }) {
+                items.append(URLQueryItem(name: "login_hint", value: email))
+            }
+            if !items.contains(where: { $0.name == "clicky_auto" }) {
+                items.append(URLQueryItem(name: "clicky_auto", value: "1"))
+            }
+            comps.queryItems = items
+            guard let url = comps.url else {
+                return .error(500, "authorize URL build failed")
+            }
+            authorizeURL = url
+        } catch {
+            return .error(500, "authorize URL missing: \(error)")
+        }
+        // Full drive: open tab, wait navigation, click account chooser
+        // row, wait callback. First-time sign-in flow.
+        let bridge = HeyClickyChromeBridgeServer.shared
+        let tabId = await bridge.openTab(url: authorizeURL.absoluteString, active: false)
+        guard let tabId else {
+            return .error(503, "chrome-ext failed to open tab")
+        }
+        // wait for Google account chooser
+        _ = await bridge.waitForNavigation(matching: "accounts.google.com", timeout: 15)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        // Try many selectors (same set as reset flow)
+        var clicked = false
+        var clickedSelector = ""
+        if let email {
+            let selectors = [
+                "[data-identifier=\"\(email)\"][role=\"link\"]",
+                "[data-identifier=\"\(email)\"]",
+                "[data-email=\"\(email)\"]",
+                "li[data-identifier]",
+                "div[data-identifier][role=\"link\"]",
+                "div[data-identifier]",
+                "[role=\"link\"][aria-label*=\"\(email)\"]",
+                "[jsname][data-identifier]"
+            ]
+            for sel in selectors {
+                if await bridge.click(tabId: tabId, selector: sel, textMatch: email, timeout: 3) {
+                    clicked = true; clickedSelector = sel; break
+                }
+            }
+        }
+        // consent page — click Continue if present
+        if await bridge.waitForNavigation(matching: "signin/oauth/consent", timeout: 3) != nil {
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            _ = await bridge.click(
+                tabId: tabId,
+                selector: "#submit_approve_access, button[jsname=\"LgbsSe\"]",
+                textMatch: "Continue|Allow|继续|允许",
+                timeout: 4
+            )
+        }
+        // wait for either callback nav OR credentials refresh notif
+        let nav = await bridge.waitForNavigation(matching: "clicky://auth-callback", timeout: 60)
+        await bridge.closeTab(tabId: tabId)
+        return .ok([
+            "authorize": authorizeURL.absoluteString,
+            "chromeTabID": tabId,
+            "chooserClicked": clicked,
+            "chooserSelector": clickedSelector,
+            "callbackSeen": nav != nil,
+            "signedIn": AppBundleConfiguration.heyClickySessionAccessToken()?.isEmpty == false
+        ])
+    }
+
+    @MainActor
+    private func handleAutomationDeleteSession(sessionIDStr: String) -> OpenClickyExternalControlResponse {
+        guard let sessionID = UUID(uuidString: sessionIDStr) else {
+            return .error(400, "sessionID must be a UUID")
+        }
+        return deleteAgentSessionsAndDock(sessionIDs: [sessionID])
+    }
+
+    @MainActor
+    private func handleAutomationDeleteSessionsByTitleContains(_ needle: String) -> OpenClickyExternalControlResponse {
+        let matches = codexAgentSessions.filter { $0.title.contains(needle) }.map { $0.id }
+        return deleteAgentSessionsAndDock(sessionIDs: matches)
+    }
+
+    @MainActor
+    private func deleteAgentSessionsAndDock(sessionIDs: [UUID]) -> OpenClickyExternalControlResponse {
+        var deleted: [String] = []
+        for sessionID in sessionIDs {
+            // Stop first so any in-flight lease + codex process gets
+            // cleaned up before we drop the session reference.
+            if codexAgentSessions.contains(where: { $0.id == sessionID }) {
+                stopCodexAgentSession(sessionID, reason: "automation_delete")
+            }
+            codexAgentSessions.removeAll { $0.id == sessionID }
+            agentDockItems.removeAll { $0.sessionID == sessionID }
+            archivedSessionIDs.remove(sessionID)
+            agentStatusCancellables[sessionID] = nil
+            agentActivityCancellables[sessionID] = nil
+            agentLoopActivityCancellables[sessionID] = nil
+            agentProgressStageCancellables[sessionID] = nil
+            agentTitleCancellables[sessionID] = nil
+            deleted.append(sessionID.uuidString)
+        }
+        // Persist so the next launch doesn't restore what we just wiped.
+        scheduleRelaunchableAgentSessionsPersist()
+        return .ok(["deleted": deleted, "count": deleted.count])
+    }
+
+    // MARK: - Automation self-test surface
+
+    @MainActor
+    private func handleAutomationStartAgent(title: String, prompt: String, workingDir: String?, reasoningEffort: String? = nil) async -> OpenClickyExternalControlResponse {
+        // Automation-launched sessions default to `xhigh` reasoning
+        // effort — long-run tasks benefit from deeper reasoning, and
+        // free-tier proxy hides the per-token dollar cost from us.
+        // Caller can override with a specific level for quick tasks.
+        let effort = reasoningEffort?.trimmingCharacters(in: .whitespaces)
+        let effective = (effort?.isEmpty == false) ? effort! : "xhigh"
+        UserDefaults.standard.set(effective, forKey: "clickyCodexReasoningEffort")
+        HeyClickyLog.log("codex.automation_effort_set", lane: "agent",
+                         direction: "internal", ["effort": effective])
+        // Create a new heyclicky-free agent session and immediately submit
+        // the prompt. Caller gets sessionID back and can poll state via
+        // /agent/session/state?sessionID=<id>.
+        let session = CodexAgentSession(
+            title: title,
+            accentTheme: Self.nextAgentDockAccentTheme(existingCount: agentDockItems.count),
+            claudeAgentSDKAPI: nil
+        )
+        // Override cwd if caller specified one. Without this, codex
+        // starts in the user's home directory and cannot find any
+        // task files the automation harness seeded into a temp dir —
+        // agent then goes searching /Users/wowdd1 / /tmp trying to
+        // guess the workdir (real symptom observed 2026-07-21).
+        if let dir = workingDir?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !dir.isEmpty {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: dir, isDirectory: &isDir),
+               isDir.boolValue {
+                session.workingDirectoryPath = dir
+            }
+        }
+        codexAgentSessions.append(session)
+        activeCodexAgentSessionID = session.id
+        observeCodexAgentSession(session)
+        let dockItem = ClickyAgentDockItem(
+            id: session.id,
+            sessionID: session.id,
+            title: title,
+            userInstruction: prompt,
+            accentTheme: session.accentTheme,
+            status: .starting,
+            progressStageLabel: "Starting",
+            progressStepText: nil,
+            activityStatusLines: [],
+            caption: nil,
+            suggestedNextActions: [],
+            createdAt: Date()
+        )
+        agentDockItems.append(dockItem)
+        // Ensure the dock window is actually visible on-screen. Without
+        // this, external drivers (MCP orchestrate, HTTP bridge) can
+        // start agents while the UI shows nothing — array is populated
+        // but the AppKit window was never displayed.
+        showAgentDockWindowNearCurrentScreen()
+        // Automation-started tasks need a strong hint that this is a
+        // FRESH task, unrelated to anything previous. Codex's own
+        // persistent memory + rollout history can bleed prior task
+        // context into a new session, causing symptoms like
+        // "I already completed this task, result in /tmp/old-workdir/"
+        // (real bug observed 2026-07-21 22:27). The fence tells the
+        // model: forget history, only use files in this workdir.
+        let sessionFence = """
+        === NEW ISOLATED SESSION START ===
+        Session ID: \(session.id.uuidString)
+        Working directory: \(session.workingDirectoryPath)
+
+        This is a BRAND-NEW, INDEPENDENT task. Ignore ALL prior
+        conversation history, prior PROGRESS.md files in other
+        directories, and any memory of previous work. The ONLY
+        authoritative state is the files in this specific working
+        directory. Do NOT reference any workdir path other than the
+        one above.
+
+        === TASK BEGINS BELOW ===
+
+        \(prompt)
+        """
+        // Queue the objective for the preamble to set right after
+        // thread/launch (before turn/start), so codex daemon
+        // injects the goal into the FIRST /responses call. If we
+        // set it later, first-turn reasoning misses it.
+        session.pendingThreadGoalObjective = extractGoalFromWorkdir(session.workingDirectoryPath, fallback: session.title)
+
+        submitAgentPrompt(sessionFence, to: session, includeScreenContext: false)
+        return .ok([
+            "sessionID": session.id.uuidString,
+            "title": title,
+            "acceptedPromptLen": prompt.count
+        ])
+    }
+
+    private func extractGoalFromWorkdir(_ dir: String, fallback: String) -> String {
+        let taskPath = (dir as NSString).appendingPathComponent("TASK.md")
+        guard let content = try? String(contentsOfFile: taskPath, encoding: .utf8) else {
+            return fallback
+        }
+        // Extract lines from `GOAL:` up to next uppercase header
+        // (`END STATE`, `CONSTRAINTS`, `DELIVERABLES`, blank double).
+        let lines = content.components(separatedBy: "\n")
+        var collecting = false
+        var buf: [String] = []
+        for line in lines {
+            let stripped = line.trimmingCharacters(in: .whitespaces)
+            if !collecting {
+                // Accept: "GOAL:", "GOAL", "# GOAL", "## GOAL",
+                // "# GOAL:" (markdown template variants).
+                let normalized = stripped
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+                    .trimmingCharacters(in: .whitespaces)
+                if stripped.hasPrefix("GOAL:") || normalized == "GOAL" || normalized == "GOAL:" {
+                    collecting = true
+                    let after = stripped.hasPrefix("GOAL:") ? String(stripped.dropFirst(5)) : ""
+                    if !after.trimmingCharacters(in: .whitespaces).isEmpty {
+                        buf.append(after.trimmingCharacters(in: .whitespaces))
+                    }
+                }
+                continue
+            }
+            // Stop on the next markdown header (# / ## line) or
+            // all-caps header (line with ':' AND uppercase word).
+            let isMarkdownHeader = stripped.hasPrefix("#")
+            let looksLikeHeader = stripped.hasSuffix(":")
+                && stripped == stripped.uppercased()
+                && stripped.count < 40
+                && !stripped.isEmpty
+            if isMarkdownHeader || looksLikeHeader { break }
+            buf.append(line)
+        }
+        let goal = buf.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return goal.isEmpty ? fallback : goal
+    }
+
+    @MainActor
+    private func handleAutomationStopAgent(sessionIDStr: String) -> OpenClickyExternalControlResponse {
+        guard let sessionID = UUID(uuidString: sessionIDStr) else {
+            return .error(400, "sessionID must be a UUID")
+        }
+        guard codexAgentSessions.contains(where: { $0.id == sessionID }) else {
+            return .error(404, "session not found")
+        }
+        stopCodexAgentSession(sessionID, reason: "automation_stop")
+        return .ok(["stoppedSessionID": sessionIDStr])
+    }
+
+    @MainActor
+    private func handleAutomationSessionState(sessionIDStr: String?) -> OpenClickyExternalControlResponse {
+        let sessions: [CodexAgentSession]
+        if let sessionIDStr, let sessionID = UUID(uuidString: sessionIDStr) {
+            sessions = codexAgentSessions.filter { $0.id == sessionID }
+        } else {
+            sessions = codexAgentSessions
+        }
+        let payload: [[String: Any]] = sessions.map { s in
+            var stateStr = "unknown"
+            switch s.status {
+            case .starting: stateStr = "starting"
+            case .running: stateStr = "running"
+            case .ready: stateStr = "ready"
+            case .stopped: stateStr = "stopped"
+            case .failed(let msg):
+                stateStr = "failed: \(msg.prefix(200))"
+            }
+            let progress = String(describing: s.progressStage)
+            let lastEntry = s.entries.last.map {
+                "\($0.role.rawValue): \(String($0.text.prefix(300)))"
+            } ?? ""
+            return [
+                "sessionID": s.id.uuidString,
+                "title": s.title,
+                "model": s.model,
+                "status": stateStr,
+                "progressStage": progress,
+                "entryCount": s.entries.count,
+                "lastEntry": lastEntry,
+                "lastError": s.lastErrorMessage ?? "",
+                "lastSubmittedPrompt": s.lastSubmittedPromptText ?? "",
+                "activeThreadID": s.activeThreadID ?? "",
+                "pendingResumeID": s.pendingThreadResumeID ?? "",
+                "stopReason": s.stopReason ?? "",
+                "hasLease": s.currentHeyClickyLease != nil,
+                "leaseID": s.currentHeyClickyLease?.leaseID ?? ""
+            ]
+        }
+        return .ok(["sessions": payload, "count": sessions.count])
+    }
+
+    @MainActor
+    private func handleAutomationListSessions() -> OpenClickyExternalControlResponse {
+        let payload: [[String: Any]] = codexAgentSessions.map { s in
+            var stateStr = "unknown"
+            switch s.status {
+            case .starting: stateStr = "starting"
+            case .running: stateStr = "running"
+            case .ready: stateStr = "ready"
+            case .stopped: stateStr = "stopped"
+            case .failed(let msg): stateStr = "failed: \(msg.prefix(80))"
+            }
+            return [
+                "sessionID": s.id.uuidString,
+                "title": s.title,
+                "status": stateStr,
+                "progressStage": String(describing: s.progressStage),
+                "isHeyClicky": s.model.hasPrefix("heyclicky-free-")
+            ]
+        }
+        return .ok(["sessions": payload, "count": codexAgentSessions.count])
+    }
+
+    @MainActor
+    private func handleAutomationInjectFault(kind: String, sessionIDStr: String?) async -> OpenClickyExternalControlResponse {
+        let targetSession: CodexAgentSession? = {
+            if let sessionIDStr, let sessionID = UUID(uuidString: sessionIDStr) {
+                return codexAgentSessions.first(where: { $0.id == sessionID })
+            }
+            return codexAgentSession
+        }()
+        switch kind {
+        case "kill_codex":
+            // Simulate a REAL codex crash: fire the exited notification
+            // WITHOUT calling session.stop() — the real crash path never
+            // sets stopReason, never resets progressStage to .idle, so
+            // the auto_replay observer must see the same "still-mid-turn"
+            // state as production. Previously we called stop() which
+            // pinned progressStage=idle and made hasInterruptedInFlightTurn
+            // return false, and set stopReason="automation_kill_codex"
+            // which the classifier COULD mistakenly treat as terminal
+            // in the future.
+            NotificationCenter.default.post(
+                name: .heyClickyCodexProcessExited,
+                object: nil,
+                userInfo: ["exit_status": Int32(-9)]
+            )
+            return .ok(["injected": "kill_codex", "note": "posted heyClickyCodexProcessExited without stop()"])
+        case "expire_credentials":
+            HeyClickySessionTokenClient.shared.invalidateAll()
+            NotificationCenter.default.post(name: .clickyHeyClickyCredentialsRefreshed, object: nil)
+            return .ok(["injected": "expire_credentials"])
+        case "trigger_turn_limit":
+            if let s = targetSession {
+                NotificationCenter.default.post(
+                    name: .heyClickyRequestAutoContinueReplay,
+                    object: nil,
+                    userInfo: ["session_id": s.id.uuidString]
+                )
+                return .ok(["injected": "trigger_turn_limit", "sessionID": s.id.uuidString])
+            }
+            return .error(404, "no session")
+        case "trigger_402_quota":
+            if let s = targetSession {
+                await s.handle402MidChat(errorText: "unexpected status 402 Payment Required: {\"error\":\"quota_exhausted\"}")
+                return .ok(["injected": "trigger_402_quota"])
+            }
+            return .error(404, "no session")
+        case "trigger_428":
+            if let s = targetSession {
+                await s.handle402MidChat(errorText: "unexpected status 428 Precondition Required: {\"error\":\"agent_turn_lease_required\"}")
+                return .ok(["injected": "trigger_428"])
+            }
+            return .error(404, "no session")
+        default:
+            return .error(400, "unknown fault kind: \(kind)")
+        }
+    }
+
+    @MainActor
+    /// Fire the same downstream pipeline a real PTT voice turn triggers,
+    /// but with a hard-coded transcript instead of the WS's STT result.
+    /// Bypasses mic/audio-engine/Realtime-WS entirely. Returns the
+    /// assistant text + a summary of what got written to the vault so
+    /// automated tests can assert without polling log tails.
+    /// Simulate an SKI-Mode utterance end-to-end WITHOUT hardware mic.
+    /// Builds the full UtteranceContext (LTM/xlb/stash/window/mcp URL+
+    /// token/hints), writes `utterance.final` to the pinned workspace's
+    /// `.oc/events.jsonl`, returns the emitted event JSON for
+    /// assertion.
+    private func handleAutomationSimulateSKIUtterance(transcript: String) async -> OpenClickyExternalControlResponse {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .error(400, "transcript is empty")
+        }
+        guard let workspace = await OpenClickyAgentsPresenceStore.shared.effectiveActiveWorkspace() else {
+            return .error(409, "no active SKI workspace (pin one or focus a git repo)")
+        }
+        let ctx = await buildSKIUtteranceContext(userQuery: trimmed)
+        let reply = await OpenClickyFileBridge.shared.writeUtteranceAndAwait(
+            workspace: workspace,
+            text: trimmed,
+            context: ctx,
+            timeoutSeconds: 0.1
+        )
+        // Read the last events.jsonl line for the caller so they can
+        // assert on context/hints without a separate file read.
+        // FIX(task #326 F4): read the events file OFF main-actor via
+        // Task.detached — the file grows unbounded and syncronous
+        // Data(contentsOf:) on the main thread stalls the app.
+        let eventsPath = workspace.appendingPathComponent(".oc/events.jsonl")
+        let lastEvent: [String: Any] = await Task.detached(priority: .utility) {
+            () -> [String: Any] in
+            guard let data = try? Data(contentsOf: eventsPath),
+                  let text = String(data: data, encoding: .utf8) else { return [:] }
+            for line in text.split(separator: "\n").reversed() {
+                if let d = line.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                   (obj["event"] as? String) == "utterance.final" {
+                    return obj
+                }
+            }
+            return [:]
+        }.value
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice", direction: "internal",
+            event: "automation.simulate_ski_utterance.ok",
+            fields: [
+                "transcript_len": String(trimmed.count),
+                "workspace": workspace.path,
+                "reply_received": reply != nil ? "yes" : "no",
+                "hint_keys": String(describing:
+                    ((lastEvent["context"] as? [String: Any])?["hints"] as? [String: Any])?.keys.sorted() ?? []
+                )
+            ]
+        )
+        return .ok([
+            "workspace": workspace.path,
+            "transcript": trimmed,
+            "emitted_event": lastEvent
+        ])
+    }
+
+    private func handleAutomationSetActiveProfile(profileID: String) -> OpenClickyExternalControlResponse {
+        let candidates = OpenClickyProfileCatalog.all.map(\.id)
+        guard candidates.contains(profileID) else {
+            return .error(400, "unknown profile '\(profileID)'; valid: \(candidates.joined(separator: ", "))")
+        }
+        let profile = OpenClickyProfileCatalog.profile(withID: profileID)
+        // applyProfile does the full lifecycle: switch UserDefaults keys +
+        // start/stop subsystems (heyclicky bridge, mirage classifier warm,
+        // SKI reconcile). Same entry the UI's profile selector uses.
+        applyProfile(profile)
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice", direction: "internal",
+            event: "automation.set_active_profile.ok",
+            fields: [
+                "profile_id": profileID,
+                "response_model_id": profile.responseModelID,
+                "stt_provider": profile.sttProvider,
+                "tts_provider": profile.ttsProvider
+            ])
+        return .ok([
+            "ok": true,
+            "profile_id": profileID,
+            "response_model_id": profile.responseModelID,
+            "stt_provider": profile.sttProvider,
+            "tts_provider": profile.ttsProvider
+        ])
+    }
+
+    private func handleAutomationSimulateVoiceTurn(transcript: String) async -> OpenClickyExternalControlResponse {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .error(400, "transcript is empty")
+        }
+        let startedAt = Date()
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice", direction: "internal",
+            event: "automation.simulate_voice_turn.begin",
+            fields: ["transcript_len": trimmed.count,
+                     "preview": String(trimmed.prefix(60))])
+
+        // 1. Preflight snapshot — same as real PTT press does before WS
+        //    commits, so the LTM block sees consistent context.
+        await HeyClickyChatToolCallClient.capturePTTSnapshot()
+
+        // 2. Fire the dialog model via the same path realtime tool-call
+        //    "openclicky_use_screen_context" fans out to — LTM + query
+        //    hits + heyclicky_free chat.
+        let systemPrompt = currentVoiceResponseSystemPrompt()
+        let history = voiceConversationHistoryForAPI()
+        // Parity with _analyzeVoiceResponseCore: inject the xlb hint block
+        // when Settings > xlinkBook Integration is enabled so automation
+        // tests exercise the same prompt shape as a real PTT turn.
+        await XLBSensorTools.resetTurnBudget()
+        // Suppress screen / clipboard / typing / caption side effects.
+        // Real PTT + realtime paths leave this off.
+        self.suppressVoiceResponseSideEffects = true
+        defer { self.suppressVoiceResponseSideEffects = false }
+        // Voice-triggered profile switch pre-empts any lane dispatch. Same
+        // handler `analyzeVoiceResponse` uses so the automation path stays
+        // in lockstep with the real PTT path.
+        if let switched = handleVoiceProfileSwitch(trimmed) {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "internal",
+                event: "automation.simulate_voice_turn.profile_switched",
+                fields: ["reply": switched])
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            return .ok([
+                "ok": true,
+                "assistantText": switched,
+                "assistantLen": switched.count,
+                "elapsedMs": elapsedMs
+            ])
+        }
+
+        let injectedPrompt = await CompanionManager.applyXLBHintIfEnabled(to: trimmed)
+        // Profile-aware dispatch. HeyClicky was hardcoded here; now honour
+        // the active profile so `openclicky_set_profile` + this simulator
+        // exercises the correct lane end-to-end. Mirage → orchestrator;
+        // every other profile → HeyClicky chat tool-call (unchanged).
+        let activeProfileID = OpenClickyProfileCatalog.activeProfile().id
+        let assistantText: String
+        do {
+            switch activeProfileID {
+            case "mirage":
+                let contextBrief = await buildMirageContextBrief(userQuery: injectedPrompt)
+                let result = await MiragePeekyOrchestrator.shared.runTurn(
+                    transcript: injectedPrompt,
+                    modelForBranches: selectedModel,
+                    contextBrief: contextBrief,
+                    onTextChunk: { _ in }
+                )
+                if let err = result.error { throw err }
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.mirage.turn_completed",
+                    fields: [
+                        "intent": result.intent.rawValue,
+                        "tool_calls": result.toolCalls.count,
+                        "text_len": result.text.count
+                    ])
+                assistantText = result.text
+            default:
+                assistantText = try await HeyClickyChatToolCallClient.shared.analyzeVoiceResponse(
+                    companionManager: self,
+                    images: [],
+                    systemPrompt: systemPrompt,
+                    conversationHistory: history,
+                    userPrompt: injectedPrompt,
+                    onTextChunk: { _ in }
+                )
+            }
+        } catch {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "error",
+                event: "automation.simulate_voice_turn.chat_failed",
+                fields: ["error": "\(error)"])
+            return .error(500, "chat failed: \(error.localizedDescription)")
+        }
+
+        // 3. Automation source: do NOT persist to vault / LTM.
+        // Test-generated turns previously polluted user's screen history
+        // and LTM retrievals with synthetic prompts. Real PTT / realtime
+        // paths still persist via their own rememberVoiceExchange call.
+
+        let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice", direction: "internal",
+            event: "automation.simulate_voice_turn.ok",
+            fields: ["elapsedMs": elapsedMs,
+                     "assistant_len": assistantText.count,
+                     "assistant_preview": String(assistantText.prefix(80))])
+        return .ok([
+            "ok": true,
+            "elapsedMs": elapsedMs,
+            "transcript": trimmed,
+            "assistantText": assistantText,
+            "assistantLen": assistantText.count,
+        ])
+    }
+
+    private func handleAutomationLogTail(count: Int) -> OpenClickyExternalControlResponse {
+        // Read the on-disk JSONL log tail — same file heyclicky writes.
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSHomeDirectory())
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        let logPath = base
+            .appendingPathComponent("OpenClicky", isDirectory: true)
+            .appendingPathComponent("Logs", isDirectory: true)
+            .appendingPathComponent("messages-\(fmt.string(from: Date())).jsonl")
+        guard let data = try? Data(contentsOf: logPath),
+              let text = String(data: data, encoding: .utf8) else {
+            return .ok(["lines": [], "count": 0])
+        }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        let slice = lines.suffix(count).map { String($0) }
+        return .ok(["lines": slice, "count": slice.count])
     }
 
     private func showExternalPrimaryCursor(at point: CGPoint, caption: String?, duration: TimeInterval, accentHex: String?, travelDuration: TimeInterval) {
@@ -3278,7 +4692,11 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
+        stopHeyClickyFreeSubsystems()
         globalPushToTalkShortcutMonitor.stop()
+        contextAwarenessHotkeys.stop()
+        OpenClickyAutoCaptureService.shared.stop()
+        OpenClickyAnnotationBadgeOverlay.shared.stop()
         wakeWordManager.stop(reason: "companion_stop")
         buddyDictationManager.cancelCurrentDictation()
         cancelCircleSelectSession()
@@ -3353,8 +4771,39 @@ final class CompanionManager: ObservableObject {
 
         if currentlyHasAccessibility {
             globalPushToTalkShortcutMonitor.start()
+            // Phase 7 Layer 4 UX hotkeys share the accessibility gate:
+            // the CGEvent tap needs the same permission the PTT monitor
+            // needs, and the AgentPickElement action does AX walks.
+            contextAwarenessHotkeys.start()
+            // AutoCaptureService: observes PickStash.shared change events
+            // and fires ContextStashWriter.captureAutoPin() ~100ms
+            // debounced so a pin refreshes the on-disk stash without a
+            // manual SnapshotContext press. Mirrors Everywhere's
+            // `AutoCaptureService` (AutoCaptureService.cs:20-107).
+            OpenClickyAutoCaptureService.shared.start()
+            // Phase 7.1 annotation badge overlay observes PickStash /
+            // AnnotationStash / WhiteboardStash notifications and drops
+            // the red ➕ badge next to each pinned element. Needs the
+            // same accessibility gate because delta-follow subscribes
+            // to AXObserver notifications on the target's owning app.
+            OpenClickyAnnotationBadgeOverlay.shared.start()
+            // Backfill: at cold boot the polling loop may find true a
+            // few ticks after `start()` ran with the initial `false`,
+            // and no one else calls `showCursorOverlayIfAvailable`
+            // when the flag flips. Result: the mascot silently never
+            // appears until the user toggles cursor / triggers PTT.
+            // User's expectation is the cursor is ALWAYS on screen.
+            if !previouslyHadAccessibility,
+               hasCompletedOnboarding,
+               isClickyCursorEnabled,
+               !isOverlayVisible {
+                showCursorOverlayIfAvailable()
+            }
         } else {
             globalPushToTalkShortcutMonitor.stop()
+            contextAwarenessHotkeys.stop()
+            OpenClickyAutoCaptureService.shared.stop()
+            OpenClickyAnnotationBadgeOverlay.shared.stop()
         }
 
         hasScreenRecordingPermission = WindowPositionManager.hasScreenRecordingPermission()
@@ -3536,20 +4985,55 @@ final class CompanionManager: ObservableObject {
         promptForMicrophoneIfNotDetermined()
     }
 
-    /// Polls all permissions frequently so the UI updates live after the
-    /// user grants them in System Settings. Screen Recording is the exception —
-    /// macOS requires an app restart for that one to take effect.
+    /// Adaptive permission polling. 1.5 s while anything is still
+    /// missing (so the UI flips immediately when the user grants
+    /// in System Settings), 60 s once everything is granted (idle
+    /// wakeups drop by 40×, meaningful over an all-day session).
     private func startPermissionPolling() {
-        accessibilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        schedulePermissionCheck(interval: 1.5)
+    }
+
+    private func schedulePermissionCheck(interval: TimeInterval) {
+        accessibilityCheckTimer?.invalidate()
+        accessibilityCheckTimer = Timer.scheduledTimer(
+            withTimeInterval: interval, repeats: true
+        ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.refreshAllPermissions()
+                guard let self else { return }
+                self.refreshAllPermissions()
+                // FIX(perf-2026-08-01): previous fast-poll interval
+                // was 1.5 s and stayed there forever whenever any
+                // permission was denied — user perpetually paid 40
+                // main-actor hops per minute doing sync TCC checks.
+                // Widen fast-poll to 10 s (still snappy when user
+                // grants a perm in Settings; UI notices within 10 s).
+                let allGranted = self.everythingGranted()
+                if allGranted && interval < 60 {
+                    self.schedulePermissionCheck(interval: 60)
+                } else if !allGranted && interval > 15 {
+                    self.schedulePermissionCheck(interval: 10)
+                }
             }
         }
     }
 
+    private func everythingGranted() -> Bool {
+        return hasAccessibilityPermission
+            && hasMicrophonePermission
+            && hasScreenRecordingPermission
+    }
+
     private func bindAudioPowerLevel() {
+        // FIX(perf-2026-08-01): audio power level upstream fires every
+        // ~20 ms while mic is active — every write drove `CompanionManager`
+        // @Published change, which forced every observing SwiftUI view
+        // in the app to re-diff (57 @Published fields on one monolithic
+        // ObservableObject). Coalesce: only forward changes larger than
+        // 0.02, and only publish at most every ~50 ms. Cuts SwiftUI
+        // work by ~5× while keeping the level bar visually smooth.
         audioPowerCancellable = buddyDictationManager.$currentAudioPowerLevel
-            .receive(on: DispatchQueue.main)
+            .throttle(for: .milliseconds(50), scheduler: DispatchQueue.main, latest: true)
+            .removeDuplicates { abs($0 - $1) < 0.02 }
             .sink { [weak self] powerLevel in
                 self?.currentAudioPowerLevel = powerLevel
             }
@@ -3642,6 +5126,9 @@ final class CompanionManager: ObservableObject {
     }
 
     private func observeCodexAgentSession(_ session: CodexAgentSession) {
+        // Perf: heavy sinks (entries / activityStatusLines / progressStage)
+        // are installed lazily. Cheap sinks (status / title) install once.
+        installHeavyAgentSinksIfNeeded(session: session)
         guard agentStatusCancellables[session.id] == nil else { return }
 
         session.onOpenableFileFound = { [weak self, weak session] fileURL in
@@ -3651,7 +5138,7 @@ final class CompanionManager: ObservableObject {
 
         agentStatusCancellables[session.id] = session.$status
             .receive(on: DispatchQueue.main)
-            .sink { [weak self, sessionID = session.id] status in
+            .sink { [weak self, sessionID = session.id, weak session] status in
                 guard let self else { return }
                 if status != .stopped {
                     self.cancelPendingAgentDockItemRemoval(for: sessionID)
@@ -3661,26 +5148,84 @@ final class CompanionManager: ObservableObject {
                 self.scheduleWidgetSnapshotPublish()
                 self.scheduleRelaunchableAgentSessionsPersist()
                 self.updateAgentProgressNarration()
-            }
-
-        agentActivityCancellables[session.id] = session.$entries
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self, sessionID = session.id] _ in
-                self?.scheduleAgentActivityRefresh(for: sessionID)
-                self?.scheduleRelaunchableAgentSessionsPersist()
-            }
-
-        agentLoopActivityCancellables[session.id] = session.$activityStatusLines
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self, sessionID = session.id] _ in
-                self?.scheduleAgentActivityRefresh(for: sessionID)
-            }
-
-        agentProgressStageCancellables[session.id] = session.$progressStage
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.refreshNotchAgentLiveActivity()
-                self?.scheduleRelaunchableAgentSessionsPersist()
+                // Direct-from-status auto-replay: when a heyclicky-free
+                // session transitions to .failed WITHOUT going through
+                // the codex-exited / turn-limit / creds-refreshed paths
+                // (e.g. transient error the classifier didn't match),
+                // still trigger recovery by posting the same auto-continue
+                // notification the turn_limit / 428 branches use. The
+                // observer in CompanionManager+HeyClicky already runs
+                // hasInterruptedInFlightTurn + debounce checks.
+                // Perf: on .stopped, drop the three heavy per-turn
+                // sinks (entries / activityStatusLines / progressStage)
+                // so long-lived stopped sessions (archived, restored
+                // from disk, failed but not closed) don't retain Combine
+                // pipelines + captured closures forever. Re-attach lazily
+                // when the session leaves .stopped in `reobserveIfNeeded`.
+                if case .stopped = status {
+                    self.agentActivityCancellables[sessionID] = nil
+                    self.agentLoopActivityCancellables[sessionID] = nil
+                    self.agentProgressStageCancellables[sessionID] = nil
+                } else if let session {
+                    self.installHeavyAgentSinksIfNeeded(session: session)
+                }
+                if case .failed = status, let session, session.model.hasPrefix("heyclicky-free-") {
+                    // Skip replay for sessions the user has abandoned
+                    // (archived, explicitly stopped, or never touched
+                    // this app-run — session restored from disk).
+                    // The observer in CompanionManager+HeyClicky also
+                    // checks `isUserInitiatedStop`, but signaling here
+                    // still costs a log line + wakes the loop; short-
+                    // circuit at source. Also skip once the per-session
+                    // failure budget is exhausted (no assistant output
+                    // advance across N tries = quota/lease-exhausted).
+                    let archived = self.archivedSessionIDs.contains(sessionID)
+                    let userStopped = ["agent_panel_stop","agent.stop_button","agent.stop_button_pressed","agent_dock_stop","agent_hud_stop","agent_task_cancelled","user_stop","user_cancel","session_stopped","chat_workspace_archived","manual_stop"].contains(session.stopReason ?? "")
+                    let notEngaged = !self.userEngagedSessionIDs.contains(sessionID)
+                    if archived || userStopped || notEngaged {
+                        HeyClickyLog.log("codex.status_failed_replay_suppressed",
+                                         lane: "agent", direction: "internal",
+                                         ["session_id_prefix": String(sessionID.uuidString.prefix(8)),
+                                          "reason": archived ? "archived" : (userStopped ? "user_stopped" : "not_engaged_this_run")])
+                    } else if !heyClickyObserverStore.shouldAttemptRecovery(sessionID: sessionID, currentEntryCount: session.entries.filter { $0.role == .assistant }.count) {
+                        let cooldown = heyClickyObserverStore.cooldownRemaining(sessionID: sessionID)
+                        HeyClickyLog.log("codex.status_failed_replay_budget_exhausted",
+                                         lane: "agent", direction: "internal",
+                                         ["session_id_prefix": String(sessionID.uuidString.prefix(8)),
+                                          "attempts": heyClickyObserverStore.currentFailureCount(sessionID: sessionID),
+                                          "cooldownSeconds": Int(cooldown)])
+                        // Arm a wake-up timer so recovery re-fires
+                        // after cooldown lapses. Without this the
+                        // session sits dead until a manual user turn.
+                        if cooldown > 0 {
+                            Task { @MainActor [weak self, weak session] in
+                                try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000) + 500_000_000)
+                                guard let self, let session else { return }
+                                guard case .failed = session.status else { return }
+                                if session.model.hasPrefix("heyclicky-free-") {
+                                    HeyClickyLog.log("codex.cooldown_wake_replay",
+                                                     lane: "agent", direction: "internal",
+                                                     ["session_id_prefix": String(sessionID.uuidString.prefix(8))])
+                                    NotificationCenter.default.post(
+                                        name: .heyClickyRequestAutoContinueReplay,
+                                        object: nil,
+                                        userInfo: ["session_id": sessionID.uuidString]
+                                    )
+                                }
+                                _ = self
+                            }
+                        }
+                    } else {
+                        NotificationCenter.default.post(
+                            name: .heyClickyRequestAutoContinueReplay,
+                            object: nil,
+                            userInfo: ["session_id": sessionID.uuidString]
+                        )
+                        HeyClickyLog.log("codex.status_failed_replay_signaled",
+                                         lane: "agent", direction: "internal",
+                                         ["session_id_prefix": String(sessionID.uuidString.prefix(8))])
+                    }
+                }
             }
 
         agentTitleCancellables[session.id] = session.$title
@@ -3690,6 +5235,100 @@ final class CompanionManager: ObservableObject {
                 self?.refreshNotchAgentLiveActivity()
                 self?.scheduleRelaunchableAgentSessionsPersist()
             }
+    }
+
+    /// Perf: heavy per-turn sinks that stream `$entries`, `$activityStatusLines`,
+    /// and `$progressStage`. Split out so they can be dropped when the
+    /// session enters `.stopped` and re-installed lazily on re-observe.
+    private func installHeavyAgentSinksIfNeeded(session: CodexAgentSession) {
+        if agentActivityCancellables[session.id] == nil {
+            agentActivityCancellables[session.id] = session.$entries
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self, sessionID = session.id] _ in
+                    self?.scheduleAgentActivityRefresh(for: sessionID)
+                    self?.scheduleRelaunchableAgentSessionsPersist()
+                }
+        }
+        if agentLoopActivityCancellables[session.id] == nil {
+            agentLoopActivityCancellables[session.id] = session.$activityStatusLines
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self, sessionID = session.id] _ in
+                    self?.scheduleAgentActivityRefresh(for: sessionID)
+                }
+        }
+        if agentProgressStageCancellables[session.id] == nil {
+            agentProgressStageCancellables[session.id] = session.$progressStage
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self, sessionID = session.id, weak session] stage in
+                    self?.handleProgressStageChange(sessionID: sessionID, session: session, stage: stage)
+                }
+        }
+    }
+
+    /// Extracted from the `$progressStage` sink so re-installing it (via
+    /// `installHeavyAgentSinksIfNeeded`) doesn't require duplicating a
+    /// ~70-line closure body.
+    private func handleProgressStageChange(sessionID: UUID,
+                                           session: CodexAgentSession?,
+                                           stage: CodexAgentProgressStage) {
+        refreshNotchAgentLiveActivity()
+        scheduleRelaunchableAgentSessionsPersist()
+        if let session, session.model.hasPrefix("heyclicky-free-") {
+            let isActive: Bool = {
+                switch stage {
+                case .starting, .planning, .executing, .composing: return true
+                default: return false
+                }
+            }()
+            let anyN = session.entries.count
+            if heyClickyObserverStore.recordProgressAndCheckTimeout(
+                sessionID: sessionID,
+                assistantEntryCount: anyN,
+                isActive: isActive) {
+                HeyClickyLog.log("codex.turn_watchdog_timeout_kill",
+                                 lane: "agent", direction: "internal",
+                                 ["session_id_prefix": String(sessionID.uuidString.prefix(8))])
+                session.stop(reason: "turn_watchdog_timeout")
+                NotificationCenter.default.post(
+                    name: .heyClickyCodexProcessExited,
+                    object: nil,
+                    userInfo: ["exit_status": -9]
+                )
+                heyClickyObserverStore.resetWatchdog(sessionID: sessionID)
+            }
+        }
+        guard let session else { return }
+        guard session.model.hasPrefix("heyclicky-free-") else { return }
+        guard stage == .completed || stage == .idle else { return }
+        guard session.entries.count <= 3 else { return }
+        guard session.lastSubmittedPromptText?.isEmpty == false else { return }
+        if case .stopped = session.status { return }
+        Task { @MainActor [weak self, weak session] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let self, let session else { return }
+            guard session.entries.count <= 3 else { return }
+            if self.archivedSessionIDs.contains(sessionID) { return }
+            let userReasons: Set<String> = ["agent_panel_stop","agent.stop_button","agent.stop_button_pressed","agent_dock_stop","agent_hud_stop","agent_task_cancelled","user_stop","user_cancel","session_stopped","chat_workspace_archived","manual_stop"]
+            if userReasons.contains(session.stopReason ?? "") { return }
+            if !heyClickyObserverStore.shouldAttemptRecovery(sessionID: sessionID, currentEntryCount: session.entries.filter { $0.role == .assistant }.count) {
+                HeyClickyLog.log("codex.zombie_completion_budget_exhausted",
+                                 lane: "agent", direction: "internal",
+                                 ["session_id_prefix": String(sessionID.uuidString.prefix(8))])
+                return
+            }
+            HeyClickyLog.log("codex.zombie_completion_replay",
+                             lane: "agent", direction: "internal",
+                             [
+                                "session_id_prefix": String(sessionID.uuidString.prefix(8)),
+                                "entries": session.entries.count,
+                                "stage": "\(stage)"
+                             ])
+            NotificationCenter.default.post(
+                name: .heyClickyRequestAutoContinueReplay,
+                object: nil,
+                userInfo: ["session_id": sessionID.uuidString]
+            )
+        }
     }
 
     private func refreshNotchAgentLiveActivity() {
@@ -3748,6 +5387,12 @@ final class CompanionManager: ObservableObject {
                 && !archivedSessionIDs.contains(session.id)
                 && !autoResumedRelaunchSessionIDs.contains(session.id)
         }
+        HeyClickyLog.log("agent.auto_resume_check", lane: "agent", direction: "internal", [
+            "stage": "S2_agent_process_launch",
+            "trigger": trigger,
+            "total_sessions": codexAgentSessions.count,
+            "to_resume": sessionsToResume.count
+        ])
         guard !sessionsToResume.isEmpty else { return }
 
         let ids = sessionsToResume.map(\.id)
@@ -3970,6 +5615,721 @@ final class CompanionManager: ObservableObject {
     /// The mini-chat dies with the parent HUD via `MiniChatPanelManager.shared.destroyAll()`.
     func popoutCurrentSession() {
         let session = codexAgentSession
+        MiniChatPanelManager.shared.show(session: session, companion: self)
+    }
+
+    /// Open the compact mini-chat NSPanel for a specific agent dock item —
+    /// invoked by the "Mini" hover action on the top-right agent dock card.
+    /// Skips the full CodexHUD (`ChatWorkspaceView` with sidebar / archive /
+    /// header) so the user sees a lean chat surface for that session.
+    /// Insert or update a dock item for a SKI Mode session (used by
+    /// SKIModeDockMirror). Bypasses the private(set) on agentDockItems
+    /// so the mirror doesn't have to live inside CompanionManager.swift.
+    /// Play a SKI Mode agent-side tts.speak line through the active
+    /// TTS client and surface a response card. Used when the reply
+    /// arrives outside the PTT->analyzeVoiceResponse path (unsolicited
+    /// or after the 8-second file-bridge wait timed out).
+    func speakSKIModeAgentReply(_ text: String) async {
+        // Respect the silent-mode toggle (Ctrl+Shift+V by default): the
+        // bubble transcript already surfaced the reply via the tail
+        // loop, so skipping the TTS playback matches SKI's toggle_silent
+        // behaviour (visual-only feedback).
+        if UserDefaults.standard.bool(forKey: SKIModeHotkeyMonitor.Keys.isSilent) {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "internal",
+                event: "openclicky.ski.speakReplySkipped",
+                fields: ["reason": "silent_mode", "textLen": String(text.count)]
+            )
+            return
+        }
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice",
+            direction: "internal",
+            event: "openclicky.ski.speakReplyStart",
+            fields: ["ttsClient": String(describing: type(of: voiceTTSClient)), "textLen": String(text.count)]
+        )
+        // Clear the "SKI · thinking" caption now that a reply is
+        // actually landing. speakText below will drive its own UI.
+        notchCaptureWindowManager.updateBackendStatusCaption(nil)
+        // Also persist the assistant reply into transcript_word so
+        // LTM has the full turn. Pair with the last user utterance.
+        if !text.isEmpty {
+            rememberVoiceExchange(
+                userTranscript: lastTranscript ?? "",
+                assistantResponse: text,
+                reason: "ski_mode_agent_reply"
+            )
+        }
+        let card = ClickyResponseCard(
+            source: .voice,
+            rawText: text,
+            contextTitle: lastTranscript ?? ""
+        )
+        latestVoiceResponseCard = card
+        // Schedule auto-fade per Settings → SKI Mode → bubble_fade_ms.
+        // 0 or negative disables auto-fade; the card stays until the
+        // next reply replaces it.
+        // FIX(task #326 UI-12): cancel any prior fade task so rapid
+        // re-speak doesn't leave stray sleepers racing to clear the
+        // card just after the NEW card was set.
+        skiFadeTask?.cancel()
+        skiFadeTask = nil
+        let fadeMs = UserDefaults.standard.integer(forKey: "openclicky.ski.bubbleFadeMs")
+        if fadeMs > 0 {
+            let cardID = card.id
+            skiFadeTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(fadeMs) * 1_000_000)
+                guard let self = self else { return }
+                if Task.isCancelled { return }
+                if self.latestVoiceResponseCard?.id == cardID {
+                    self.latestVoiceResponseCard = nil
+                }
+            }
+        }
+        // Floor management, audio only.
+        //
+        // Reached from the `agentDidSpeak` observer, which fires whenever an
+        // external CLI writes a `tts.speak` to commands.jsonl — including
+        // unsolicited turns with no PTT utterance behind them. Without a
+        // floor check this audio starts on top of whatever is already
+        // happening: the user mid-dictation, a previous reply still playing,
+        // a realtime session live. Every other deferred-speech path already
+        // waits (`speakSystemAnnouncementAfterCurrentTTS`); this one did not.
+        //
+        // The wait is deliberately placed HERE, after the response card and
+        // `rememberVoiceExchange` — those must land immediately. The bubble
+        // is the user's feedback that the agent replied, and the exchange is
+        // paired against `lastTranscript`, which can change during a wait.
+        // Only the speaker is deferred.
+        //
+        // Wait rather than drop: an agent reply is worth a few seconds of
+        // delay. The shared helper bounds that at 30 s, then gives up.
+        if systemAnnouncementAudioWouldCollideWithVoiceInput {
+            guard await waitForSystemAnnouncementSlot(sessionID: nil) else {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.speakReplySkipped",
+                    fields: ["reason": "floor_busy_timeout", "textLen": String(text.count)]
+                )
+                return
+            }
+        }
+
+        let client = voiceTTSClient
+        // Resolve the active workspace once so we can emit `tts.done`
+        // (or `tts.interrupted`) to the same .oc/events.jsonl the CLI
+        // skill is tailing.
+        let ttsWorkspace = await OpenClickyAgentsPresenceStore.shared.effectiveActiveWorkspace()
+        do {
+            if let edge = client as? MicrosoftEdgeTTSClient {
+                try await edge.speakText(text)
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.speakReplyDone",
+                    fields: ["path": "edge"])
+            } else if let el = client as? ElevenLabsTTSClient {
+                try await el.speakText(text, waitUntilFinished: true, onPlaybackStarted: nil)
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.speakReplyDone",
+                    fields: ["path": "elevenlabs"])
+            } else {
+                // Fall back to the streaming path.
+                let session = client.beginStreamingResponse(onPlaybackStarted: {})
+                session.appendText(text)
+                try await session.finish()
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.speakReplyDone",
+                    fields: ["path": "streaming_fallback"])
+            }
+            if let ws = ttsWorkspace {
+                await OpenClickyFileBridge.shared.emitEventLine(
+                    workspace: ws,
+                    payload: [
+                        "event": "tts.done",
+                        "ts": Date().timeIntervalSince1970
+                    ]
+                )
+            }
+        } catch {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice",
+                direction: "internal",
+                event: "openclicky.ski.speakReplyFailed",
+                fields: ["error": "\(error)"]
+            )
+            if let ws = ttsWorkspace {
+                await OpenClickyFileBridge.shared.emitEventLine(
+                    workspace: ws,
+                    payload: [
+                        "event": "tts.interrupted",
+                        "reason": "\(error)",
+                        "ts": Date().timeIntervalSince1970
+                    ]
+                )
+            }
+        }
+    }
+
+    func upsertSKIModeDockItem(_ item: ClickyAgentDockItem) {
+        if let idx = agentDockItems.firstIndex(where: { $0.id == item.id }) {
+            if agentDockItems[idx] != item {
+                agentDockItems[idx] = item
+            }
+        } else {
+            agentDockItems.append(item)
+        }
+    }
+
+    func removeSKIModeDockItem(id: UUID) {
+        agentDockItems.removeAll { $0.id == id }
+    }
+
+    /// Ensure the existing agent-dock window is visible so SKI dock
+    /// bubbles surface. Uses the existing show path — no UI changes.
+    func presentAgentDockWindowForSKI() {
+        showAgentDockWindowNearCurrentScreen()
+    }
+
+    /// Port the OpenClicky external MCP bridge is listening on. Stored
+    /// once at `onPortResolved` and read when we build the SKI event
+    /// context so the CLI knows the URL for `mcp/sensor`.
+    var openClickyMCPBridgePort: UInt16?
+
+    /// True while a SKI-mode CLI turn is in flight (from bridge write
+    /// until `agent.done`). Blocks the pipeline's tail
+    /// `voiceState = .idle` reset — the CLI may still be running tool
+    /// calls, so idle is a lie until the CLI says done.
+    @Published var isSKITurnInFlight: Bool = false
+
+    /// Auto-fade handle for the SKI response card. Cancelled when a
+    /// new speak lands so rapid replies don't race.
+    private var skiFadeTask: Task<Void, Never>?
+
+    /// Assemble the SKI file-bridge `context` object for one utterance.
+    /// Each hint is gated on the toggle that would let the CLI use it:
+    /// if `Record screen` is off there is no OpenRewind history to
+    /// point at, so we don't advertise it. This keeps the CLI from
+    /// wasting a tool call on a source that has nothing to serve.
+    func buildSKIUtteranceContext(userQuery: String) async -> OpenClickyFileBridge.UtteranceContext {
+        var ctx = OpenClickyFileBridge.UtteranceContext()
+        let ud = UserDefaults.standard
+
+        // 1. Focused window (short) + Everywhere active window (full).
+        //    `focusedWindowLine` is the 1-line label the CLI shows /
+        //    routes on. `everywhereActiveWindowBrief` carries the
+        //    richer Everywhere block (title, URL, workdir, picked
+        //    context) so a CLI can decide whether to dig further via
+        //    the get_focused_window_ax MCP tool.
+        if let win = AssistAgentActiveWindow.capture() {
+            var shortParts: [String] = []
+            if !win.appName.isEmpty { shortParts.append(win.appName) }
+            if let f = win.filePath, !f.isEmpty {
+                shortParts.append((f as NSString).lastPathComponent)
+            } else if let u = win.browserURL, !u.isEmpty {
+                shortParts.append(u)
+            }
+            let shortBrief = shortParts.joined(separator: " · ")
+            if !shortBrief.isEmpty {
+                ctx.focusedWindowLine = shortBrief
+            }
+            // Everywhere brief adds URL / workdir / picked-context
+            // hints beyond the compact focused_window label.
+            var richParts: [String] = []
+            if !win.appName.isEmpty { richParts.append("app=\(win.appName)") }
+            if let t = win.windowTitle, !t.isEmpty {
+                richParts.append("title=\"" + String(t.prefix(60)) + "\"")
+            }
+            if let u = win.browserURL, !u.isEmpty { richParts.append("url=\(u)") }
+            if let w = win.inferredWorkdir, !w.isEmpty { richParts.append("workdir=\(w)") }
+            if !win.pickedItems.isEmpty { richParts.append("picked=\(win.pickedItems.count)") }
+            let richBrief = richParts.joined(separator: " · ")
+            if !richBrief.isEmpty && richBrief != shortBrief {
+                ctx.everywhereActiveWindowBrief = richBrief +
+                    " — related tool: `get_focused_context`"
+            }
+        }
+
+        // 2. MCP endpoint — always emit so CLI can call any sensor tool.
+        if let port = openClickyMCPBridgePort {
+            ctx.mcpURL = "http://127.0.0.1:\(port)/mcp/sensor"
+        }
+        ctx.mcpToken = AppBundleConfiguration.externalControlBridgeToken()
+
+        // 3. LTM memories hit — transcript_word vault is populated
+        //    from PTT / SKI / voice replies too, NOT only from
+        //    screen recording. Don't gate on screen toggle.
+        if !userQuery.isEmpty {
+            let markdown = await LongTermMemoryContext.build(query: userQuery)
+            let trimmed = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                let firstLine = trimmed.split(separator: "\n").first.map(String.init) ?? ""
+                let bulletCount = trimmed.split(separator: "\n").filter { $0.hasPrefix("- ") }.count
+                let countText = bulletCount > 0 ? "\(bulletCount) LTM entries" : "LTM has context"
+                ctx.ltmMemoriesBrief = countText + " · " + String(firstLine.prefix(80)) +
+                    " — related tools: `openrewind.search` (returns items with segment_id), `openrewind.transcript segment_id=<Int64>` (full text of one segment)"
+            }
+        }
+
+        // 4. XLB topics — opt-in, gated by the Settings switch.
+        //    Previously read "openclicky.xlb.enabled" defaulting to true,
+        //    but that key is not what Settings writes, so this branch ran
+        //    unconditionally against an index that was itself disabled.
+        //    One accessor now, same as XLBTopicIndex.isEnabled().
+        if AppBundleConfiguration.xlbEnabled() {
+            let topics = await XLBTopicIndex.shared.fuzzyLookup(userQuery, limit: 3)
+            let names = topics.map(\.name).filter { !$0.isEmpty }
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "internal",
+                event: "openclicky.ski.buildContext.xlb_probe",
+                fields: [
+                    "query": String(userQuery.prefix(40)),
+                    "result_count": String(topics.count),
+                    "names_nonempty": String(names.count)
+                ]
+            )
+            if !names.isEmpty {
+                // Point the CLI at metadata first (cheap) before it
+                // decides which topic to expand — expanding a whole
+                // topic upfront can be hundreds of KB, but the
+                // metadata is a few hundred bytes and tells the CLI
+                // which sub-sections to fetch next.
+                // Neutral capability description — no rigid workflow.
+                // The CLI must decide sequencing / termination based on
+                // what the user actually asked; hard-coding a numbered
+                // recipe here would train the CLI to obey rather than
+                // adapt (overfits to the test transcript).
+                let topicsList = names.joined(separator: ", ")
+                var brief = "matched topics: " + topicsList
+                brief += ". xlb tools available: `xlb_get_topic_meta` (cheap; subsections + neighbors), "
+                brief += "`xlb_get_topic_section topic=\"...\" section=\"...\"` (specific section body), "
+                brief += "`xlb_get_topic` (full body — expensive)."
+                ctx.xlbTopicsBrief = brief
+            }
+        }
+
+        // 5. Stash context (PickStash / AnnotationStash / selection /
+        //    frontmost-app snippet). Sourced from hotkey actions, not
+        //    screen frames — don't gate on screen capture.
+        do {
+            let stash = currentStashContextForVoicePrompt()
+            if !stash.isEmpty {
+                let firstLine = stash.split(separator: "\n").first.map(String.init) ?? ""
+                ctx.screenOCRStashBrief = "stash: " + String(firstLine.prefix(80)) +
+                    " — related tool: `openrewind.recentActivity` (last ~60s on-screen OCR)"
+            }
+        }
+
+        // 6. Long-term OpenRewind frame history — gated on screen
+        //    capture toggle. Pre-search the FTS index for top-3 hits so
+        //    the CLI sees actual candidate frames right in the hint,
+        //    instead of a "recording is on" placeholder that forced a
+        //    second tool call for every question about the past screen.
+        if ud.bool(forKey: "openclicky.screenHistory.capture.screen"), !userQuery.isEmpty {
+            let hitsBrief: String? = await {
+                guard let bridge = await MainActor.run(body: { OpenRewindBridge.shared })
+                else { return nil }
+                let adapter = await MainActor.run { RewindDataAdapter(reader: bridge.reader) }
+                let hits = (try? await adapter.search(userQuery, limit: 3, hybrid: false)) ?? []
+                guard !hits.isEmpty else { return nil }
+                let iso = ISO8601DateFormatter()
+                let lines: [String] = hits.map { h in
+                    let ts = iso.string(from: h.entry.createdAt)
+                    let win = (h.entry.windowName ?? "").prefix(60)
+                    let snip = h.snippet.replacingOccurrences(of: "\n", with: " ").prefix(140)
+                    return "  - [\(h.entry.id) \(ts) \(win)] \(snip)"
+                }
+                return "screen history top hits (openrewind FTS on \"\(userQuery.prefix(60))\"):\n"
+                    + lines.joined(separator: "\n")
+                    + "\n  drill down: `openrewind.ask` / `openrewind.showFrame`"
+            }()
+            ctx.openrewindOCRHitsBrief = hitsBrief
+                ?? "screen history recording is on — related tool: `openrewind.ask` (no FTS hits for this query)"
+        }
+
+        // 7. Clipboard — no toggle, but skip empty.
+        if let cb = NSPasteboard.general.string(forType: .string),
+           !cb.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            ctx.clipboardBrief = "clipboard has \(cb.count) chars — related tool: `get_clipboard`"
+        }
+
+        return ctx
+    }
+
+    /// approve_before_send: send the currently-pending utterance to
+    /// the file bridge. Called by the notch approve button / a "send"
+    /// voice command.
+    func confirmPendingSKIUtterance() {
+        let payload = pendingSKIUtterance
+        pendingSKIUtterance = nil
+        guard let (text, workspace) = payload else { return }
+        Task { @MainActor [weak self] in
+            let ctx = await self?.buildSKIUtteranceContext(userQuery: text)
+            _ = await OpenClickyFileBridge.shared.writeUtteranceAndAwait(
+                workspace: workspace,
+                text: text,
+                context: ctx,
+                timeoutSeconds: 0.1
+            )
+        }
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice", direction: "internal",
+            event: "openclicky.ski.utterance_confirmed",
+            fields: ["preview": String(text.prefix(60))]
+        )
+    }
+
+    /// approve_before_send: discard the pending utterance.
+    func cancelPendingSKIUtterance() {
+        pendingSKIUtterance = nil
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice", direction: "internal",
+            event: "openclicky.ski.utterance_cancelled",
+            fields: [:]
+        )
+    }
+
+    /// Latest utterance waiting for user approval (approve_before_send).
+    /// Published so the notch panel's approve overlay updates reactively.
+    @Published var pendingSKIUtteranceText: String? = nil
+    var pendingSKIUtterance: (text: String, workspace: URL)? {
+        get { _pendingSKIUtterance }
+        set {
+            _pendingSKIUtterance = newValue
+            pendingSKIUtteranceText = newValue?.text
+        }
+    }
+    private var _pendingSKIUtterance: (text: String, workspace: URL)?
+
+    /// Subscribe to notifications published by SKIModeHotkeyMonitor.
+    /// `nextProject` / `toggleSilent` are handled entirely inside the
+    /// monitor + defaults; here we wire `captureScreen` and
+    /// `toggleWidget` because they need CompanionManager state.
+    /// Handle text submitted from the SKI mini-chat panel. Route
+    /// through the same buildSKIUtteranceContext + file-bridge path
+    /// the voice-response pipeline uses so typed prompts carry the
+    /// same MCP URL/token + hint context as spoken utterances.
+    private func wireSKIModeMiniChatTextHandler() {
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("com.openclicky.ski.textSubmitFromMiniChat"),
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self = self,
+                  let text = note.userInfo?["text"] as? String,
+                  let path = note.userInfo?["workspace"] as? String,
+                  !text.isEmpty else { return }
+            let workspace = URL(fileURLWithPath: path)
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                let ctx = await self.buildSKIUtteranceContext(userQuery: text)
+                _ = await OpenClickyFileBridge.shared.writeUtteranceAndAwait(
+                    workspace: workspace,
+                    text: text,
+                    context: ctx,
+                    timeoutSeconds: 0.1
+                )
+            }
+        }
+    }
+
+    /// Text-through channel for Peeky Free (mirage) — mirrors the SKI mini-
+    /// chat text handler. Anything posting to
+    /// `com.openclicky.mirage.textSubmit` (mini-chat, automation, external
+    /// bridge) fires a full mirage turn: build context brief, run the 5-
+    /// intent orchestrator, TTS + response card via the shared voice
+    /// pipeline. Bypasses the STT lane entirely so there is a real
+    /// keyboard-only path parity with HeyClicky Free / SKI Mode.
+    private func wireMirageMiniChatTextHandler() {
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("com.openclicky.mirage.textSubmit"),
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self = self,
+                  let text = (note.userInfo?["text"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                let modelID = self.selectedModel
+                let contextBrief = await self.buildMirageContextBrief(userQuery: text)
+                let result = await MiragePeekyOrchestrator.shared.runTurn(
+                    transcript: text,
+                    modelForBranches: modelID,
+                    contextBrief: contextBrief,
+                    onTextChunk: { _ in }
+                )
+                if !result.text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    self.rememberVoiceExchange(
+                        userTranscript: text,
+                        assistantResponse: result.text,
+                        reason: "peeky_free_text_\(result.intent.rawValue)"
+                    )
+                    self.latestVoiceResponseCard = ClickyResponseCard(
+                        source: .voice,
+                        rawText: result.text,
+                        contextTitle: text
+                    )
+                    do {
+                        try await self.voiceTTSClient.speakText(result.text, waitUntilFinished: true, onPlaybackStarted: nil)
+                    } catch {
+                        NSLog("[MiragePeeky] TTS failed on text-submit reply: \(error)")
+                    }
+                }
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.mirage.text_submit_completed",
+                    fields: [
+                        "intent": result.error == nil ? result.intent.rawValue : "error",
+                        "text_len": result.text.count,
+                        "tool_calls": result.toolCalls.count
+                    ]
+                )
+            }
+        }
+    }
+
+    /// Listen for hands-free captured PCM and pump it through the
+    /// active whisper provider + file bridge, matching the PTT flow.
+    /// Persist every PTT final transcript to the vault (Screen History
+    /// `transcript_word`) via ConversationLogger. Covers the user-only
+    /// case where no assistant reply follows: journaling, ESC-cancel,
+    /// SKI fire-and-forget without a `tts.speak` reply. When the LLM
+    /// path IS running, `rememberVoiceExchange` will log the same
+    /// text later; ConversationLogger dedupes per-segment.
+    private func wirePTTLongTermMemoryLogger() {
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("com.openclicky.voice.dictation.finalTranscriptForLTM"),
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self = self,
+                  let text = note.userInfo?["text"] as? String,
+                  !text.isEmpty else { return }
+            let reason = (note.userInfo?["reason"] as? String) ?? "unknown"
+            self.rememberUserUtteranceOnly(text, reason: "ptt_final." + reason)
+        }
+    }
+
+    private func wireSKIModeHandsFreeHandler() {
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("com.openclicky.ski.handsFreeUtteranceCaptured"),
+            object: nil,
+            queue: .main
+        ) { [weak self] notif in
+            guard let self = self,
+                  let samples = notif.userInfo?["samples"] as? [Int16] else { return }
+            self.handleSKIHandsFreeSamples(samples)
+        }
+    }
+
+    private func handleSKIHandsFreeSamples(_ samples: [Int16]) {
+        // Delegate to WhisperCppTranscriber directly (same path as
+        // PTT). Result goes into the file bridge as an utterance.
+        Task.detached { [weak self] in
+            guard let self = self else { return }
+            guard let workspaceURL = await OpenClickyAgentsPresenceStore.shared.effectiveActiveWorkspace() else {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.handsfree_no_workspace",
+                    fields: [:]
+                )
+                return
+            }
+            let utterance = AudioUtterance(
+                samples: samples,
+                sampleRate: 16_000,
+                startedAt: Date(),
+                duration: TimeInterval(samples.count) / 16_000.0,
+                onDiskURL: nil,
+                source: "mic"
+            )
+            let language = WhisperLocalPreferences.language()
+            let model = WhisperLocalPreferences.modelName()
+            let transcriber = WhisperCppTranscriber.shared(modelName: model, language: language)
+            let words: [AudioTranscriptWord]
+            do {
+                words = try await transcriber.transcribe(utterance: utterance)
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.handsfree_whisper_failed",
+                    fields: ["error": "\(error)"]
+                )
+                return
+            }
+            let text = words.map(\.text).joined(separator: " ")
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed.count > 1 else {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.handsfree_transcript_empty",
+                    fields: [:]
+                )
+                return
+            }
+            let ctx = await self.buildSKIUtteranceContext(userQuery: trimmed)
+            _ = await OpenClickyFileBridge.shared.writeUtteranceAndAwait(
+                workspace: workspaceURL,
+                text: trimmed,
+                context: ctx,
+                timeoutSeconds: 0.1
+            )
+        }
+    }
+
+    private func wireSKIModeHotkeyHandlers() {
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("com.openclicky.ski.captureScreenRequested"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.captureScreenForSKIActiveWorkspace()
+        }
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("com.openclicky.ski.toggleWidgetVisibility"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.toggleSKINotchVisibility()
+        }
+        NotificationCenter.default.addObserver(
+            forName: SKIModeConversationStore.voiceChangeRequested,
+            object: nil,
+            queue: .main
+        ) { notif in
+            guard let voice = notif.userInfo?["voice"] as? String, !voice.isEmpty else { return }
+            // Persist as an OpenClicky-visible pref so the Settings UI
+            // reflects the CLI-requested voice. Actual playback voice
+            // resolution happens in the active TTS client (edge/eleven).
+            UserDefaults.standard.set(voice, forKey: "openclicky.ski.preferredVoice")
+            // Map onto the concrete provider voice defaults keys so
+            // playback picks it up on the next utterance.
+            UserDefaults.standard.set(voice, forKey: "openClickyMicrosoftEdgeVoice")
+            UserDefaults.standard.set(voice, forKey: AppBundleConfiguration.userElevenLabsVoiceIDDefaultsKey)
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "internal",
+                event: "openclicky.ski.voice_set_applied",
+                fields: ["voice": voice]
+            )
+        }
+    }
+
+    /// Grab main display via SCScreenshotManager, save PNG under active
+    /// workspace's `.oc/screenshots/`, and append a `screen.captured`
+    /// event to `events.jsonl` (matching SKI's capture_screen hotkey).
+    private func captureScreenForSKIActiveWorkspace() {
+        Task { @MainActor in
+            guard let workspace = await OpenClickyAgentsPresenceStore.shared.effectiveActiveWorkspace() else {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.hotkey_capture_no_workspace",
+                    fields: [:]
+                )
+                return
+            }
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard let display = content.displays.first else { return }
+                let filter = SCContentFilter(display: display, excludingWindows: [])
+                let config = SCStreamConfiguration()
+                config.width = display.width
+                config.height = display.height
+                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                let rep = NSBitmapImageRep(cgImage: cgImage)
+                guard let pngData = rep.representation(using: .png, properties: [:]) else { return }
+
+                let dir = workspace.appendingPathComponent(".oc/screenshots", isDirectory: true)
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let stamp = ISO8601DateFormatter().string(from: Date())
+                    .replacingOccurrences(of: ":", with: "-")
+                let path = dir.appendingPathComponent("\(stamp).png")
+                try pngData.write(to: path)
+
+                let event: [String: Any] = [
+                    "event": "screen.captured",
+                    "session_id": UUID().uuidString,
+                    "path": path.path,
+                    "ts": Date().timeIntervalSince1970
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: event, options: []),
+                   var line = String(data: data, encoding: .utf8) {
+                    line += "\n"
+                    let eventsPath = workspace.appendingPathComponent(".oc/events.jsonl")
+                    if let handle = try? FileHandle(forWritingTo: eventsPath) {
+                        try? handle.seekToEnd()
+                        try? handle.write(contentsOf: Data(line.utf8))
+                        try? handle.close()
+                    } else {
+                        try? Data(line.utf8).write(to: eventsPath)
+                    }
+                }
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.hotkey_capture_ok",
+                    fields: ["path": path.path]
+                )
+            } catch {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.hotkey_capture_failed",
+                    fields: ["error": "\(error)"]
+                )
+                // Emit `screen.capture_failed` so the CLI skill can
+                // react (e.g. tell user to grant Screen Recording).
+                let reason: String
+                let errStr = "\(error)".lowercased()
+                if errStr.contains("permission") || errStr.contains("tccdeny") {
+                    reason = "screen_recording_permission"
+                } else {
+                    reason = String(errStr.prefix(120))
+                }
+                await OpenClickyFileBridge.shared.emitEventLine(
+                    workspace: workspace,
+                    payload: [
+                        "event": "screen.capture_failed",
+                        "reason": reason,
+                        "ts": Date().timeIntervalSince1970
+                    ]
+                )
+            }
+        }
+    }
+
+    private func toggleSKINotchVisibility() {
+        // The main panel exposes only show/dismiss via public API; a
+        // second invocation posts the standard dismiss notification.
+        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+        // Give the dismiss a beat to land before re-showing, so a
+        // second toggle press actually re-opens instead of no-op'ing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self = self else { return }
+            self.notchCaptureWindowManager.showMainInterfacePanel(companionManager: self)
+        }
+    }
+
+    /// Register a SKI-backed shim CodexAgentSession so the existing
+    /// chat/mini-chat panels can render it exactly like a real Codex
+    /// session. Idempotent by id.
+    func registerSKIShimAgentSession(_ shim: CodexAgentSession) {
+        guard !codexAgentSessions.contains(where: { $0.id == shim.id }) else { return }
+        codexAgentSessions.append(shim)
+    }
+
+    /// Remove a SKI shim session when its underlying SKI session goes
+    /// away.
+    func removeSKIShimAgentSession(id: UUID) {
+        codexAgentSessions.removeAll { $0.id == id }
+    }
+
+    func openMiniChatForAgentDockItem(_ itemID: UUID) {
+        guard let sessionID = agentDockItems.first(where: { $0.id == itemID })?.sessionID,
+              let session = codexAgentSessions.first(where: { $0.id == sessionID }) else {
+            return
+        }
+        selectCodexAgentSession(sessionID)
         MiniChatPanelManager.shared.show(session: session, companion: self)
     }
 
@@ -4305,6 +6665,18 @@ final class CompanionManager: ObservableObject {
             fields["transport"] = "codex_app_server_stdio"
             fields["streamingMethod"] = "codex_app_server_agentMessage_delta"
             fields["apiKeyFallback"] = AppBundleConfiguration.openAIAPIKey() != nil
+        case .heyclickyFree:
+            fields["executionMethod"] = "HeyClickyChatToolCallClient.analyzeVoiceResponse"
+            fields["authMode"] = "heyclicky_free_oauth"
+            fields["transport"] = "https_json"
+            fields["streamingMethod"] = "single_shot_response"
+            fields["provider"] = "heyclicky_free"
+        case .peekyFree:
+            fields["executionMethod"] = "analyzeMirageResponse"
+            fields["authMode"] = "mirage_rotating_uuid"
+            fields["transport"] = "https_sse"
+            fields["streamingMethod"] = "MirageBackendClient.sendStreamingChunks"
+            fields["provider"] = "mirage"
         }
 
         return fields
@@ -4318,6 +6690,11 @@ final class CompanionManager: ObservableObject {
             || voiceState == .processing
             || currentResponseTask != nil
             || realtimeBidirectionalVoiceTask != nil
+            // Also fire when an announcement Task is queued but has
+            // not yet reached the audio device — ESC should cancel
+            // "about to speak" too, not only "currently speaking".
+            || pendingSystemAnnouncementTask != nil
+            || speakingSystemAnnouncementSessionID != nil
 
         guard isVoiceActive else { return }
 
@@ -4388,6 +6765,53 @@ final class CompanionManager: ObservableObject {
             beginCircleSelectSessionIfEnabled()
 
             pendingKeyboardShortcutStartTask?.cancel()
+            // Cache routing lane at press. Release event must match — else
+            // a mid-hold provider swap strands the HeyClicky WS mic-open.
+            pttPressedRoutedToHeyClicky = shouldRoutePTTToHeyClickyRealtimeSession
+            if pttPressedRoutedToHeyClicky {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice",
+                    direction: "internal",
+                    event: "realtime.session_ptt_begin",
+                    fields: ["source": "keyboardShortcut"]
+                )
+                // Snapshot the preflight (frontmost / Finder selection /
+                // browser URL / clipboard etc.) NOW — the moment the
+                // user pressed PTT — so the assist agent context
+                // reflects what the user was looking at when they
+                // decided to speak, not what's front by the time the
+                // tool_call fires (may drift 5-10s later).
+                Task { @MainActor in
+                    await HeyClickyChatToolCallClient.capturePTTSnapshot()
+                }
+                // clicky-mac parity (CompanionManager.handleShortcutTransition
+                // `.pressed`): cancel transient hide, ensure overlay visible,
+                // clear any prior element target, THEN flip voiceState =
+                // .listening, THEN begin PTT.
+                transientHideTask?.cancel()
+                transientHideTask = nil
+                // Clear detected-element state BEFORE voiceState flips so
+                // the SwiftUI diff for the same layout pass sees both
+                // `detectedElement == nil` and `voiceState == .listening`
+                // and paints the waveform straight away instead of
+                // blanking for a frame on stale pointing state.
+                clearDetectedElementLocation()
+                // Silence any in-flight completion announcement / prior
+                // TTS before the mic opens. Without this, the boot-time
+                // "agent status" narration keeps playing over the
+                // user's PTT audio and both voices overlap in the
+                // recording (user report: "按快捷键说话时它也在说
+                // 话"). `HeyClickyRealtimeSession.beginPushToTalk`
+                // already barges its own playback, but a
+                // *voiceTTSClient* announcement (agent completion,
+                // ack line) runs on a separate transport and needs an
+                // explicit stop here.
+                interruptCurrentVoiceResponse()
+                warmCursorOverlayForVoiceInput(reason: "ptt_press")
+                voiceState = .listening
+                HeyClickyRealtimeSession.shared.beginPushToTalk()
+                return
+            }
             if shouldUseBidirectionalRealtimeVoiceInput {
                 startBidirectionalRealtimeVoiceCapture(source: "keyboardShortcut")
                 return
@@ -4428,6 +6852,26 @@ final class CompanionManager: ObservableObject {
             finishCircleSelectSessionForVoiceTurn()
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
+            // Consume the cached press-side routing decision — never
+            // re-evaluate provider at release, or mid-hold swap strands
+            // the HeyClicky mic-open.
+            let routeToHeyClicky = pttPressedRoutedToHeyClicky
+            pttPressedRoutedToHeyClicky = false
+            if routeToHeyClicky {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice",
+                    direction: "internal",
+                    event: "realtime.session_ptt_end",
+                    fields: ["source": "keyboardShortcut"]
+                )
+                HeyClickyRealtimeSession.shared.endPushToTalk()
+                // clicky-mac parity: flip to .processing while the model
+                // is thinking. The subscription on session.$isResponding
+                // will bounce us to .responding on first audio delta,
+                // then .idle on responseDone.
+                voiceState = .processing
+                return
+            }
             if finishBidirectionalRealtimeVoiceCaptureIfNeeded(source: "keyboardShortcut") {
                 return
             }
@@ -4628,6 +7072,22 @@ final class CompanionManager: ObservableObject {
     var shouldUseBidirectionalRealtimeVoiceInput: Bool {
         OpenClickyModelCatalog.isSpeechModelID(selectedModel)
     }
+
+    /// True when the currently selected voice model is HeyClicky Free
+    /// (heyclicky-free-speech). PTT for this lane routes through the
+    /// persistent HeyClickyRealtimeSession (clicky-mac RealtimeSession
+    /// parity) instead of the per-turn WS. All other lanes keep their
+    /// existing paths.
+    var shouldRoutePTTToHeyClickyRealtimeSession: Bool {
+        let model = OpenClickyModelCatalog.voiceResponseModel(withID: selectedModel)
+        return model.provider == .heyclickyFree
+    }
+
+    /// Cached at `.pressed` and reused at `.released`. If the user swaps
+    /// provider mid-hold, we still deliver the release to the same lane
+    /// that got the press — otherwise the HeyClicky WS mic stays open
+    /// forever because the release event routes down the legacy branch.
+    var pttPressedRoutedToHeyClicky: Bool = false
 
     private var activeRealtimeSpeechVoiceID: String {
         let model = OpenClickyModelCatalog.voiceResponseModel(withID: selectedModel)
@@ -4854,6 +7314,16 @@ final class CompanionManager: ObservableObject {
                     self?.lastTranscript = transcript
                     self?.circleSelectLivePartialTranscript = transcript
                     self?.circleSelectSession.refreshSnapUsingLatestTranscript()
+                    // Realtime path bypasses rememberVoiceExchange; log to LTM directly.
+                    let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                    OpenClickyMessageLogStore.shared.append(
+                        lane: "voice", direction: "internal",
+                        event: "realtime.callback.onUserTranscript",
+                        fields: ["textLen": trimmed.count,
+                                 "preview": String(trimmed.prefix(60))])
+                    if !trimmed.isEmpty {
+                        ConversationLogger.log(trimmed, by: .user)
+                    }
                 }
                 let onAssistantTextChunk: @MainActor @Sendable (String) -> Void = { [weak self] accumulatedText in
                     guard self?.realtimeBidirectionalVoiceTurnGeneration == turnGeneration else { return }
@@ -4865,6 +7335,9 @@ final class CompanionManager: ObservableObject {
                         contextTitle: "Realtime voice input"
                     )
                     self?.updateVoiceResponseCaption(trimmed)
+                    // Assistant transcript is accumulated per delta; only log the final
+                    // full sentence to avoid dumping N growing prefixes. Track last-seen.
+                    self?.stampRealtimeAssistantTranscript(trimmed, generation: turnGeneration)
                 }
                 let onPlaybackStarted: @MainActor @Sendable () -> Void = { [weak self] in
                     guard self?.realtimeBidirectionalVoiceTurnGeneration == turnGeneration else { return }
@@ -4884,7 +7357,7 @@ final class CompanionManager: ObservableObject {
                 let selectedVoiceResponseModel = OpenClickyModelCatalog.voiceResponseModel(withID: self.selectedModel)
                 if selectedVoiceResponseModel.provider == .deepgram {
                     try await self.deepgramVoiceAgentClient.beginBidirectionalVoiceTurn(
-                        systemPrompt: self.currentRealtimeVoiceSystemPrompt(),
+                        systemPrompt: await self.currentRealtimeVoiceSystemPromptAsync(),
                         conversationHistory: historyForAPI,
                         onUserTranscript: onUserTranscript,
                         onAssistantTextChunk: onAssistantTextChunk,
@@ -4892,7 +7365,7 @@ final class CompanionManager: ObservableObject {
                     )
                 } else {
                     try await self.openAIRealtimeSpeechClient.beginBidirectionalVoiceTurn(
-                        systemPrompt: self.currentRealtimeVoiceSystemPrompt(),
+                        systemPrompt: await self.currentRealtimeVoiceSystemPromptAsync(),
                         conversationHistory: historyForAPI,
                         onUserTranscript: onUserTranscript,
                         onAssistantTextChunk: onAssistantTextChunk,
@@ -5075,9 +7548,28 @@ final class CompanionManager: ObservableObject {
                         wasRoutedByClient: deepgramResult.wasRoutedByClient
                     )
                 } else {
+                    // In-session tool execution (clicky-mac parity) for the
+                    // HeyClicky Free lane. Runs chat-tool-call in the
+                    // background WITHOUT breaking the realtime WS, then
+                    // posts the JSON result back so the same session
+                    // continues speaking with the tool output inline.
+                    let selectedVoiceResponseModel = OpenClickyModelCatalog.voiceResponseModel(withID: self.selectedModel)
+                    let handleTool: (@Sendable (String, String, String) async -> String?)? = {
+                        guard selectedVoiceResponseModel.provider == .heyclickyFree else { return nil }
+                        return { [weak self] name, arguments, _callID in
+                            guard let self, name == "openclicky_use_screen_context" else { return nil }
+                            let transcript = OpenAIRealtimeSpeechClient.parseTranscriptArgument(arguments) ?? ""
+                            let instruction = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !instruction.isEmpty else {
+                                return #"{"error":"empty_instruction"}"#
+                            }
+                            return await self.executeInSessionScreenContextTool(instruction: instruction)
+                        }
+                    }()
                     let openAIResult = try await self.openAIRealtimeSpeechClient.finishBidirectionalVoiceTurn(
                         routeUserTranscriptBeforeAssistantResponse: routeBeforeAssistant,
-                        routeRealtimeToolCallBeforeAssistantResponse: routeRealtimeToolCall
+                        routeRealtimeToolCallBeforeAssistantResponse: routeRealtimeToolCall,
+                        handleRealtimeToolCall: handleTool
                     )
                     result = BidirectionalRealtimeVoiceResult(
                         userTranscript: openAIResult.userTranscript,
@@ -5426,6 +7918,10 @@ final class CompanionManager: ObservableObject {
             contextTitle: "Voice input fault"
         )
         updateVoiceResponseCaption(userFacingMessage, force: true)
+        // Failure captions used to stick around the cursor indefinitely.
+        // Auto-dismiss after 5s so a transient network hiccup doesn't
+        // leave a stale error bubble hanging next to the pointer.
+        scheduleVoiceResponseCaptionClear(after: 5.0)
         OpenClickyMessageLogStore.shared.append(
             lane: "voice",
             direction: "internal",
@@ -5510,6 +8006,14 @@ final class CompanionManager: ObservableObject {
         includeQuickLocalResponses: Bool,
         hybridAgentStartCountsAsHandled: Bool = false
     ) -> Bool {
+        // Pre-router: self-driving Codex for folder-only agent utterances.
+        // Falls through when no folder is selected or the transcript
+        // doesn't look like agent intent, letting upstream's regular
+        // routing chain (startExplicit / startSmart / startImplicit)
+        // take over.
+        if trySelfDrivingCodexDispatch(from: transcript) {
+            return true
+        }
         if handleAgentCancellationRequestIfNeeded(from: transcript) {
             return true
         }
@@ -9323,6 +11827,10 @@ final class CompanionManager: ObservableObject {
 
             let voiceSystemPrompt = await MainActor.run { self.currentVoiceResponseSystemPrompt() }
 
+            // active-window context is now injected centrally in
+            // _analyzeVoiceResponseCore so all speech + text paths
+            // (PTT, Shift+Space, mini chat) see the same block. No
+            // per-arm prepend here.
             let userPromptForClaude: String = {
                 if labeledImages.isEmpty {
                     return "\(speculativeFireForCapture)\n\nNo screenshot is available. Answer from the transcript only and use [POINT:none]."
@@ -13300,13 +15808,36 @@ final class CompanionManager: ObservableObject {
         return cleanedInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Public bridge for `HeyClickyRealtimeSession`'s
+    /// `openclicky_start_background_agent` tool. Kept as a method on the
+    /// primary CompanionManager class so it can reach the private
+    /// `startVoiceAgentTaskPlan` while still being callable from
+    /// extension files in the module.
+    func launchBackgroundAgentForRealtime(instruction: String) {
+        startVoiceAgentTaskPlan(
+            instruction: instruction,
+            acknowledgement: nil,
+            route: "agent.start",
+            speakAcknowledgement: false,
+            interruptVoiceResponse: false,
+            voiceContextUserTranscript: instruction
+        )
+    }
+
     private func startVoiceAgentTaskPlan(
         instruction: String,
         acknowledgement: String? = nil,
         route: String = "agent.start",
         speakAcknowledgement: Bool = true,
         interruptVoiceResponse: Bool = false,
-        voiceContextUserTranscript: String? = nil
+        voiceContextUserTranscript: String? = nil,
+        workingDirectoryOverride: String? = nil,
+        projectRef: String? = nil,
+        slug: String? = nil,
+        progressDriven: Bool = false,
+        completionMarker: String? = nil,
+        taskDir: String? = nil,
+        taskProgressPath: String? = nil
     ) {
         let effectiveSpeakAcknowledgement: Bool
         if suppressNextVoiceAgentStartAcknowledgement {
@@ -13324,7 +15855,14 @@ final class CompanionManager: ObservableObject {
                 route: route,
                 speakAcknowledgement: effectiveSpeakAcknowledgement,
                 interruptVoiceResponse: interruptVoiceResponse,
-                voiceContextUserTranscript: voiceContextUserTranscript
+                voiceContextUserTranscript: voiceContextUserTranscript,
+                workingDirectoryOverride: workingDirectoryOverride,
+                projectRef: projectRef,
+                slug: slug,
+                progressDriven: progressDriven,
+                completionMarker: completionMarker,
+                taskDir: taskDir,
+                taskProgressPath: taskProgressPath
             )
             return
         }
@@ -13350,9 +15888,49 @@ final class CompanionManager: ObservableObject {
                 route: "\(route).split",
                 speakAcknowledgement: effectiveSpeakAcknowledgement && index == 0,
                 interruptVoiceResponse: interruptVoiceResponse && index == 0,
-                voiceContextUserTranscript: voiceContextUserTranscript ?? instruction
+                voiceContextUserTranscript: voiceContextUserTranscript ?? instruction,
+                workingDirectoryOverride: workingDirectoryOverride,
+                projectRef: projectRef,
+                slug: slug,
+                progressDriven: progressDriven,
+                completionMarker: completionMarker,
+                taskDir: taskDir,
+                taskProgressPath: taskProgressPath
             )
         }
+    }
+
+    /// Public bridge used by `RouteDispatcher` (Phase 4 Step 2) to spawn a
+    /// codex agent for a route-classified voice turn without reaching
+    /// into the private plan entry point. Keeps the routing surface
+    /// small: one workdir override, one transcript, no acknowledgement
+    /// (Fable's TTS reply already covered the user).
+    func dispatchRoutedAgentTask(
+        instruction: String,
+        workingDirectoryOverride: String?,
+        projectRef: String? = nil,
+        slug: String? = nil,
+        progressDriven: Bool = false,
+        completionMarker: String? = nil,
+        taskDir: String? = nil,
+        taskProgressPath: String? = nil,
+        voiceContextUserTranscript: String?
+    ) {
+        startVoiceAgentTaskPlan(
+            instruction: instruction,
+            acknowledgement: nil,
+            route: "agent.route_dispatch",
+            speakAcknowledgement: false,
+            interruptVoiceResponse: false,
+            voiceContextUserTranscript: voiceContextUserTranscript,
+            workingDirectoryOverride: workingDirectoryOverride,
+            projectRef: projectRef,
+            slug: slug,
+            progressDriven: progressDriven,
+            completionMarker: completionMarker,
+            taskDir: taskDir,
+            taskProgressPath: taskProgressPath
+        )
     }
 
     private func startVoiceAgentTask(
@@ -13361,7 +15939,14 @@ final class CompanionManager: ObservableObject {
         route: String = "agent.start",
         speakAcknowledgement: Bool = true,
         interruptVoiceResponse: Bool = false,
-        voiceContextUserTranscript: String? = nil
+        voiceContextUserTranscript: String? = nil,
+        workingDirectoryOverride: String? = nil,
+        projectRef: String? = nil,
+        slug: String? = nil,
+        progressDriven: Bool = false,
+        completionMarker: String? = nil,
+        taskDir: String? = nil,
+        taskProgressPath: String? = nil
     ) {
         // Note: when the user explicitly said "agent" we do NOT route
         // through `handleDirectComputerUseRequest` here — that path
@@ -13486,6 +16071,69 @@ final class CompanionManager: ObservableObject {
                 title: Self.shortAgentInstructionSummary(instruction),
                 accentTheme: accentTheme
             )
+            // Phase 4 Step 2: honour a workdir override handed in by the
+            // route dispatcher. Mirrors `handleAutomationStartAgent` —
+            // must be a real existing directory before we clobber the
+            // session default, otherwise the agent lands in $HOME and
+            // hunts for task files.
+            if let overrideRaw = workingDirectoryOverride?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !overrideRaw.isEmpty {
+                // F26 HIGH #2 — `FileManager.fileExists` does not expand
+                // `~`; do it here so `"~/Projects/foo"` from Fable does
+                // not silently fall through the validator.
+                let overridePath = (overrideRaw as NSString).expandingTildeInPath
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: overridePath, isDirectory: &isDir),
+                   isDir.boolValue {
+                    agentSession.workingDirectoryPath = overridePath
+                    HeyClickyLog.log("openclicky.route_workdir_applied", lane: "agent", direction: "internal", [
+                        "sessionID": agentSession.id.uuidString,
+                        "workdir": overridePath
+                    ])
+                } else {
+                    HeyClickyLog.log("openclicky.route_workdir_invalid", lane: "agent", direction: "warn", [
+                        "sessionID": agentSession.id.uuidString,
+                        "workdir": overridePath
+                    ])
+                }
+            }
+            // F26 HIGH #1 — thread route metadata onto the codex session
+            // as structured fields. The F28 auto-continue observer will
+            // read `progressDriven` + `completionMarker` off the session
+            // when polling `progress.md`; landed here so the substrate is
+            // present before the observer arm ships (Task #203).
+            if progressDriven {
+                agentSession.progressDriven = true
+                agentSession.completionMarker = completionMarker
+                HeyClickyLog.log("openclicky.route_progress_driven_applied", lane: "agent", direction: "internal", [
+                    "sessionID": agentSession.id.uuidString,
+                    "completion_marker": completionMarker ?? ""
+                ])
+            }
+            if let ref = projectRef?.trimmingCharacters(in: .whitespacesAndNewlines), !ref.isEmpty {
+                agentSession.routeProjectRef = ref
+            }
+            if let s = slug?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                agentSession.routeSlug = s
+            }
+            // Openclicky task-planning contract: propagate the resolved
+            // task directory and PROGRESS.md path so the codex spawn
+            // environment carries `OPENCLICKY_TASK_DIR` /
+            // `OPENCLICKY_TASK_PROGRESS`. See
+            // docs/OPENCLICKY_TASK_SPEC.md and CodexProcessManager.start.
+            if let td = taskDir?.trimmingCharacters(in: .whitespacesAndNewlines), !td.isEmpty {
+                agentSession.taskDir = td
+            }
+            if let tp = taskProgressPath?.trimmingCharacters(in: .whitespacesAndNewlines), !tp.isEmpty {
+                agentSession.taskProgressPath = tp
+            }
+            if agentSession.taskDir != nil || agentSession.taskProgressPath != nil {
+                HeyClickyLog.log("openclicky.task_env_applied", lane: "agent", direction: "internal", [
+                    "sessionID": agentSession.id.uuidString,
+                    "taskDir": agentSession.taskDir ?? "",
+                    "taskProgressPath": agentSession.taskProgressPath ?? ""
+                ])
+            }
             if let timing {
                 agentRequestTimingsBySessionID[agentSession.id] = timing
             }
@@ -13619,6 +16267,7 @@ final class CompanionManager: ObservableObject {
         )
     }
 
+
     /// Returns true when two realtime-route fingerprints represent the same
     /// utterance: exact match OR one is a prefix of the other (minimum 3
     /// words in the shorter side, to avoid collapsing unrelated short commands).
@@ -13640,6 +16289,35 @@ final class CompanionManager: ObservableObject {
         overlayWindowManager.hasShownOverlayBefore = true
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
         isOverlayVisible = true
+    }
+
+    /// Pre-mount the overlay so a PTT press doesn't pay the first-frame
+    /// SwiftUI layout cost synchronously with the mic-open. Callers should
+    /// invoke this once at boot AND at hotkey-armed moments so the overlay
+    /// window is alive and its cursor tracker's initial `isCursorOnThisScreen`
+    /// state is warmed up — otherwise the waveform view exists but blanks
+    /// for ~1 frame until the tracker fires.
+    ///
+    /// Also logs the permission-missing case so a silent no-op has an
+    /// audit trail. UI hint is delivered via `heyClickyStatusChanged` so
+    /// the notch / bubble can surface a "grant accessibility" caption.
+    func warmCursorOverlayForVoiceInput(reason: String) {
+        guard isClickyCursorEnabled else { return }
+        guard hasAccessibilityPermission else {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice",
+                direction: "error",
+                event: "voice.overlay_blocked_no_permission",
+                fields: ["reason": reason]
+            )
+            NotificationCenter.default.postHeyClickyStatus(
+                .transportError,
+                extra: ["hint": "grant_accessibility_permission",
+                        "user_message": "开启辅助功能权限后光标才会出现"]
+            )
+            return
+        }
+        showCursorOverlayIfAvailable()
     }
 
     private func directComputerUseAgentBoundaryCueText() -> String {
@@ -13839,6 +16517,30 @@ final class CompanionManager: ObservableObject {
         return accentThemes[existingCount % accentThemes.count]
     }
 
+    /// Returns true when the caption text is a transient recovery
+    /// message emitted by `friendlyRecoveryCaption` (e.g. "网络恢复中…"),
+    /// which should NOT persist as a dock terminal caption. Keep in
+    /// sync with the phrase set produced by
+    /// `CodexAgentSession.friendlyRecoveryCaption`.
+    static func isTransientRecoveryCaption(_ text: String?) -> Bool {
+        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return false }
+        let recoveryPhrases = [
+            "正在自动继续",
+            "正在为你自动续期额度",
+            "正在自动重新连接",
+            "正在自动继续下一段",
+            "网络恢复中",
+            "服务响应异常，正在自动重试",
+            "服务暂时不可用，正在自动重试",
+            "正在自动恢复",
+            "正在启动会话",
+            "正在自动重新开启会话",
+            "服务响应异常"
+        ]
+        return recoveryPhrases.contains(where: { text.contains($0) })
+    }
+
     private func updateAgentDockItem(for sessionID: UUID, status: CodexAgentSessionStatus) {
         defer { refreshCursorAgentTaskLabel() }
 
@@ -13862,21 +16564,25 @@ final class CompanionManager: ObservableObject {
         switch status {
         case .starting:
             agentDockItems[itemIndex].status = .starting
-            // Only overwrite the caption when we actually have real assistant
-            // activity. Otherwise preserve the existing caption (the user's
-            // acknowledgement message) instead of replacing it with the
-            // generic "An agent is getting ready." placeholder. When neither
-            // is present, leave caption nil so the view can render its own
-            // streaming "thinking" affordance.
-            if let displayActivity, hasActivitySummary {
+            // Any prior recovery-in-progress caption ("网络恢复中…") now
+            // reflects a stale state — status has already transitioned
+            // to .starting which means recovery already succeeded and
+            // a new turn is spinning up. Clear it so the dock doesn't
+            // keep lying about "recovering" during the actual restart.
+            if Self.isTransientRecoveryCaption(agentDockItems[itemIndex].caption) {
+                agentDockItems[itemIndex].caption = nil
+            }
+            if let displayActivity, hasActivitySummary,
+               !Self.isTransientRecoveryCaption(displayActivity) {
                 agentDockItems[itemIndex].caption = displayActivity
             }
         case .running:
             agentDockItems[itemIndex].status = .running
-            // Same rationale as .starting — never replace the caption with
-            // "An agent is working on this." Leave nil to surface the
-            // animated thinking indicator until real tokens stream in.
-            if let displayActivity, hasActivitySummary {
+            if Self.isTransientRecoveryCaption(agentDockItems[itemIndex].caption) {
+                agentDockItems[itemIndex].caption = nil
+            }
+            if let displayActivity, hasActivitySummary,
+               !Self.isTransientRecoveryCaption(displayActivity) {
                 agentDockItems[itemIndex].caption = displayActivity
             }
         case .ready:
@@ -13903,9 +16609,24 @@ final class CompanionManager: ObservableObject {
             announceAgentCompletionIfNeeded(sessionID: sessionID, outcome: "success", summary: completionSpeechSummary)
         case .failed:
             agentDockItems[itemIndex].status = .failed
-            agentDockItems[itemIndex].caption = activityDisplaySummary ?? "The agent stopped. Open the agent for details."
-            agentDockItems[itemIndex].progressStageLabel = "Stopped"
-            agentDockItems[itemIndex].progressStepText = activityDisplaySummary ?? activitySummary
+            // Recovery captions ("网络恢复中…", "正在为你自动续期额度…" …)
+            // are TRANSIENT states set while the app is auto-recovering.
+            // They must not permanently pin the dock card — the failure
+            // is being handled, not final. Detect them and swap for a
+            // neutral "auto-retrying" line so the dock reflects TRUTH
+            // (an agent that will resume) rather than a stale mid-flight
+            // recovery hint.
+            let isRecoveryCaption = Self.isTransientRecoveryCaption(activityDisplaySummary)
+            let dockCaption: String
+            if isRecoveryCaption {
+                dockCaption = "正在自动恢复…"
+                agentDockItems[itemIndex].progressStageLabel = "Recovering"
+            } else {
+                dockCaption = activityDisplaySummary ?? "The agent stopped. Open the agent for details."
+                agentDockItems[itemIndex].progressStageLabel = "Stopped"
+            }
+            agentDockItems[itemIndex].caption = dockCaption
+            agentDockItems[itemIndex].progressStepText = isRecoveryCaption ? dockCaption : (activityDisplaySummary ?? activitySummary)
             completeAgentRequestTimingIfNeeded(
                 sessionID: sessionID,
                 status: "failed",
@@ -14117,6 +16838,22 @@ final class CompanionManager: ObservableObject {
         lastNarratedAgentOutcomeBySessionID[sessionID] = outcome
 
         guard let session = codexAgentSessions.first(where: { $0.id == sessionID }) else { return }
+        // HeyClicky Free lane: never speak per-turn failures. Codex may
+        // emit half-a-dozen `method:error` events for one broken turn,
+        // and each flips status .running→.failed→.ready→.failed, which
+        // used to bypass the outcome dedup and produce the "重复说话"
+        // loop the user saw. Log the outcome for observability but keep
+        // the realtime channel silent so the free-tier lane does not
+        // narrate its own upstream errors back at the user.
+        if session.model.hasPrefix("heyclicky-free-"), outcome == "failed" {
+            HeyClickyLog.log("agent.completion_speech_suppressed", lane: "agent",
+                             direction: "internal", [
+                "session_id_prefix": String(session.id.uuidString.prefix(8)),
+                "outcome": outcome,
+                "reason": "heyclicky_free_lane_never_narrates_failures"
+            ])
+            return
+        }
         let taskTitle = Self.agentCompletionSpokenTaskTitle(for: session)
 
         // User-initiated cancellation: the user just clicked Stop / said
@@ -14205,7 +16942,7 @@ final class CompanionManager: ObservableObject {
     /// Play an agent-completion announcement. Chime first (if requested),
     /// then the spoken line. Anything currently playing is cut so the
     /// chime never overlaps speech and never gets cut by speech.
-    private func speakSystemAnnouncementAfterCurrentTTS(
+    func speakSystemAnnouncementAfterCurrentTTS(
         _ line: String,
         for sessionID: UUID?,
         withChime: Bool = false
@@ -14243,12 +16980,31 @@ final class CompanionManager: ObservableObject {
         pendingSystemAnnouncementTask = task
     }
 
+    /// Cap on `silencedAgentSpeechSessionIDs`. The set is a tombstone list —
+    /// membership means "this session's queued speech must not play" — and
+    /// nothing ever removed from it, so a long-running instance accumulated
+    /// one UUID per silenced agent task forever. Bounded FIFO instead: a
+    /// session silenced 512 tasks ago cannot still have audio parked, since
+    /// every wait path gives up after 30 s.
+    private static let maxSilencedAgentSpeechSessionIDs = 512
+
     private func silenceAgentSpeech(for sessionID: UUID, reason: String) {
         var didSilenceSpeech = false
         silencedAgentSpeechSessionIDs.insert(sessionID)
+        silencedAgentSpeechSessionOrder.append(sessionID)
+        while silencedAgentSpeechSessionOrder.count > Self.maxSilencedAgentSpeechSessionIDs {
+            let evicted = silencedAgentSpeechSessionOrder.removeFirst()
+            silencedAgentSpeechSessionIDs.remove(evicted)
+        }
         if pendingSystemAnnouncementSessionID == sessionID {
             pendingSystemAnnouncementTask?.cancel()
-            pendingSystemAnnouncementTask = nil
+            // Deliberately NOT clearing `pendingSystemAnnouncementTask`.
+            // The next announcement chains on it via `await
+            // previousTask.result`; nilling it here breaks that link, so a
+            // fresh announcement could start while a *different* session's
+            // announcement is still speaking. A cancelled task's `result`
+            // returns immediately, so keeping the reference costs nothing
+            // and preserves serialization.
             pendingSystemAnnouncementSessionID = nil
             didSilenceSpeech = true
         }
@@ -14602,6 +17358,12 @@ final class CompanionManager: ObservableObject {
     }
 
     func prepareVoiceFollowUpForAgentDockItem(_ itemID: UUID) {
+        if SKIModeDockMirror.shared.skiSessionID(forDockItemID: itemID) != nil {
+            // SKI Mode voice = normal PTT — the file bridge routes to
+            // the pinned/auto workspace already. Just prep the mic.
+            prepareForVoiceFollowUp()
+            return
+        }
         guard let sessionID = agentDockItems.first(where: { $0.id == itemID })?.sessionID else {
             prepareForVoiceFollowUp()
             return
@@ -14792,6 +17554,46 @@ final class CompanionManager: ObservableObject {
     func submitNewAgentTaskFromUI(_ prompt: String, source: String = "agent_new_task_prompt") -> BrowserWorkspaceAgentSessionProtocol? {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { return nil }
+        // When the HeyClicky Free lane is active AND a background
+        // agent is already running (activeThreadID set), route follow-
+        // up HUD messages through `/agent-messages` so the running
+        // agent picks them up mid-turn. Local codex path is only for
+        // the very first prompt in a session.
+        // HeyClicky Free follow-up: route through the local Codex
+        // stdin path, not the /agent-messages HTTP endpoint. That
+        // endpoint is metadata-only in the reference implementation
+        // (session_id/role/tokens/status/timestamp) — sending prompt
+        // content there never reaches the running agent. clicky-mac
+        // uses the same local streaming model (AgentSessionsBridge).
+        if shouldRoutePTTToHeyClickyRealtimeSession,
+           codexAgentSession.activeThreadID != nil {
+            HeyClickyLog.log("hud.reply_routed_to_codex_stdin", lane: "agent",
+                             direction: "internal", [
+                "stage": "S5_message_egress",
+                "source": source,
+                "content_len": trimmedPrompt.count,
+                "active_thread": codexAgentSession.activeThreadID ?? "nil",
+                "turn_active": codexAgentSession.isTurnActiveForChatQueue
+            ])
+            let session = codexAgentSession
+            if session.isTurnActiveForChatQueue {
+                session.submitPromptFromUI(trimmedPrompt, screenContext: nil)
+            } else {
+                stageDashboardAgentSubmission(prompt: trimmedPrompt, session: session)
+                submitAgentPrompt(trimmedPrompt, to: session)
+            }
+            // Fire-and-forget metadata log (correct schema: role/tokens/status)
+            // so the proxy still gets the turn counter for /me/plan usage.
+            Task.detached {
+                await HeyClickyAgentMessagesClient.shared.logTurnMetadata(
+                    sessionID: session.id.uuidString,
+                    role: "user",
+                    tokens: trimmedPrompt.count,
+                    status: "submitted"
+                )
+            }
+            return nil
+        }
         var taskPrompt = trimmedPrompt
         if Self.isRawTransportDiagnosticEvent(trimmedPrompt) {
             // Typed/pasted prompts that mix user intent with log evidence
@@ -15037,6 +17839,15 @@ final class CompanionManager: ObservableObject {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { return }
 
+        // Fresh user-authored prompts reset the recovery-attempt budget
+        // for this session. Auto-replay prompts (prefix "请继续之前的任务")
+        // must NOT reset — otherwise the recovery loop resets its own
+        // budget and never trips the exhaustion break.
+        if !trimmedPrompt.hasPrefix("请继续之前的任务") {
+            heyClickyObserverStore.resetFailureBudget(sessionID: session.id)
+        }
+        userEngagedSessionIDs.insert(session.id)
+
         lastAgentContextSessionID = session.id
         activeCodexAgentSessionID = session.id
         let baselinePasteboardChangeCount = NSPasteboard.general.changeCount
@@ -15081,6 +17892,10 @@ final class CompanionManager: ObservableObject {
     }
 
     func interruptCurrentVoiceResponse() {
+        // Barge-in for the assist agent's multi-round loop. If a
+        // research-tool run is live, cancel it so the user doesn't
+        // sit through waiting when they've decided to pivot.
+        AssistAgentBridge.shared.cancelActive()
         currentVoiceResponseCancellationHandler?("interrupted")
         currentVoiceResponseCancellationHandler = nil
         currentVoiceResponseRequestID = nil
@@ -15100,6 +17915,17 @@ final class CompanionManager: ObservableObject {
         openAIRealtimeSpeechClient.stopPlayback()
         deepgramVoiceAgentClient.stopPlayback()
         voiceTTSClient.stopPlayback()
+        // Barge-in must also kill queued system announcements. The
+        // announcement pipeline runs on a separate Task
+        // (`speakSystemAnnouncementAfterCurrentTTS`) which stopPlayback
+        // does NOT cancel — the Task re-fires TTS as soon as the
+        // player idles. Without cancelling here, ESC / next PTT stops
+        // one line of speech and the next queued line immediately
+        // starts playing. User: "按下 Esc 键的时候，它应该立即闭嘴".
+        pendingSystemAnnouncementTask?.cancel()
+        pendingSystemAnnouncementTask = nil
+        pendingSystemAnnouncementSessionID = nil
+        speakingSystemAnnouncementSessionID = nil
         clearVoiceResponseCaptionAndInteractiveBubble()
         if !buddyDictationManager.isDictationInProgress {
             currentAudioPowerLevel = 0
@@ -15462,6 +18288,20 @@ final class CompanionManager: ObservableObject {
         )
     }
 
+    /// Public preview for any settings UI to speak an arbitrary sample
+    /// line through the currently-selected TTS provider. Bypasses caption
+    /// bubble spamming — meant purely for "does the voice work" tests
+    /// like the Peeky voice picker's Preview button.
+    /// Public preview / filler entry. `interruptExisting=false` so the
+    /// in-flight voice turn's cancellation handler is NOT tripped when
+    /// we speak a short opener while the model is still generating.
+    /// (Default `speakShortSystemResponse` calls interruptCurrentVoice
+    /// Response, which was cancelling mirage turns the instant a filler
+    /// fired — the very filler the turn scheduled to reassure the user.)
+    func previewCurrentTTSVoice(_ sample: String) {
+        speakShortSystemResponse(sample, interruptExisting: false)
+    }
+
     func testVoiceResponseCaptionPlayback() {
         let line = "This is OpenClicky's caption playback test. The selected caption font should show beside the cursor."
         latestVoiceResponseCard = ClickyResponseCard(
@@ -15684,7 +18524,11 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    private static let companionVoiceResponseSystemPrompt = """
+    // `nonisolated` so ClaudeAPI can read the bytes when placing its
+    // cache_control breakpoint without hopping to the main actor. It is a
+    // `let` string literal — no isolation is needed to make it safe, and
+    // inheriting the class's @MainActor here is an error under Swift 6.
+    nonisolated private static let companionVoiceResponseSystemPrompt = """
     you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s), and when the user has enabled camera context you may also receive a camera image labeled as such. your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
     YOUR JOB IS NARROW. you only do these things:
@@ -15812,9 +18656,39 @@ final class CompanionManager: ObservableObject {
     }
 
     func currentVoiceResponseSystemPrompt() -> String {
+        // Kept for callers that still want the whole prompt as one
+        // string. New callers wanting cache-safe splitting should use
+        // `stableVoiceResponseSystemPrompt()` + `dynamicVoiceResponseSystemContext()`
+        // instead — the stable part is the ONLY part that should carry
+        // a `cache_control` block (Anthropic hashes exact bytes up to
+        // the cache breakpoint; any volatile prefix defeats the cache).
+        stableVoiceResponseSystemPrompt() + "\n\n" + dynamicVoiceResponseSystemContext()
+    }
+
+    /// Stable identity/tools/style block. Byte-invariant across turns
+    /// in a session so prompt-cache can hit. Consume via `system[]` with
+    /// `cache_control: {type:"ephemeral", ttl:"1h"}`.
+    func stableVoiceResponseSystemPrompt() -> String {
+        Self.companionVoiceResponseSystemPrompt
+    }
+
+    /// Same bytes as `stableVoiceResponseSystemPrompt()`, reachable without a
+    /// manager instance. `ClaudeAPI` needs the prefix to place its
+    /// `cache_control` breakpoint but is a plain non-actor class with no
+    /// reference back here; going through the instance would force it onto
+    /// the main actor for what is a constant.
+    nonisolated static func stableVoiceResponseSystemPromptForCaching() -> String {
+        companionVoiceResponseSystemPrompt
+    }
+
+    /// Dynamic per-turn context (frontmost app skill hints, memory,
+    /// calibration state, web-search availability, runtime storage).
+    /// Consume via `system[]` as a SECOND block WITHOUT `cache_control`.
+    /// Anthropic prompt cache only hashes up to the cache breakpoint,
+    /// so trailing volatile content does NOT break the cache prefix.
+    func dynamicVoiceResponseSystemContext() -> String {
         let memoryContext = codexHomeManager.persistentMemoryContext()
         return """
-        \(Self.companionVoiceResponseSystemPrompt)
         \(inlineWebSearchCapabilityPromptIfAvailable())
         \(currentAppSkillContextPrompt())
         \(visualGuidanceCorrectionLearningPrompt())
@@ -15971,6 +18845,7 @@ final class CompanionManager: ObservableObject {
 
     func currentRealtimeVoiceSystemPrompt() -> String {
         let memoryContext = codexHomeManager.persistentMemoryContext()
+        let stashContext = currentStashContextForVoicePrompt()
         return """
         \(Self.companionRealtimeVoiceSystemPrompt)
 
@@ -15980,10 +18855,252 @@ final class CompanionManager: ObservableObject {
 
         \(runtimeStorageContextForVoicePrompt())
 
+        \(stashContext)
+
         persistent memory:
         read this as durable user/project context. do not say you cannot remember outside the conversation; use this memory.
 
         \(memoryContext)
+        """
+    }
+
+    /// Async variant — resolves browser URL for enriched stash
+    /// context. Preferred entry point for realtime voice.
+    func currentRealtimeVoiceSystemPromptAsync() async -> String {
+        let memoryContext = codexHomeManager.persistentMemoryContext()
+        let stashContext = await currentStashContextForVoicePromptAsync()
+        // Do NOT drain stashes here. Unlike Shift+Space (one-shot
+        // capture → consume → clear), the voice turn is a continuing
+        // conversation where the user may reference the same pin /
+        // whiteboard / links across multiple back-and-forth turns.
+        // User clears manually via Alt+C (ClearContextStash).
+        return """
+        \(Self.companionRealtimeVoiceSystemPrompt)
+
+        \(currentRealtimeRoutingContextPrompt())
+
+        \(currentAppSkillContextPrompt())
+
+        \(runtimeStorageContextForVoicePrompt())
+
+        \(stashContext)
+
+        persistent memory:
+        read this as durable user/project context. do not say you cannot remember outside the conversation; use this memory.
+
+        \(memoryContext)
+        """
+    }
+
+    /// Snapshot every OpenClicky stash into a plain-text block the
+    /// voice model can consume directly. The realtime model can't
+    /// call MCP tools, so if the user pinned an element / drew on the
+    /// whiteboard / dragged a link rect / copied a multi-pick batch
+    /// before pressing the voice hotkey, we must inline that context
+    /// into the system prompt. Byte-parity-adjacent with
+    /// `OpenClickyContextStashWriter.captureCoreAsync`: same stashes,
+    /// same peek semantics (no drain — the user may want to run
+    /// Shift+Space right after and still see the same data).
+    /// Drain every stash after the voice model has consumed the
+    /// context — mirrors the drain semantics of Shift+Space so the
+    /// user gets a consistent "capture → consume → clear" cycle
+    /// regardless of which consumer (cmux vs voice) they route to.
+    private func drainAllStashesForVoiceTurn() {
+        PickStash.shared.clearWithEvent()
+        LinkRectStash.shared.clearWithEvent()
+        WhiteboardStash.shared.clearWithEvent()
+        AnnotationStash.shared.clearWithEvent()
+    }
+
+    func currentStashContextForVoicePrompt() -> String {
+        // Synchronous entry point used by non-async prompt builders.
+        // BrowserURL fetch is intentionally omitted here to avoid
+        // blocking @MainActor; async callers should use
+        // `currentStashContextForVoicePromptAsync()` to get the URL
+        // enrichment.
+        return buildStashContextForVoicePrompt(browserUrl: nil)
+    }
+
+    /// Async variant — resolves the browser URL for the frontmost app
+    /// so the voice model sees the canonical URL alongside the window
+    /// title. Cap wait at 250 ms by racing against `Task.sleep`.
+    /// Preferred entry point for realtime voice; the sync entry point
+    /// is a safety fallback for prompt-builder codepaths that can't
+    /// hop to async.
+    /// Public accessor for the HeyClickyRealtimeSession WS path — it
+    /// doesn't send `session.update.instructions` (server has a baked
+    /// prompt) so stash context must be injected as a per-turn
+    /// `conversation.item.create` system message.
+    func currentStashContextForVoiceTurn() async -> String {
+        return await currentStashContextForVoicePromptAsync()
+    }
+
+    private func currentStashContextForVoicePromptAsync() async -> String {
+        let front = FrontmostAppCapture.capture()
+        let url: String? = await withTaskGroup(of: String?.self) { group -> String? in
+            guard let front else { return nil }
+            group.addTask {
+                let info = await BrowserURLCapture.capture(processId: front.processId)
+                return info?.url
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                return nil
+            }
+            // Take whichever finishes first (either the URL or the
+            // 250 ms tick). Cancel the loser.
+            let first = await group.next()
+            group.cancelAll()
+            return first ?? nil
+        }
+        return buildStashContextForVoicePrompt(browserUrl: url)
+    }
+
+    /// Pure builder — no async, no locks beyond what each stash owns.
+    /// Called by both sync and async entry points so the assembly
+    /// logic stays single-source-of-truth.
+    private func buildStashContextForVoicePrompt(browserUrl: String?) -> String {
+        var lines: [String] = []
+        let picks = PickStash.shared.peekAll()
+        if !picks.isEmpty {
+            lines.append("pinned UI elements (\(picks.count)):")
+            for (i, p) in picks.enumerated() {
+                let role = p.role ?? "?"
+                let title = p.title ?? ""
+                let value = p.value ?? ""
+                let bundle = p.bundleId ?? ""
+                // Prefer the richest text: title -> value -> "(no text)".
+                let displayText: String
+                if !title.isEmpty {
+                    displayText = title
+                } else if !value.isEmpty {
+                    displayText = value.count > 400 ? String(value.prefix(400)) + "…" : value
+                } else {
+                    displayText = "(element has no title/value)"
+                }
+                lines.append("  #\(i) \(role) text=\"\(displayText)\" [pid=\(p.pid) bundle=\(bundle)] bounds=\(Int(p.bounds.origin.x)),\(Int(p.bounds.origin.y)),\(Int(p.bounds.width))x\(Int(p.bounds.height))")
+            }
+        }
+        if let links = LinkRectStash.shared.peek(), !links.isEmpty {
+            lines.append("recently harvested links (\(links.count)):")
+            for (i, l) in links.prefix(20).enumerated() {
+                let titlePart: String
+                if let t = l.title, !t.isEmpty { titlePart = " [\(t)]" } else { titlePart = "" }
+                lines.append("  #\(i) \(l.url)\(titlePart)")
+            }
+            if links.count > 20 {
+                lines.append("  ... (\(links.count - 20) more not shown)")
+            }
+        }
+        // Whiteboard: `ocrText` is misnamed — it actually carries the
+        // AX-snap primary text + OCR fallback merged by
+        // `WhiteboardOrchestrator.mergedText` (see
+        // OpenClickyWhiteboardOverlayWindow.swift:870-878).
+        if let regions = WhiteboardStash.shared.peek(), !regions.isEmpty {
+            let nonEmpty = regions.filter { ($0.ocrText ?? "").isEmpty == false }
+            if !nonEmpty.isEmpty {
+                lines.append("whiteboard regions (\(nonEmpty.count)):")
+                for (i, r) in nonEmpty.prefix(8).enumerated() {
+                    lines.append("  #\(i) kind=\(r.gestureKind) text=\"\(r.ocrText ?? "")\"")
+                }
+            }
+        }
+        let annotations = AnnotationStash.shared.peek()
+        if !annotations.isEmpty {
+            lines.append("annotations (\(annotations.count)):")
+            for (i, a) in annotations.prefix(20).enumerated() {
+                lines.append("  #\(i) source=\(a.source.rawValue) anchor=\(a.anchorLabel ?? "?") body=\"\(a.body)\"")
+            }
+        }
+        // Selection: prefer cache (last Cmd+C or SnapshotContext capture),
+        // fall back to active AX read so voice hotkey ALWAYS sees the
+        // current selection even if the user never triggered a capture.
+        let selectionText: String? = {
+            // Terminal / Electron TUI guard — reading selection from
+            // apps like cmux (Claude Code) has been observed to leak a
+            // literal 'c' into the frontmost input field, likely because
+            // an AX bootstrap side-effect triggers a copy-key
+            // interpretation inside Chromium. Skip the whole selection
+            // capture when the frontmost app is a known terminal.
+            let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.lowercased() ?? ""
+            let terminalBundles = [
+                "com.cmuxterm.app", "com.apple.terminal", "com.googlecode.iterm2",
+                "com.mitchellh.ghostty", "dev.warp.warpmac", "co.zeit.hyper",
+                "io.alacritty", "net.kovidgoyal.kitty", "org.kde.konsole",
+                "com.microsoft.vscode", "com.microsoft.vscodeinsiders",
+                "dev.zed.zed"
+            ]
+            if terminalBundles.contains(where: { front.contains($0) }) {
+                return nil
+            }
+            if let cached = SelectionCache.shared.getFresh(), !cached.text.isEmpty {
+                return cached.text
+            }
+            if let live = SelectedTextCapture.capture()?.text, !live.isEmpty {
+                return live
+            }
+            return nil
+        }()
+        if let text = selectionText, !text.isEmpty {
+            let preview = text.count > 240 ? String(text.prefix(240)) + "…" : text
+            lines.append("recently selected text: \"\(preview)\"")
+        }
+        // Finder-selected files — the ACTIVE window context capture
+        // (AssistAgentActiveWindow) already runs async and produces
+        // absolute paths for `filePath` / `inferredWorkdir`. That
+        // block is injected separately by the pipeline; here we only
+        // add a hint pointing to it so the main dialog knows to look.
+        if let selText = selectionText,
+           selText.count < 120,
+           !selText.contains("/") {
+            // Selection is a short bare filename — remind model that
+            // active-window block carries the absolute path.
+            lines.append("hint: if the user's request references \"\(selText)\", the absolute path is in [active-window] file=... below.")
+        }
+        // Frontmost app + window title + browser URL (URL only
+        // available on the async caller path; nil otherwise).
+        if let front = FrontmostAppCapture.capture() {
+            var appLine = "current app: \(front.appKey) [pid=\(front.processId) bundle=\(front.bundleId ?? "?")]"
+            if let win = FocusedWindowCapture.capture(processId: front.processId), let title = win.title, !title.isEmpty {
+                let truncated = title.count > 200 ? String(title.prefix(200)) + "…" : title
+                appLine += " window=\"\(truncated)\""
+            }
+            if let url = browserUrl, !url.isEmpty {
+                let truncated = url.count > 400 ? String(url.prefix(400)) + "…" : url
+                appLine += " url=\(truncated)"
+            }
+            lines.append(appLine)
+        }
+        // Clipboard preview. Do NOT gate on xlb-multi-pick sentinel here —
+        // voice model can't call MCP so it needs to see raw clipboard
+        // when relevant. Truncate to protect against pasting large blobs.
+        if let clip = ClipboardCapture.capture(), let text = clip.text, !text.isEmpty {
+            let preview = text.count > 500 ? String(text.prefix(500)) + "…" : text
+            lines.append("clipboard: \"\(preview)\"")
+        }
+        if lines.isEmpty {
+            HeyClickyLog.log(
+                "openclicky.voice.stash_context",
+                lane: "voice",
+                direction: "internal",
+                ["lines_count": 0, "empty": "true"]
+            )
+            return ""
+        }
+        let body = lines.joined(separator: "\n")
+        HeyClickyLog.log(
+            "openclicky.voice.stash_context",
+            lane: "voice",
+            direction: "internal",
+            [
+                "lines_count": lines.count,
+                "empty": "false",
+                "preview": String(body.prefix(500)),
+            ]
+        )
+        return """
+        current stash context (what OpenClicky captured before this voice turn — treat as authoritative pointer to what the user is asking about):
+        \(body)
         """
     }
 
@@ -16280,7 +19397,22 @@ nonisolated enum SpokenText {
     }
 
     static func wordCount(in text: String) -> Int {
-        text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).count
+        let spaceSplit = text.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        // For CJK text (中文 / 日文) split-on-space yields 1 chunk for
+        // a whole sentence because there are no separators between chars.
+        // Fall back to CJK char count so dedup / speculative firing /
+        // the realtime route fingerprint fire correctly in Chinese.
+        let cjkCharCount = text.unicodeScalars.reduce(0) { acc, scalar in
+            let v = scalar.value
+            let isCJK = (v >= 0x4E00 && v <= 0x9FFF)
+                || (v >= 0x3400 && v <= 0x4DBF)
+                || (v >= 0x3040 && v <= 0x30FF)
+            return acc + (isCJK ? 1 : 0)
+        }
+        if cjkCharCount >= 3, spaceSplit.count < cjkCharCount {
+            return cjkCharCount
+        }
+        return spaceSplit.count
     }
 
     /// Strips leading filler ("hey", "ok clicky", "i said to", "let's try that

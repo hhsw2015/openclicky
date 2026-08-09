@@ -51,7 +51,7 @@ struct ThreeDViewerView: View {
                         .foregroundStyle(.secondary)
                     Text("Couldn't open 3D model")
                         .font(.callout)
-                    Text(error)
+                    Text(LocalizedStringKey(error))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)

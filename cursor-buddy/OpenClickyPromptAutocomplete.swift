@@ -162,11 +162,11 @@ struct OpenClickyPromptAutocompletePanel: View {
                   .foregroundColor(DS.Colors.accentText)
                   .frame(width: 18)
                 VStack(alignment: .leading, spacing: 1) {
-                  Text(option.title)
+                  Text(LocalizedStringKey(option.title))
                     .font(.system(size: 11, weight: .heavy))
                     .foregroundColor(DS.Colors.textPrimary)
                     .lineLimit(1)
-                  Text(option.subtitle)
+                  Text(LocalizedStringKey(option.subtitle))
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(DS.Colors.textSecondary)
                     .lineLimit(1)

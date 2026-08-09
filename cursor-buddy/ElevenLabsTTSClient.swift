@@ -654,7 +654,16 @@ final class StreamingTTSSession {
     }
 
     static func wordCount(_ text: String) -> Int {
-        text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).count
+        let spaceSplit = text.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        let cjk = text.unicodeScalars.reduce(0) { acc, s in
+            let v = s.value
+            let hit = (v >= 0x4E00 && v <= 0x9FFF)
+                || (v >= 0x3400 && v <= 0x4DBF)
+                || (v >= 0x3040 && v <= 0x30FF)
+            return acc + (hit ? 1 : 0)
+        }
+        if cjk >= 3, spaceSplit.count < cjk { return cjk }
+        return spaceSplit.count
     }
 
     /// Splits an over-long sentence into clauses on `,`, `:`, `;`, ` — `, ` -- `.
@@ -753,7 +762,13 @@ final class StreamingTTSSession {
                 inWord = false
             }
 
-            if char == "," || char == ":" || char == ";" {
+            // Chinese/Japanese full-width comma-like pauses (、，：；) are
+            // treated as clause boundaries too. Without these the streamer
+            // never flushes on CJK text — a single Chinese sentence never
+            // hits any ASCII comma so audio playback never starts until
+            // finish(). Symptom in logs: `audioPlaybackState:never_started`.
+            if char == "," || char == ":" || char == ";"
+                || char == "，" || char == "、" || char == "：" || char == "；" {
                 let nextIndex = text.index(after: index)
                 if wordCount >= Self.minimumWordsBeforePauseCut {
                     guard nextIndex < text.endIndex else { return nextIndex }
@@ -784,7 +799,10 @@ final class StreamingTTSSession {
                 return endIndex
             }
 
-            if char == "." || char == "!" || char == "?" || char == "\n" {
+            // Full-width Chinese/Japanese sentence terminators (。！？) are
+            // real sentence ends — flush the same way as `.!?`.
+            if char == "." || char == "!" || char == "?" || char == "\n"
+                || char == "。" || char == "！" || char == "？" {
                 let nextIndex = text.index(after: index)
                 let isNewline = char == "\n"
 
@@ -946,7 +964,12 @@ final class StreamingTTSSession {
                 // session may have been torn down while the fetch was
                 // in flight, in which case scheduling onto a detached
                 // player would crash with `_engine != nil`.
-                guard !self.isCancelled, player.engine != nil else { return }
+                if self.isCancelled || player.engine == nil {
+                    NSLog("[TTS-DROP] sentence#%d cancelled=%d engineNil=%d frames=%d",
+                          sentenceIndex, self.isCancelled ? 1 : 0,
+                          player.engine == nil ? 1 : 0, samples.count)
+                    return
+                }
                 let frames = ElevenLabsTTSClient.scheduleSamples(
                     samples,
                     on: player,
@@ -1784,6 +1807,11 @@ nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
     case cartesia = "cartesia"
     case deepgram = "deepgram"
     case microsoftEdge = "microsoft_edge"
+    /// Free-tier Cartesia via aegis-proxy (Peeky Free lane). Not bound
+    /// to any profile — any profile can select it in Settings. Wire
+    /// identical to `.cartesia`; token comes from the mirage token-mint
+    /// endpoint instead of the user's Cartesia API key.
+    case mirageCartesia = "mirage_cartesia"
     var id: String { rawValue }
     var displayName: String {
         switch self {
@@ -1792,6 +1820,7 @@ nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
         case .cartesia: return "Cartesia"
         case .deepgram: return "Deepgram Aura"
         case .microsoftEdge: return "Microsoft Edge"
+        case .mirageCartesia: return "Cartesia (Peeky Free)"
         }
     }
     static func resolve(_ raw: String?) -> OpenClickyTTSProvider {

@@ -12,6 +12,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 import OpenClickyCore
 import OpenClickyUI
@@ -21,6 +22,10 @@ extension Notification.Name {
     static let clickyShowPanel = Notification.Name("clickyShowPanel")
     static let clickyPanelContentSizeDidChange = Notification.Name("clickyPanelContentSizeDidChange")
     static let clickyMainPanelResizeStateDidChange = Notification.Name("clickyMainPanelResizeStateDidChange")
+    static let clickyHeyClickyResetCompleted = Notification.Name("clickyHeyClickyResetCompleted")
+    static let clickyHeyClickyCredentialsRefreshed = Notification.Name("clickyHeyClickyCredentialsRefreshed")
+    static let clickyHeyClickyGuidedClickFollowUp = Notification.Name("clickyHeyClickyGuidedClickFollowUp")
+    static let clickyHeyClickySessionExpired = Notification.Name("clickyHeyClickySessionExpired")
 }
 
 /// Custom NSPanel subclass that can become the key window even with
@@ -32,6 +37,18 @@ private class KeyablePanel: NSPanel {
 @MainActor
 final class MenuBarPanelManager: NSObject {
     private var statusItem: NSStatusItem?
+    /// Combine sink that repaints the status-item icon when the Agent
+    /// inbox unread count changes. Retained for lifetime of manager.
+    private var notificationsBadgeCancellable: AnyCancellable?
+    /// Sinks for Screen History recording state — one dot per active
+    /// channel (screen / mic / system audio) drawn as a small colored
+    /// pip on top of the base menubar icon. Same repaint pipeline as
+    /// the agent-notification badge.
+    private var recordingStateCancellables = Set<AnyCancellable>()
+    private var lastRecordingBadge: (screen: Bool, audio: Bool) = (false, false)
+    /// Cached template icon image loaded once — badge overlay redraws
+    /// on top of this so we don't rebuild the whole symbol per tick.
+    private var baseStatusIcon: NSImage?
     private var panel: NSPanel?
     private var clickOutsideMonitor: Any?
     private var dismissPanelObserver: NSObjectProtocol?
@@ -84,18 +101,19 @@ final class MenuBarPanelManager: NSObject {
             }
         }
 
+        // FIX(perf audit #334 P0-2): UserDefaults.didChangeNotification
+        // fires on EVERY UserDefaults.set anywhere in the app — many
+        // dozens/sec during voice streaming. Previously refreshThemeAppearance
+        // + refreshGlassBackdropAccent ran per fire on main. Coalesce
+        // to a 500 ms tail: at most 2 refreshes/sec regardless of write
+        // rate, and only when a themekey actually changed.
         themeObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: UserDefaults.standard,
             queue: .main
         ) { [weak self] _ in
-            // M22: the closure already runs on the main queue (.main above), but
-            // Swift 6 still sees it as nonisolated unless we assert main-actor
-            // execution explicitly.
             MainActor.assumeIsolated {
-                guard let self else { return }
-                self.refreshThemeAppearance()
-                self.refreshGlassBackdropAccent()
+                self?.scheduleThemeRefresh()
             }
         }
     }
@@ -131,11 +149,218 @@ final class MenuBarPanelManager: NSObject {
 
         guard let button = statusItem?.button else { return }
 
-        button.image = makeClickyMenuBarIcon()
+        baseStatusIcon = makeClickyMenuBarIcon()
+        button.image = baseStatusIcon
         button.image?.isTemplate = true
         button.action = #selector(statusItemClicked(_:))
         button.target = self
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        // FIX(a11y-audit-2026-08-01 #1): VoiceOver would announce this
+        // status item as "button" without a label. Add explicit label
+        // + tooltip so VoiceOver and hover both surface the app name.
+        button.setAccessibilityLabel("OpenClicky")
+        button.setAccessibilityRole(.button)
+        button.toolTip = "OpenClicky"
+
+        // Repaint the icon whenever the Agent inbox unread count
+        // changes so the user sees a red badge when the running agent
+        // has pushed a new message (or the Notch surface is expected
+        // to show a dot). Sink runs on main queue because we touch
+        // NSStatusItem UI.
+        notificationsBadgeCancellable = HeyClickyAgentNotificationsClient.shared
+            .$unreadCount
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] count in
+                self?.applyAgentBadge(count: count)
+            }
+        // Kick a one-shot refresh so cold-boot users see the badge for
+        // any unread notifications from prior sessions. The @Published
+        // sink above will fire when the response lands.
+        Task { await HeyClickyAgentNotificationsClient.shared.refresh() }
+        // Watch Screen History recording state so the menu-bar icon
+        // shows AT-A-GLANCE whether video / audio is currently being
+        // captured. No need to open the app to check.
+        // Watch defaults changes so the icon flips instantly when
+        // the user toggles capture in Settings or the menu bar,
+        // without waiting for the capture pipeline to acknowledge.
+        // FIX(task #326 UI-11): filter didChangeNotification by
+        // whether the recording keys are the ones that could have
+        // changed. Prior code re-ran the badge repaint on EVERY
+        // defaults write (dock frame autosave, SKI hotkey remap,
+        // model selector, etc.) — hundreds of no-op repaints per
+        // typing session.
+        NotificationCenter.default.publisher(
+            for: UserDefaults.didChangeNotification)
+            .throttle(for: .milliseconds(500), scheduler: DispatchQueue.main, latest: true)
+            .sink { [weak self] _ in self?.applyRecordingBadgeIfChanged() }
+            .store(in: &recordingStateCancellables)
+        // Also react to pipeline state as a secondary signal (covers
+        // cases where the user hits an OS-level pause, e.g. entering
+        // a Sonoma system-lock, without touching our defaults).
+        ScreenHistoryState.shared.$isRecordingScreen
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.applyRecordingBadge() }
+            .store(in: &recordingStateCancellables)
+        ScreenHistoryState.shared.$isRecordingMic
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.applyRecordingBadge() }
+            .store(in: &recordingStateCancellables)
+        ScreenHistoryState.shared.$isRecordingSystemAudio
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.applyRecordingBadge() }
+            .store(in: &recordingStateCancellables)
+        // Initial paint so the icon matches state at boot, not just
+        // on first Combine event.
+        DispatchQueue.main.async { [weak self] in
+            self?.applyRecordingBadge()
+        }
+    }
+
+    /// Swap the menu-bar icon itself between four states so a glance
+    /// at the top-right of the screen tells the user what's being
+    /// recorded (Rewind ships the same UX with `ic_rewind-menubar`
+    /// variants). No overlays — the base image is replaced entirely
+    /// so the shape reads unambiguously at 22 px.
+    ///
+    ///   idle       → triangle only (baseStatusIcon)
+    ///   video only → record.circle (SF Symbol, red tint)
+    ///   audio only → mic.fill      (SF Symbol, orange tint)
+    ///   both       → record.circle.fill + micro dot (both indicator)
+    /// Cached snapshot of the recording defaults so `applyRecordingBadgeIfChanged`
+    /// can short-circuit when nothing relevant to the badge moved.
+    private var lastRecordingBadgeSnapshot: (screen: Bool, mic: Bool, sysAudio: Bool)?
+
+    private func applyRecordingBadgeIfChanged() {
+        let ud = UserDefaults.standard
+        let screen = ud.object(forKey: "openclicky.screenHistory.capture.screen") as? Bool ?? true
+        let mic = ud.bool(forKey: "openclicky.screenHistory.capture.mic")
+        let sysAudio = ud.bool(forKey: "openclicky.screenHistory.capture.systemAudio")
+        let snap = (screen, mic, sysAudio)
+        if let last = lastRecordingBadgeSnapshot, last == snap { return }
+        lastRecordingBadgeSnapshot = snap
+        applyRecordingBadge()
+    }
+
+    private func applyRecordingBadge() {
+        guard let button = statusItem?.button, let base = baseStatusIcon
+        else { return }
+        // Icon should reflect USER INTENT (what they've toggled in
+        // Settings / menu bar), not just live capture-pipeline state.
+        // `ScreenHistoryState.isRecordingScreen` only flips true once
+        // ScreenCaptureKit hands us the first frame — that lags the
+        // user's click by seconds and leaves the icon looking stuck.
+        let ud = UserDefaults.standard
+        // FIX(#342): master toggle defaults to true when the key is
+        // absent, matching the capture pipeline's own default. The old
+        // `ud.bool(forKey:)` returned false whenever the user had never
+        // touched a "master" toggle → icon stayed idle even while
+        // recording was live. Use `object(forKey:) as? Bool` so we can
+        // distinguish absent (→ default) from explicit false.
+        let masterEnabled: Bool = {
+            if let v = ud.object(forKey: "openclicky.screenHistory.enabled") as? Bool {
+                return v
+            }
+            return true
+        }()
+        let screenIntent = ud.object(
+            forKey: "openclicky.screenHistory.capture.screen") == nil
+            ? true
+            : ud.bool(forKey: "openclicky.screenHistory.capture.screen")
+        let audioIntent = ud.bool(forKey: "openclicky.screenHistory.capture.mic")
+                       || ud.bool(forKey: "openclicky.screenHistory.capture.systemAudio")
+        // Live state takes precedence over intent: if ScreenHistoryState
+        // says recording is active, force the icon on regardless of what
+        // the master defaults key looks like (covers cases where the
+        // capture pipeline was started via a different route).
+        let liveScreen = ScreenHistoryState.shared.isRecordingScreen
+        let liveAudio = ScreenHistoryState.shared.isRecordingMic
+            || ScreenHistoryState.shared.isRecordingSystemAudio
+        let screen = liveScreen || (masterEnabled && screenIntent)
+        let audio = liveAudio || (masterEnabled && audioIntent)
+        NSLog("[OpenClicky] menubar icon state screen=%d audio=%d master=%d",
+              screen ? 1 : 0, audio ? 1 : 0, masterEnabled ? 1 : 0)
+        if lastRecordingBadge == (screen, audio) { return }
+        lastRecordingBadge = (screen, audio)
+        // Idle → plain triangle, template-tintable.
+        if !screen && !audio {
+            button.image = base
+            button.image?.isTemplate = true
+            return
+        }
+        // Pick a SF Symbol that spells out the state.
+        let symbolName: String
+        let tint: NSColor
+        switch (screen, audio) {
+        case (true,  false): symbolName = "record.circle";     tint = .systemRed
+        case (false, true):  symbolName = "mic.fill";           tint = .systemOrange
+        case (true,  true):  symbolName = "record.circle.fill"; tint = .systemRed
+        default:             symbolName = "circle";             tint = .labelColor
+        }
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        guard let sym = NSImage(systemSymbolName: symbolName,
+                                 accessibilityDescription: symbolName)?
+                .withSymbolConfiguration(cfg)
+        else {
+            button.image = base
+            return
+        }
+        // Draw the symbol tinted; for the both-state overlay a small
+        // mic pip on top so users can distinguish "video+audio" from
+        // "video only".
+        let size = NSSize(width: 20, height: 20)
+        let composed = NSImage(size: size)
+        composed.lockFocus()
+        tint.set()
+        let rect = NSRect(origin: .zero, size: size)
+        let symRect = NSRect(x: (size.width - sym.size.width) / 2,
+                              y: (size.height - sym.size.height) / 2,
+                              width: sym.size.width, height: sym.size.height)
+        sym.draw(in: symRect, from: .zero, operation: .sourceOver, fraction: 1,
+                  respectFlipped: true, hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)])
+        // Tint pass — multiply blend so template glyph picks up color.
+        tint.setFill()
+        rect.fill(using: .sourceAtop)
+        // Both-state: overlay a small orange mic tick in the corner.
+        if screen && audio {
+            NSColor.systemOrange.setFill()
+            let d: CGFloat = 5
+            NSBezierPath(ovalIn: NSRect(x: size.width - d - 1,
+                                         y: 0.5, width: d, height: d)).fill()
+        }
+        composed.unlockFocus()
+        composed.isTemplate = false
+        button.image = composed
+    }
+
+    /// Redraw the status-bar icon with an optional badge (red dot for
+    /// 1-9, "9+" for larger). Keeps the underlying template icon
+    /// intact so light/dark mode inversion still works.
+    private func applyAgentBadge(count: Int) {
+        guard let button = statusItem?.button, let base = baseStatusIcon else { return }
+        if count <= 0 {
+            button.image = base
+            button.image?.isTemplate = true
+            return
+        }
+        let size = base.size
+        let composed = NSImage(size: size)
+        composed.lockFocus()
+        // Draw the base icon as template so system inversion kicks in.
+        base.draw(in: NSRect(origin: .zero, size: size))
+        // Red dot in the top-right corner. Not template — it stays red
+        // regardless of menubar color mode (matches macOS mail badge).
+        let dotDiameter: CGFloat = 6
+        let dotRect = NSRect(
+            x: size.width - dotDiameter,
+            y: size.height - dotDiameter,
+            width: dotDiameter,
+            height: dotDiameter
+        )
+        NSColor.systemRed.setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+        composed.unlockFocus()
+        composed.isTemplate = false  // Preserve red fill.
+        button.image = composed
     }
 
     /// Draws the clicky triangle as a menu bar icon. Uses the same shape
@@ -225,9 +450,168 @@ final class MenuBarPanelManager: NSObject {
         menu.addItem(settingsItem)
 
         menu.addItem(.separator())
+        addScreenHistoryQuickControls(to: menu)
+        menu.addItem(.separator())
         menu.addItem(agentHistoryMenuItem())
 
         menu.popUp(positioning: quickItem, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
+    }
+
+    private func addScreenHistoryQuickControls(to menu: NSMenu) {
+        // Header shows the master state ("Screen History · ON/OFF").
+        let masterOn = ScreenHistoryState.shared.isEnabled
+        let masterHeader = NSMenuItem(
+            title: "Screen History · " + (masterOn ? "ON" : "OFF"),
+            action: nil, keyEquivalent: "")
+        masterHeader.isEnabled = false
+        menu.addItem(masterHeader)
+
+        // Read the same UserDefaults keys the Settings page writes,
+        // so menu bar and settings pane stay in sync. Screen capture
+        // defaults to true when unset (matches @AppStorage default),
+        // audio defaults to false.
+        let ud = UserDefaults.standard
+        let videoOn: Bool = ud.object(forKey: "openclicky.screenHistory.capture.screen") == nil
+            ? true
+            : ud.bool(forKey: "openclicky.screenHistory.capture.screen")
+        // FIX(ui-2026-07-31): split "Record audio" into microphone
+        // and system-audio switches. Users need to separately opt into
+        // the microphone (privacy-sensitive) vs system audio (video/
+        // meeting playback). The unified switch mixed the two.
+        let micOn = ud.bool(forKey: "openclicky.screenHistory.capture.mic")
+        let sysAudioOn = ud.bool(forKey: "openclicky.screenHistory.capture.systemAudio")
+        menu.addItem(makeToggleMenuItem(
+            title: "Record video",
+            isOn: videoOn,
+            action: #selector(toggleScreenHistoryVideo)))
+        // FIX(mic-menu-restored-2026-08-04): restored "Record
+        // microphone" now that whisper.cpp is on 1.9.1 with the
+        // large-v3-turbo-q5_0 model + auto language detection.
+        // The old failure mode ("buffers arrive silent, Whisper
+        // hallucinates on <0.05 RMS clips") was caused by (a) the
+        // ABI-mismatched libwhisper crashing, (b) hard-coded
+        // `language="zh"` making zh→en drift into YouTube subtitle
+        // template hallucinations. Both fixed in Tasks #259 and #260.
+        menu.addItem(makeToggleMenuItem(
+            title: "Record microphone",
+            isOn: micOn,
+            action: #selector(toggleScreenHistoryMic)))
+        menu.addItem(makeToggleMenuItem(
+            title: "Record system audio",
+            isOn: sysAudioOn,
+            action: #selector(toggleScreenHistorySystemAudio)))
+
+        // Vault size — actually measure the vault dir even before
+        // capture kicks in. `ScreenHistoryState.vaultBytes` only
+        // updates while capture is running; fall back to a direct
+        // du of the vault root when off.
+        let bytes = liveVaultSize()
+        let sizeText = bytes > 0
+            ? ByteCountFormatter.string(fromByteCount: bytes,
+                                         countStyle: .file)
+            : "empty"
+        let storage = NSMenuItem(
+            title: "Vault: \(sizeText)",
+            action: nil, keyEquivalent: "")
+        storage.isEnabled = false
+        menu.addItem(storage)
+    }
+
+    /// Cached vault-size measurement. Menu-bar dropdown reads this
+    /// value synchronously so opening the menu is instant; a 30-s
+    /// background timer keeps it fresh. `du`-style enumeration on
+    /// the main thread stalled the click by ~200 ms on GB-scale
+    /// vaults — unacceptable for a menu open.
+    private var cachedVaultBytes: Int64 = 0
+    private var vaultSizeRefreshTimer: Timer?
+
+    private func liveVaultSize() -> Int64 {
+        startVaultSizeRefreshIfNeeded()
+        return cachedVaultBytes
+    }
+
+    private func startVaultSizeRefreshIfNeeded() {
+        guard vaultSizeRefreshTimer == nil else { return }
+        // FIX(perf-2026-08-01): 30 s vault-size walk enumerates every
+        // file in ~/Library/.../OpenClicky/rewind on a utility queue —
+        // fine per-tick, but the tick fires every 30 s forever whether
+        // the user ever opens the menu or not. Widen to 5 min for
+        // steady-state; on-demand refresh happens whenever the panel
+        // actually shows via `NSMenuDelegate.menuWillOpen`. Cuts disk
+        // walk 10× at rest.
+        recomputeVaultSizeInBackground()
+        vaultSizeRefreshTimer = Timer.scheduledTimer(withTimeInterval: 300,
+                                                      repeats: true) { [weak self] _ in
+            self?.recomputeVaultSizeInBackground()
+        }
+    }
+
+    private func recomputeVaultSizeInBackground() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let root = FileManager.default.urls(
+                for: .applicationSupportDirectory, in: .userDomainMask
+            ).first?.appendingPathComponent("OpenClicky/rewind", isDirectory: true)
+            guard let root,
+                  let en = FileManager.default.enumerator(
+                    at: root,
+                    includingPropertiesForKeys: [.fileSizeKey],
+                    options: [.skipsHiddenFiles])
+            else { return }
+            var total: Int64 = 0
+            for case let f as URL in en {
+                if let s = try? f.resourceValues(
+                        forKeys: [.fileSizeKey]).fileSize {
+                    total += Int64(s)
+                }
+            }
+            DispatchQueue.main.async { self?.cachedVaultBytes = total }
+        }
+    }
+
+    /// Rewind-style toggle menu item — NSMenuItem hosting a SwiftUI
+    /// Toggle. Users see a real on/off switch, not a plain text row.
+    /// Ported from Rewind's `MenuItemToggleHostingView` (IDA
+    /// _TtC6Rewind25MenuItemToggleHostingView). Menu closes when the
+    /// user clicks the toggle so the state visibly changes on next
+    /// open — matches Rewind's own UX.
+    private func makeToggleMenuItem(title: String,
+                                     isOn: Bool,
+                                     action: Selector) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let host = NSHostingView(rootView: MenuBarToggleRow(
+            title: title,
+            isOn: isOn,
+            onToggle: { [weak self] in
+                _ = self?.perform(action)
+            }))
+        host.frame = NSRect(x: 0, y: 0, width: 240, height: 30)
+        it.view = host
+        return it
+    }
+
+    @objc private func toggleScreenHistoryVideo() {
+        // Same key the Screen History Settings page's "Capture screen"
+        // checkbox writes. Flipping either one moves the other — no
+        // desync between menu bar and settings pane.
+        let key = "openclicky.screenHistory.capture.screen"
+        let cur = UserDefaults.standard.bool(forKey: key)
+        UserDefaults.standard.set(!cur, forKey: key)
+    }
+
+    @objc private func toggleScreenHistoryMic() {
+        // FIX(ui-2026-07-31): microphone toggle is independent from
+        // system-audio. Same key the Settings page writes.
+        let key = "openclicky.screenHistory.capture.mic"
+        let cur = UserDefaults.standard.bool(forKey: key)
+        UserDefaults.standard.set(!cur, forKey: key)
+    }
+
+    @objc private func toggleScreenHistorySystemAudio() {
+        // FIX(ui-2026-07-31): system audio (video / meeting playback)
+        // toggle, separate from the microphone.
+        let key = "openclicky.screenHistory.capture.systemAudio"
+        let cur = UserDefaults.standard.bool(forKey: key)
+        UserDefaults.standard.set(!cur, forKey: key)
     }
 
     private func agentHistoryMenuItem() -> NSMenuItem {
@@ -311,6 +695,21 @@ final class MenuBarPanelManager: NSObject {
 
         panel?.makeKeyAndOrderFront(nil)
         panel?.orderFrontRegardless()
+        if let p = panel {
+            HeyClickyLog.log(
+                "openclicky.window.installed.menu_bar_panel",
+                lane: "system",
+                direction: "internal",
+                [
+                    "window_num": p.windowNumber,
+                    "size_w": Int(p.frame.width),
+                    "size_h": Int(p.frame.height),
+                    "level": p.level.rawValue,
+                    "alpha": Double(p.alphaValue),
+                    "purpose": "legacy_status_item_panel",
+                ]
+            )
+        }
         installClickOutsideMonitor()
 
         if isCreatingPanel {
@@ -319,7 +718,17 @@ final class MenuBarPanelManager: NSObject {
     }
 
     private func hidePanel() {
+        let windowNum = panel?.windowNumber ?? 0
         panel?.orderOut(nil)
+        HeyClickyLog.log(
+            "openclicky.window.dismissed.menu_bar_panel",
+            lane: "system",
+            direction: "internal",
+            [
+                "window_num": windowNum,
+                "reason": "hidePanel",
+            ]
+        )
         removeClickOutsideMonitor()
     }
 
@@ -383,6 +792,21 @@ final class MenuBarPanelManager: NSObject {
         applyPinnedPanelBehavior()
         refreshThemeAppearance()
         refreshGlassBackdropAccent()
+    }
+
+    /// Debounces theme refreshes fired by UserDefaults.didChange. See
+    /// perf audit #334 P0-2. Trailing edge: last write within a 500 ms
+    /// window wins.
+    private var pendingThemeRefresh: DispatchWorkItem?
+    private func scheduleThemeRefresh() {
+        pendingThemeRefresh?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.refreshThemeAppearance()
+            self.refreshGlassBackdropAccent()
+        }
+        pendingThemeRefresh = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
     }
 
     private func refreshGlassBackdropAccent() {
@@ -656,6 +1080,20 @@ final class AgentMenuBarStatusManager: NSObject {
         let visibleItems = menuBarItems(from: companionManager)
         latestItemsByID = Dictionary(uniqueKeysWithValues: visibleItems.map { ($0.id, $0) })
 
+        // Consolidate: default to a single-icon UX (macOS convention —
+        // one app owns one status item, agent state lives in its
+        // dropdown submenu). Users who preferred the per-agent
+        // icons can flip this UserDefault back on.
+        let showPerAgent = UserDefaults.standard.bool(
+            forKey: "openclicky.menuBar.perAgentIcons")
+        if !showPerAgent {
+            for (_, statusItem) in statusItemsByItemID {
+                NSStatusBar.system.removeStatusItem(statusItem)
+            }
+            statusItemsByItemID.removeAll()
+            return
+        }
+
         let visibleIDs = Set(visibleItems.map(\.id))
         let staleIDs = statusItemsByItemID.keys.filter { !visibleIDs.contains($0) }
         for itemID in staleIDs {
@@ -782,6 +1220,10 @@ final class AgentMenuBarStatusManager: NSObject {
             },
             voice: { [weak companionManager] in
                 companionManager?.prepareVoiceFollowUpForAgentDockItem(item.id)
+            },
+            mini: { [weak companionManager, weak popover] in
+                popover?.performClose(nil)
+                companionManager?.openMiniChatForAgentDockItem(item.id)
             },
             close: { [weak popover] in
                 popover?.performClose(nil)
@@ -1118,5 +1560,30 @@ private final class AgentStatusItemDropTargetView: NSView {
 
         let filenames = pasteboard.propertyList(forType: .fileURL) as? [String] ?? []
         return filenames.map { URL(fileURLWithPath: $0).standardizedFileURL }
+    }
+}
+
+/// Menu-bar row with a real SwiftUI Toggle — mirrors Rewind's
+/// `MenuItemToggleHostingView`. Sized to match Apple's own menu row
+/// padding (~28 pt height, 14 pt side inset), so it feels native
+/// alongside plain NSMenuItems below it.
+struct MenuBarToggleRow: View {
+    let title: String
+    @State var isOn: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(LocalizedStringKey(title))
+                .font(.system(size: 13))
+            Spacer(minLength: 12)
+            Toggle("", isOn: $isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .onChange(of: isOn) { _, _ in onToggle() }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 28)
     }
 }

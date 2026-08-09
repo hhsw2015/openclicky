@@ -56,10 +56,15 @@ struct OpenClickyNotchPanelView: View {
     }
 
     @ObservedObject var companionManager: CompanionManager
+    /// Assist-agent progress — live rounds/tool counts per running sub.
+    @ObservedObject var assistAgentRegistry = AssistAgentRegistry.shared
     @ObservedObject var agentStore = OpenClickyAgentStore.shared
     @ObservedObject var automationStore = OpenClickyAutomationStore.shared
     @ObservedObject var skillDiscoveryStore = OpenClickySkillDiscoveryStore.shared
     @ObservedObject var petLibrary = ClickyBuddyPetLibrary.shared
+    // Subscribe so quota changes (spawn burn + periodic refresh) drive
+    // an immediate re-render of the HeyClicky Free row detail.
+    @ObservedObject var heyClickyPlan = HeyClickyPlanClient.shared
     @AppStorage(ClickyAccentTheme.userDefaultsKey) var selectedAccentThemeID = ClickyAccentTheme.blue.rawValue
     @AppStorage(ClickyCursorAvatarStyle.userDefaultsKey) var avatarStyleRawValue = ClickyCursorAvatarStyle.default.storageValue
     @AppStorage(ClickyCursorAvatarSizePreference.userDefaultsKey) var cursorAvatarSizeScale = ClickyCursorAvatarSizePreference.defaultScale
@@ -262,7 +267,20 @@ struct OpenClickyNotchPanelView: View {
     }
 
     var compactChatEntries: [CodexTranscriptEntry] {
-        let visibleEntries = companionManager.codexAgentSession.entries.compactMap { entry -> CodexTranscriptEntry? in
+        // FIX(task #326 UI-8): pre-slice to the last ~24 entries
+        // before running the regex-heavy display transform. Prior
+        // code walked the full history (which grows to hundreds of
+        // entries in long sessions) and ran two `replacingOccurrences`
+        // per entry, on every SwiftUI body recompute (~10-30/s under
+        // an active SKI tool_call burst).
+        let entries = companionManager.codexAgentSession.entries
+        let tail: ArraySlice<CodexTranscriptEntry>
+        if entries.count > 24 {
+            tail = entries.suffix(24)
+        } else {
+            tail = entries[entries.startIndex..<entries.endIndex]
+        }
+        let visibleEntries = tail.compactMap { entry -> CodexTranscriptEntry? in
             guard entry.role != .command else { return nil }
             var displayEntry = entry
             displayEntry.text = compactChatDisplayText(from: entry.text)
@@ -309,7 +327,35 @@ struct OpenClickyNotchPanelView: View {
         let nativeComputerUseStatus = companionManager.nativeComputerUseController.status
         let backgroundComputerUseStatus = companionManager.backgroundComputerUseController.status
 
+        // HeyClicky Free row: shows sign-in state + free quota; row is
+        // wired to be tap-actionable in `connectionRow(_:)`.
+        let heyClickyRow: OpenClickyNotchConnectionRow = {
+            if AppBundleConfiguration.heyClickySignedIn() {
+                let email = AppBundleConfiguration.heyClickySessionUserEmail() ?? "signed in"
+                let quota: String
+                if let plan = heyClickyPlan.latest {
+                    quota = plan.remainingText
+                } else {
+                    quota = "quota unknown · tap to reset"
+                }
+                return OpenClickyNotchConnectionRow(
+                    title: "HeyClicky Free",
+                    detail: "\(email) · \(quota)",
+                    state: .ready,
+                    systemImageName: "sparkles"
+                )
+            } else {
+                return OpenClickyNotchConnectionRow(
+                    title: "HeyClicky Free",
+                    detail: "Tap to sign in with Google — free listening, voice, and Agent Mode.",
+                    state: .available,
+                    systemImageName: "sparkles"
+                )
+            }
+        }()
+
         return [
+            heyClickyRow,
             OpenClickyNotchConnectionRow(
                 title: "Voice",
                 detail: "\(companionManager.buddyDictationManager.transcriptionProviderDisplayName) → \(companionManager.selectedTTSProvider.displayName) · \(speechModelLabel)",
@@ -351,7 +397,48 @@ struct OpenClickyNotchPanelView: View {
                 detail: "\(skillDiscoveryStore.suggestions.count) suggestions · scans local skills and targeted online sources",
                 state: automationStore.skillDiscoveryAutomation?.enabled == true ? .ready : .available,
                 systemImageName: "wand.and.stars.inverse"
-            )
+            ),
+            {
+                // Browser (OpenDia) — Node WS bridge state
+                let opendia = OpenClickyOpenDiaSubprocess.shared
+                let running = opendia.isRunning
+                let port = opendia.boundPort
+                let detail: String
+                if !OpenClickyOpenDiaSettings.shared.enabled {
+                    detail = "Disabled"
+                } else if running, let port {
+                    detail = "Running on :\(port) · load extension in Chrome"
+                } else {
+                    detail = "Starting…"
+                }
+                return OpenClickyNotchConnectionRow(
+                    title: "Browser (OpenDia)",
+                    detail: detail,
+                    state: running ? .ready : (OpenClickyOpenDiaSettings.shared.enabled ? .available : .needsAttention),
+                    systemImageName: "safari"
+                )
+            }(),
+            {
+                // Chrome Bridge — HTTP long-poll server for account reset
+                let bridge = HeyClickyChromeBridgeServer.shared
+                let running = bridge.isRunning
+                let port = bridge.activePort
+                let extAlive = bridge.isExtensionAlive
+                let detail: String
+                if running, let port {
+                    detail = extAlive
+                        ? "Listening on 127.0.0.1:\(port) · Extension connected"
+                        : "Listening on 127.0.0.1:\(port) · Extension not connected"
+                } else {
+                    detail = "Not running"
+                }
+                return OpenClickyNotchConnectionRow(
+                    title: "Chrome Bridge",
+                    detail: detail,
+                    state: (running && extAlive) ? .ready : .available,
+                    systemImageName: "puzzlepiece.extension"
+                )
+            }()
         ]
     }
 

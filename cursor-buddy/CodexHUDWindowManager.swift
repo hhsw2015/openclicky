@@ -23,6 +23,11 @@ private final class OpenClickyHUDPanel: NSPanel {
 final class CodexHUDWindowManager: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var themeObserver: NSObjectProtocol?
+    // Weak ref so windowShouldClose (traffic-light red button) can route
+    // through CompanionManager.hideCodexHUD, which is the only path that
+    // stops the /agent-messages poller. Without this, closing the HUD
+    // leaked the poller and kept burning requests forever.
+    private weak var companionRef: CompanionManager?
 
     override init() {
         super.init()
@@ -46,9 +51,17 @@ final class CodexHUDWindowManager: NSObject, NSWindowDelegate {
     }
 
     nonisolated func windowShouldClose(_ sender: NSWindow) -> Bool {
-        // Route the red traffic-light close through hide() so the panel
-        // and its SwiftUI hosting view stay alive for the next show().
-        Task { @MainActor in self.hide() }
+        // Route the red traffic-light close through the companion so
+        // the /agent-messages poller stops (raw `hide()` bypassed it).
+        Task { @MainActor in
+            HeyClickyLog.log("agent.hud_close_traffic_light", lane: "agent",
+                             direction: "internal", ["stage": "S3_hud_opens"])
+            if let cm = self.companionRef {
+                cm.hideCodexHUD()
+            } else {
+                self.hide()
+            }
+        }
         return false
     }
 
@@ -57,6 +70,7 @@ final class CodexHUDWindowManager: NSObject, NSWindowDelegate {
         openMemory: @escaping () -> Void,
         prepareVoiceFollowUp: @escaping () -> Void
     ) {
+        companionRef = companionManager
         if panel == nil {
             panel = makePanel(
                 companionManager: companionManager,
@@ -78,16 +92,51 @@ final class CodexHUDWindowManager: NSObject, NSWindowDelegate {
         }
         panel?.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
+        if let p = panel {
+            HeyClickyLog.log(
+                "openclicky.window.installed.codex_hud",
+                lane: "system",
+                direction: "internal",
+                [
+                    "window_num": p.windowNumber,
+                    "size_w": Int(p.frame.width),
+                    "size_h": Int(p.frame.height),
+                    "level": p.level.rawValue,
+                    "alpha": Double(p.alphaValue),
+                    "purpose": "codex_agent_hud",
+                ]
+            )
+        }
     }
 
     func hide() {
+        let windowNum = panel?.windowNumber ?? 0
         panel?.orderOut(nil)
+        HeyClickyLog.log(
+            "openclicky.window.dismissed.codex_hud",
+            lane: "system",
+            direction: "internal",
+            [
+                "window_num": windowNum,
+                "reason": "hide",
+            ]
+        )
     }
 
     func destroy() {
         MiniChatPanelManager.shared.destroyAll()
+        let windowNum = panel?.windowNumber ?? 0
         panel?.close()
         panel = nil
+        HeyClickyLog.log(
+            "openclicky.window.dismissed.codex_hud",
+            lane: "system",
+            direction: "internal",
+            [
+                "window_num": windowNum,
+                "reason": "destroy",
+            ]
+        )
     }
 
     private func makePanel(
@@ -104,9 +153,8 @@ final class CodexHUDWindowManager: NSObject, NSWindowDelegate {
             )
         )
         hostingView.wantsLayer = true
-        hostingView.layer?.cornerRadius = OpenClickyHUDLayout.cornerRadius
-        hostingView.layer?.cornerCurve = .continuous
-        hostingView.layer?.masksToBounds = true
+        hostingView.layer?.cornerRadius = 0
+        hostingView.layer?.masksToBounds = false
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
         hostingView.autoresizingMask = [.width, .height]
         // Keep the HUD as an OpenClicky surface, not a standard app window:
@@ -126,7 +174,7 @@ final class CodexHUDWindowManager: NSObject, NSWindowDelegate {
         OpenClickyWindowLevels.applyMainPanelLevel(to: panel)
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.fullScreenPrimary]
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.minSize = NSSize(width: OpenClickyHUDLayout.minimumWidth, height: OpenClickyHUDLayout.minimumHeight)
         panel.contentMinSize = NSSize(width: OpenClickyHUDLayout.minimumWidth, height: OpenClickyHUDLayout.minimumHeight)
         let resizeContainer = OpenClickyHUDResizeContainerView(frame: NSRect(x: 0, y: 0, width: OpenClickyHUDLayout.width, height: OpenClickyHUDLayout.height))
@@ -1064,7 +1112,7 @@ struct CodexHUDView: View {
                                 .font(appUIFont(size: max(10, subtextFontSize), weight: .bold))
                                 .foregroundColor(DS.Colors.textPrimary)
                                 .lineLimit(1)
-                            Text(attachment.displayName)
+                            Text(LocalizedStringKey(attachment.displayName))
                                 .font(appUIFont(size: max(8, subtextFontSize - 3), weight: .semibold))
                                 .foregroundColor(DS.Colors.textTertiary)
                                 .lineLimit(1)
@@ -1427,7 +1475,7 @@ private struct HUDHeaderPill: View {
         HStack(spacing: 5) {
             Image(systemName: systemImageName)
                 .font(appUIFont(size: max(9, subtextFontSize - 2), weight: .bold))
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .font(appUIFont(size: max(10, subtextFontSize - 1), weight: .semibold))
                 .lineLimit(1)
         }
@@ -1529,7 +1577,7 @@ private struct HUDFloatingAgentButton: View {
                     }
 
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(session.title)
+                        Text(LocalizedStringKey(session.title))
                             .font(appUIFont(size: max(11, bodyFontSize - 2), weight: .semibold))
                             .foregroundColor(DS.Colors.textPrimary)
                             .lineLimit(1)

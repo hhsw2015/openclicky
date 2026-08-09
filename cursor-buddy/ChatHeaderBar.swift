@@ -160,7 +160,7 @@ struct ChatHeaderBar: View {
   private func modelButton(_ opt: OpenClickyModelOption) -> some View {
     Button(action: { selectModel(opt.id) }) {
       HStack {
-        Text(opt.label)
+        Text(LocalizedStringKey(opt.label))
         if opt.id == session.model {
           Spacer()
           Image(systemName: "checkmark")
@@ -194,10 +194,13 @@ struct ChatHeaderBar: View {
     // updates the HUD session label. Voice backend family is set separately
     // via the bubble / notch selector.
     session.model = id
-    UserDefaults.standard.set(id, forKey: "clickyCodexModel")
+    // Record as a per-profile override so a later profile switch does
+    // not clobber this pick. `setAgentModelPreservingOverride` routes
+    // to whichever storage key this profile's agent runner reads.
+    companion.setAgentModelPreservingOverride(id)
     if OpenClickyModelCatalog.voiceResponseModel(withID: id).provider == .apple
         || OpenClickyModelCatalog.voiceResponseModel(withID: id).provider == .anthropic {
-      companion.setSelectedModel(id)
+      companion.setSelectedModelPreservingOverride(id)
     }
   }
 

@@ -11,10 +11,17 @@ import Foundation
 enum BuddyTranscriptionProviderID: String, CaseIterable, Identifiable {
     case automatic = "automatic"
     case parakeet = "parakeet"
+    case whisperLocal = "whisper_local"
     case appleSpeech = "apple"
     case assemblyAI = "assemblyai"
     case deepgram = "deepgram"
     case openAI = "openai"
+    case heyclickyFree = "heyclicky_free"
+    /// Free-tier Deepgram STT via aegis-proxy (Peeky Free lane). Wire
+    /// identical to the paid `.deepgram` case; the token comes from the
+    /// mirage token-mint endpoint instead of the user's own Deepgram key.
+    /// Available to any profile — not bound to the .peekyFree profile.
+    case mirageDeepgram = "mirage_deepgram"
 
     var id: String { rawValue }
 
@@ -24,6 +31,8 @@ enum BuddyTranscriptionProviderID: String, CaseIterable, Identifiable {
             return "Automatic"
         case .parakeet:
             return "Parakeet"
+        case .whisperLocal:
+            return "Whisper (local)"
         case .appleSpeech:
             return "Apple Speech"
         case .assemblyAI:
@@ -32,6 +41,10 @@ enum BuddyTranscriptionProviderID: String, CaseIterable, Identifiable {
             return "Deepgram"
         case .openAI:
             return "Whisper"
+        case .heyclickyFree:
+            return "HeyClicky Free"
+        case .mirageDeepgram:
+            return "Deepgram (Peeky Free)"
         }
     }
 
@@ -41,6 +54,8 @@ enum BuddyTranscriptionProviderID: String, CaseIterable, Identifiable {
             return "Local-first"
         case .parakeet:
             return "Local Parakeet"
+        case .whisperLocal:
+            return "Local whisper.cpp"
         case .appleSpeech:
             return "On-device Apple"
         case .assemblyAI:
@@ -49,6 +64,10 @@ enum BuddyTranscriptionProviderID: String, CaseIterable, Identifiable {
             return "Streaming"
         case .openAI:
             return "OpenAI listening"
+        case .heyclickyFree:
+            return "Sign in with Google"
+        case .mirageDeepgram:
+            return "Free-tier Deepgram (rotating anonymous UUID)"
         }
     }
 }
@@ -115,6 +134,11 @@ enum BuddyTranscriptionProviderFactory {
             switch providerID {
             case .parakeet:
                 return OpenClickyParakeetTranscriptionProvider().isConfigured
+            case .whisperLocal:
+                return WhisperLocalTranscriptionProvider().isConfigured
+            case .heyclickyFree:
+                return AppBundleConfiguration.heyClickySignedIn()
+                    && (try? AppBundleConfiguration.heyClickyProxyBaseURL()) != nil
             default:
                 return true
             }
@@ -145,6 +169,56 @@ enum BuddyTranscriptionProviderFactory {
                 displayedProviderID: .appleSpeech,
                 provider: AppleSpeechTranscriptionProvider()
             )
+        }
+
+        if resolvedPreferredProvider == .heyclickyFree {
+            let heyClicky = HeyClickyProxyTranscriptionProvider()
+            if heyClicky.isConfigured {
+                return ProviderSelection(
+                    requestedProviderID: .heyclickyFree,
+                    displayedProviderID: .heyclickyFree,
+                    provider: heyClicky
+                )
+            }
+            print("Transcription: HeyClicky Free preferred but not signed in, falling back")
+            let fallback = configuredFallback(
+                excluding: .heyclickyFree,
+                assemblyAIProvider: assemblyAIProvider,
+                deepgramProvider: deepgramProvider,
+                openAIProvider: openAIProvider,
+                parakeetProvider: parakeetProvider
+            )
+            return ProviderSelection(
+                requestedProviderID: .heyclickyFree,
+                displayedProviderID: fallback.0,
+                provider: fallback.1
+            )
+        }
+
+        if resolvedPreferredProvider == .whisperLocal {
+            let whisperProvider = WhisperLocalTranscriptionProvider()
+            return ProviderSelection(
+                requestedProviderID: .whisperLocal,
+                displayedProviderID: .whisperLocal,
+                provider: whisperProvider
+            )
+        }
+
+        // Peeky Free (mirage) Deepgram — free-tier via aegis-proxy. Not
+        // bound to any specific profile: any profile can select it in
+        // Settings. When the mirage upstream isn't configured we fall
+        // through so the user gets the normal fallback chain instead of
+        // a hard error.
+        if resolvedPreferredProvider == .mirageDeepgram {
+            let mirage = MirageDeepgramTranscriptionProvider()
+            if mirage.isConfigured {
+                return ProviderSelection(
+                    requestedProviderID: .mirageDeepgram,
+                    displayedProviderID: .mirageDeepgram,
+                    provider: mirage
+                )
+            }
+            print("Transcription: Peeky Free Deepgram preferred but MirageSecrets not configured, falling back")
         }
 
         if resolvedPreferredProvider == .parakeet {
@@ -267,6 +341,18 @@ enum BuddyTranscriptionProviderFactory {
         if excludedProvider != .parakeet, parakeetProvider.isConfigured {
             print("Transcription: using Parakeet as fallback")
             return (.parakeet, parakeetProvider)
+        }
+
+        // Whisper.cpp local — offline, free, multilingual, better
+        // Chinese than AppleSpeech. Prefer over any cloud provider when
+        // the model file is installed; only skip when the user has NOT
+        // downloaded a Whisper model yet (isConfigured=false).
+        if excludedProvider != .whisperLocal {
+            let whisperProvider = WhisperLocalTranscriptionProvider()
+            if whisperProvider.isConfigured {
+                print("Transcription: using Whisper local as fallback")
+                return (.whisperLocal, whisperProvider)
+            }
         }
 
         if excludedProvider != .assemblyAI, assemblyAIProvider.isConfigured {

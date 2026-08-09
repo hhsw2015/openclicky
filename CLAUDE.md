@@ -86,3 +86,8 @@ swiftc -parse <relevant Swift source files>
 ```
 
 Do not launch unsigned or throwaway builds for TCC permission testing.
+
+## Build scripts
+
+- `bash scripts/fast-install.sh` — Debug + 增量, 5-30s. 平常开发用.
+- `bash scripts/sign-and-install.sh` — Release + slim + strip + resign, 2-5min. 发布/测性能用.

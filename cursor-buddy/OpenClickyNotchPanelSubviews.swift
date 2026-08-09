@@ -34,10 +34,10 @@ struct OpenClickyNotchHeroCard<Content: View>: View {
                     .background(Circle().fill(accent.opacity(0.15)))
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
+                    Text(LocalizedStringKey(title))
                         .font(typography.font(size: 15, weight: .black))
                         .foregroundColor(DS.Colors.textPrimary)
-                    Text(subtitle)
+                    Text(LocalizedStringKey(subtitle))
                         .font(typography.font(size: 10, weight: .semibold))
                         .foregroundColor(DS.Colors.textSecondary)
                         .lineLimit(2)
@@ -101,17 +101,17 @@ struct OpenClickyNotchMetricCard: View {
 
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(alignment: .firstTextBaseline, spacing: 5) {
-                        Text(value)
+                        Text(LocalizedStringKey(value))
                             .font(typography.font(size: 16, weight: .black))
                             .foregroundColor(DS.Colors.textPrimary)
                             .lineLimit(1)
-                        Text(title)
+                        Text(LocalizedStringKey(title))
                             .font(typography.font(size: 9, weight: .black))
                             .foregroundColor(DS.Colors.textTertiary)
                             .textCase(.uppercase)
                             .lineLimit(1)
                     }
-                    Text(detail)
+                    Text(LocalizedStringKey(detail))
                         .font(typography.font(size: 9, weight: .semibold))
                         .foregroundColor(DS.Colors.textSecondary)
                         .lineLimit(1)
@@ -267,10 +267,10 @@ struct OpenClickyNotchEmptyState: View {
             Image(systemName: systemImageName)
                 .font(typography.font(size: 22, weight: .heavy))
                 .foregroundColor(DS.Colors.textSecondary)
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .font(typography.font(size: 12, weight: .heavy))
                 .foregroundColor(DS.Colors.textPrimary)
-            Text(subtitle)
+            Text(LocalizedStringKey(subtitle))
                 .font(typography.font(size: 10, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
                 .lineSpacing(CGFloat(appLineSpacing))

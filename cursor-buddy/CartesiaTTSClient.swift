@@ -18,6 +18,12 @@ final class CartesiaTTSClient {
     private var apiKey: String?
     private(set) var voiceID: String
     private let session: URLSession
+
+    /// Optional dynamic token source for the mirage (Peeky Free) lane.
+    /// When set, replaces the static apiKey with a freshly-minted short-
+    /// lived token per request — MirageCartesiaClient hooks this in so
+    /// Cartesia TTS works without a personal API key.
+    var tokenProvider: (@Sendable () async throws -> String)? = nil
     // Cartesia-Version pinned to the latest stable. Verified against
     // https://docs.cartesia.ai (2026-04-26). The voice-ID request
     // shape (`{"voice": {"mode": "id", ...}}`) is the supported format
@@ -86,7 +92,14 @@ final class CartesiaTTSClient {
         waitUntilFinished: Bool = true,
         onPlaybackStarted: (() -> Void)? = nil
     ) async throws {
-        guard let apiKey, !apiKey.isEmpty else {
+        // Resolve auth token: tokenProvider (mirage lane) wins over the
+        // static apiKey. When neither is set, we cannot make the call.
+        let apiKey: String
+        if let provider = tokenProvider {
+            apiKey = try await provider()
+        } else if let staticKey = self.apiKey, !staticKey.isEmpty {
+            apiKey = staticKey
+        } else {
             throw Self.makeError(-100, "Cartesia API key is not configured")
         }
         guard !voiceID.isEmpty,
@@ -260,16 +273,122 @@ final class CartesiaTTSClient {
         return session
     }
 
+    /// Isolated filler playback: fully local AVAudioEngine + player so
+    /// the concurrent streaming session (main TTS) never gets its
+    /// engine reset when this finishes. Different from `speakText`,
+    /// which writes into `self.audioEngine` and would trip
+    /// `player.engine == nil` in the streaming enqueue path.
+    ///
+    /// Silent on any error — filler is best-effort UX cover. Never
+    /// throws to the caller so the turn continues even if TTS is down.
+    func speakFillerIsolated(_ text: String) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let apiKey: String
+        if let provider = tokenProvider {
+            do { apiKey = try await provider() } catch { return }
+        } else if let staticKey = self.apiKey, !staticKey.isEmpty {
+            apiKey = staticKey
+        } else {
+            return
+        }
+        guard !voiceID.isEmpty,
+              let url = URL(string: "https://api.cartesia.ai/tts/bytes") else {
+            return
+        }
+        // Fetch PCM once — this is a short phrase, no need to stream.
+        let request = Self.makeRequest(url: url, apiKey: apiKey, voiceID: voiceID, text: trimmed)
+        let samples: [Int16]
+        do { samples = try await Self.decodePCMSamples(request: request, session: session) }
+        catch { return }
+        guard !samples.isEmpty,
+              let format = AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: Self.streamSampleRate,
+                channels: 1,
+                interleaved: true) else { return }
+
+        // Fully-local engine + player. Nothing touches `self.audioEngine`.
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        do { try engine.start() } catch { return }
+
+        // Fill a PCM buffer from Int16 samples.
+        let frameCount = AVAudioFrameCount(samples.count)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
+              let int16Ptr = buffer.int16ChannelData?[0] else {
+            engine.stop()
+            return
+        }
+        buffer.frameLength = frameCount
+        samples.withUnsafeBufferPointer { src in
+            int16Ptr.update(from: src.baseAddress!, count: samples.count)
+        }
+
+        let played = CheckedContinuation<Void, Never>.self
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            player.scheduleBuffer(buffer, at: nil, options: []) {
+                cont.resume()
+            }
+            player.play()
+        }
+        _ = played
+        await MainActor.run {
+            player.stop()
+            engine.stop()
+        }
+    }
+
     func fetchSentenceSamples(_ text: String) async throws -> [Int16] {
-        guard let apiKey, !apiKey.isEmpty else {
-            throw Self.makeError(-10, "Cartesia API key not configured")
+        let apiKey: String
+        do {
+            if let provider = tokenProvider {
+                apiKey = try await provider()
+            } else if let staticKey = self.apiKey, !staticKey.isEmpty {
+                apiKey = staticKey
+            } else {
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "error",
+                    event: "cartesia.fetch.no_auth",
+                    fields: ["text_len": text.count])
+                throw Self.makeError(-10, "Cartesia API key not configured")
+            }
+        } catch {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "error",
+                event: "cartesia.fetch.token_provider_failed",
+                fields: ["error": "\(error)"])
+            throw error
         }
         guard !voiceID.isEmpty, let url = URL(string: "https://api.cartesia.ai/tts/bytes") else {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "error",
+                event: "cartesia.fetch.no_voice_id",
+                fields: ["voiceID": voiceID])
             throw Self.makeError(-11, "Cartesia voice ID not configured")
         }
+        OpenClickyMessageLogStore.shared.append(
+            lane: "voice", direction: "outgoing",
+            event: "cartesia.fetch.start",
+            fields: ["text_len": text.count, "voice_id_prefix": String(voiceID.prefix(8))])
         let request = Self.makeRequest(url: url, apiKey: apiKey, voiceID: voiceID, text: text)
         let urlSession = self.session
-        return try await Self.decodePCMSamples(request: request, session: urlSession)
+        do {
+            let samples = try await Self.decodePCMSamples(request: request, session: urlSession)
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "incoming",
+                event: "cartesia.fetch.ok",
+                fields: ["samples": samples.count])
+            return samples
+        } catch {
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "error",
+                event: "cartesia.fetch.http_error",
+                fields: ["error": "\(error)"])
+            throw error
+        }
     }
 
     nonisolated private static func decodePCMSamples(

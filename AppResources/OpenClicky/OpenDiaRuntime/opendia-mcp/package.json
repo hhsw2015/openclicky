@@ -1,0 +1,51 @@
+{
+  "name": "opendia",
+  "version": "1.1.0",
+  "description": "🎯 OpenDia - The open alternative to Dia. Connect your browser to AI models with anti-detection bypass for Twitter/X, LinkedIn, Facebook",
+  "main": "server.js",
+  "bin": {
+    "opendia": "./server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "tunnel": "node server.js --tunnel",
+    "sse-only": "node server.js --sse-only",
+    "tunnel-sse": "node server.js --tunnel --sse-only",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "mcp",
+    "browser",
+    "automation",
+    "ai",
+    "claude",
+    "chrome",
+    "extension",
+    "twitter",
+    "linkedin",
+    "facebook",
+    "anti-detection"
+  ],
+  "author": "OpenDia Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aaronjmars/opendia.git"
+  },
+  "homepage": "https://github.com/aaronjmars/opendia",
+  "bugs": {
+    "url": "https://github.com/aaronjmars/opendia/issues"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.2.1",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "server.js",
+    "README.md"
+  ]
+}

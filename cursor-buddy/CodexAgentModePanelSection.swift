@@ -53,12 +53,12 @@ struct CodexAgentModePanelSection: View {
 
                 Spacer()
 
-                Text(session.status.label)
+                Text(LocalizedStringKey(session.status.label))
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(DS.Colors.textTertiary)
             }
 
-            Text(summaryText)
+            Text(LocalizedStringKey(summaryText))
                 .font(.system(size: 11))
                 .foregroundColor(DS.Colors.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -92,7 +92,7 @@ struct CodexAgentModePanelSection: View {
                 }
 
             if let error = visibleInlineErrorMessage {
-                Text(error)
+                Text(LocalizedStringKey(error))
                     .font(.system(size: 10))
                     .foregroundColor(DS.Colors.destructiveText)
                     .lineLimit(3)
@@ -177,7 +177,7 @@ struct CodexAgentModePanelSection: View {
 
                 Spacer()
 
-                Text(statusBadgeText)
+                Text(LocalizedStringKey(statusBadgeText))
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(statusBadgeColor)
                     .padding(.horizontal, 8)
@@ -185,7 +185,7 @@ struct CodexAgentModePanelSection: View {
                     .background(Capsule().fill(statusBadgeColor.opacity(0.16)))
             }
 
-            Text(inlineOverlayTitle)
+            Text(LocalizedStringKey(inlineOverlayTitle))
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Colors.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -208,7 +208,7 @@ struct CodexAgentModePanelSection: View {
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(inlineOverlayCaption)
+                        Text(LocalizedStringKey(inlineOverlayCaption))
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(DS.Colors.textPrimary)
                             .lineLimit(nil)
@@ -413,7 +413,7 @@ struct CodexAgentModePanelSection: View {
             Text("Stage")
                 .font(.system(size: 9, weight: .bold))
                 .foregroundColor(DS.Colors.textTertiary)
-            Text(session.progressStage.label)
+            Text(LocalizedStringKey(session.progressStage.label))
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundColor(DS.Colors.textSecondary)
         }
@@ -718,6 +718,7 @@ struct CodexAgentModeSettingsSheet: View {
                         ClickyKnowledgeIndexSummaryView(index: knowledgeIndex, openMemory: openMemory)
 
                         if let responseCard {
+                            let tapDismiss = UserDefaults.standard.bool(forKey: "openclicky.ski.tapToDismiss")
                             ClickyResponseCardCompactView(
                                 card: responseCard,
                                 actionHandlers: ClickyResponseCardActionHandlers(
@@ -736,6 +737,12 @@ struct CodexAgentModeSettingsSheet: View {
                                     }
                                 )
                             )
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                if tapDismiss {
+                                    dismissResponseCard()
+                                }
+                            }
                         }
                     }
 
@@ -844,10 +851,10 @@ struct CodexAgentModeSettingsSheet: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
-                Text(subtitle)
+                Text(LocalizedStringKey(subtitle))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -894,7 +901,7 @@ struct CodexAgentModeSettingsSheet: View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(option.label)
+                    Text(LocalizedStringKey(option.label))
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
                         .lineLimit(1)
@@ -909,7 +916,7 @@ struct CodexAgentModeSettingsSheet: View {
                     }
                 }
 
-                Text(option.provider.displayName)
+                Text(LocalizedStringKey(option.provider.displayName))
                     .font(.system(size: 8, weight: .medium))
                     .foregroundColor(DS.Colors.textTertiary)
                     .lineLimit(1)
@@ -943,7 +950,7 @@ struct CodexAgentModeSettingsSheet: View {
                 } label: {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
-                            Text(option.label)
+                            Text(LocalizedStringKey(option.label))
                                 .font(.system(size: 9, weight: .semibold))
                                 .foregroundColor(transcriptionProviderID == option.rawValue ? DS.Colors.textPrimary : DS.Colors.textTertiary)
                                 .lineLimit(1)
@@ -957,7 +964,7 @@ struct CodexAgentModeSettingsSheet: View {
                             }
                         }
 
-                        Text(option.subtitle)
+                        Text(LocalizedStringKey(option.subtitle))
                             .font(.system(size: 8, weight: .medium))
                             .foregroundColor(DS.Colors.textTertiary)
                             .lineLimit(1)
@@ -1011,7 +1018,7 @@ struct CodexAgentModeSettingsSheet: View {
                     .foregroundColor(DS.Colors.textTertiary)
                     .frame(width: 13)
 
-                Text(label)
+                Text(LocalizedStringKey(label))
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(DS.Colors.textSecondary)
             }
@@ -1037,13 +1044,13 @@ struct CodexAgentModeSettingsSheet: View {
                 .foregroundColor(DS.Colors.textTertiary)
                 .frame(width: 14)
 
-            Text(label)
+            Text(LocalizedStringKey(label))
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundColor(DS.Colors.textSecondary)
 
             Spacer()
 
-            Text(value)
+            Text(LocalizedStringKey(value))
                 .font(.system(size: 9, weight: .medium))
                 .foregroundColor(DS.Colors.textTertiary)
         }
@@ -1121,7 +1128,7 @@ struct CodexAgentModeSettingsSheet: View {
                 Image(systemName: systemImage)
                     .font(.system(size: 11, weight: .medium))
                     .frame(width: 14)
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 12, weight: .bold))
                 Spacer()
                 if showsChevron {

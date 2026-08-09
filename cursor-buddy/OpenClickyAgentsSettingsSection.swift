@@ -79,7 +79,7 @@ struct OpenClickyAgentsSettingsSection: View {
         Image(systemName: agent.isProtectedSystemAgent ? "lock.shield.fill" : (agent.isUserDefined ? "person.crop.circle.fill" : "person.crop.circle"))
           .foregroundColor(agent.isUserDefined ? .accentColor : .secondary)
         VStack(alignment: .leading, spacing: 1) {
-          Text(agent.metadata.displayName)
+          Text(LocalizedStringKey(agent.metadata.displayName))
             .font(.system(size: 12, weight: .medium))
           Text(agent.slug)
             .font(.system(size: 10))
@@ -210,7 +210,7 @@ private struct AgentEditorView: View {
     HStack(spacing: 8) {
       Image(systemName: agent.isProtectedSystemAgent ? "lock.shield.fill" : (agent.isUserDefined ? "person.crop.circle.fill" : "person.crop.circle"))
       VStack(alignment: .leading, spacing: 0) {
-        Text(agent.metadata.displayName)
+        Text(LocalizedStringKey(agent.metadata.displayName))
           .font(.system(size: 14, weight: .semibold))
         Text("slug: \(agent.slug)" + agentTitleSuffix)
           .font(.system(size: 10))
@@ -227,7 +227,7 @@ private struct AgentEditorView: View {
 
   private func field(_ label: String, text: Binding<String>) -> some View {
     VStack(alignment: .leading, spacing: 4) {
-      Text(label).font(.system(size: 11, weight: .medium))
+      Text(LocalizedStringKey(label)).font(.system(size: 11, weight: .medium))
       TextField("", text: text)
         .textFieldStyle(.roundedBorder)
         .font(.system(size: 12))
@@ -237,7 +237,7 @@ private struct AgentEditorView: View {
   private func textArea(_ label: String, text: Binding<String>, hint: String) -> some View {
     VStack(alignment: .leading, spacing: 4) {
       HStack {
-        Text(label).font(.system(size: 11, weight: .medium))
+        Text(LocalizedStringKey(label)).font(.system(size: 11, weight: .medium))
         Text("· \(hint)").font(.system(size: 10)).foregroundColor(.secondary)
       }
       TextEditor(text: text)
@@ -331,7 +331,7 @@ private struct CreateAgentSheet: View {
       }
 
       if let error {
-        Text(error).font(.system(size: 11)).foregroundColor(.red)
+        Text(LocalizedStringKey(error)).font(.system(size: 11)).foregroundColor(.red)
       }
 
       HStack {
@@ -348,7 +348,7 @@ private struct CreateAgentSheet: View {
 
   private func labeled(_ label: String, placeholder: String, text: Binding<String>) -> some View {
     VStack(alignment: .leading, spacing: 3) {
-      Text(label).font(.system(size: 11, weight: .medium))
+      Text(LocalizedStringKey(label)).font(.system(size: 11, weight: .medium))
       TextField(placeholder, text: text).textFieldStyle(.roundedBorder).font(.system(size: 12))
     }
   }

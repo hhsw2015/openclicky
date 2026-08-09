@@ -265,6 +265,17 @@ private final class OpenClickyDynamicNotchKitModel: ObservableObject {
         openNotch()
     }
 
+    private var scrubWorkItem: DispatchWorkItem?
+    func scheduleDraftScrubCoalesced() {
+        scrubWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.scrubDroppedFileTextFromDraft()
+        }
+        scrubWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150),
+                                      execute: item)
+    }
+
     func scrubDroppedFileTextFromDraft() {
         guard !draftText.isEmpty, !draftAttachments.isEmpty else { return }
         var scrubbedText = draftText
@@ -966,12 +977,12 @@ private struct OpenClickyDynamicNotchKitExpandedView: View {
                 contextIcon(suggestion)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(suggestion.title)
+                    Text(LocalizedStringKey(suggestion.title))
                         .font(.system(size: 15, weight: .heavy))
                         .foregroundStyle(primaryTextColor.opacity(0.98))
                         .lineLimit(1)
                         .truncationMode(.tail)
-                    Text(suggestion.subtitle)
+                    Text(LocalizedStringKey(suggestion.subtitle))
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(primaryTextColor.opacity(0.62))
                         .lineLimit(1)
@@ -1163,16 +1174,15 @@ private struct OpenClickyDynamicNotchKitInputRow: View {
             fieldFocused = true
         }
         .onChange(of: model.draftText) { _, _ in
-            // Scrubbing rewrites draftText, which cannot publish from inside
-            // the onChange view-update transaction.
-            DispatchQueue.main.async {
-                model.scrubDroppedFileTextFromDraft()
-            }
+            // FIX(perf-2026-08-01): coalesce per-keystroke main.async
+            // hop. Every draftText mutation queued a hop; typing a
+            // sentence produced 20+ back-to-back main.async invocations
+            // + regex scrubs. Debounce so scrub happens ~150 ms after
+            // typing pauses.
+            model.scheduleDraftScrubCoalesced()
         }
         .onChange(of: model.draftAttachments) { _, _ in
-            DispatchQueue.main.async {
-                model.scrubDroppedFileTextFromDraft()
-            }
+            model.scheduleDraftScrubCoalesced()
         }
         .onChange(of: fieldFocused) { _, focused in
             // onChange runs inside the view-update transaction; publishing

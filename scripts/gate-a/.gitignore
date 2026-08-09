@@ -1,0 +1,4 @@
+.build/
+*.o
+Sources/gatea/OpenClickyIntentClassifier.swift
+Sources/gatea/MirageRedact.swift

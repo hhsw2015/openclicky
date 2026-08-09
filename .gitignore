@@ -30,3 +30,15 @@ worker/.env.local
 .mcp.json
 /.antigravitycli
 /cascade
+
+# Runtime scratch for the SKI / openclicky-voice loop. The app and the CLI
+# skill append to these every session; they are a live IPC channel, not
+# source, and can contain spoken transcripts.
+.oc/
+
+# routelet ONNX embedder — 127 MB, over GitHub's 100 MB hard limit, and it
+# is copied verbatim from Peeky's bundle rather than built here. Same
+# treatment as CodexRuntime above: expected on disk, never in history.
+# Provisioning is manual today; docs/mirage-openclicky-integration-plan.md
+# already flagged remote-download-on-first-activation as the alternative.
+/AppResources/OpenClicky/mirage-routelet/embedder.onnx

@@ -179,7 +179,16 @@ extension CompanionManager {
     /// historic name so menu-bar actions, deep links, and SDK callers all land
     /// on the new ChatWorkspace surface rather than a debug-only legacy HUD.
     func showCodexHUD(developerRequested _: Bool = false) {
-        guard isAdvancedModeEnabled else { return }
+        guard isAdvancedModeEnabled else {
+            HeyClickyLog.log("agent.hud_gated", lane: "agent", direction: "internal", [
+                "stage": "S3_hud_opens", "reason": "advanced_mode_disabled"
+            ])
+            return
+        }
+        HeyClickyLog.log("agent.hud_showing", lane: "agent", direction: "internal", [
+            "stage": "S3_hud_opens",
+            "hey_clicky_lane": shouldRoutePTTToHeyClickyRealtimeSession
+        ])
         codexHUDWindowManager.show(
             companionManager: self,
             openMemory: { [weak self] in
@@ -191,6 +200,16 @@ extension CompanionManager {
                 self.prepareForVoiceFollowUp()
             }
         )
+        // When the HeyClicky Free lane is active, opening the HUD
+        // implicitly means the user is engaging with agent output —
+        // mark inbox notifications read and (re)start the /agent-messages
+        // long-poll so remote turns flow into the HUD live.
+        if shouldRoutePTTToHeyClickyRealtimeSession {
+            beginAgentMessagesPollingIfNeeded()
+            Task { @MainActor in
+                await HeyClickyAgentNotificationsClient.shared.markAllRead()
+            }
+        }
     }
 
     #if DEBUG
@@ -473,7 +492,12 @@ final class UserActivityIdleDetector: ObservableObject {
             }
         }
 
-        idleCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        // FIX(perf-2026-08-01): 2 Hz always-on main-actor hop for
+        // idle evaluation. NSEvent monitor above already records every
+        // user activity; the timer only exists to fire the idle→active
+        // transition. 3 s cadence still shows the "idle" gate within
+        // human perception window while cutting main-actor pressure 6×.
+        idleCheckTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.evaluateIdleState()
             }

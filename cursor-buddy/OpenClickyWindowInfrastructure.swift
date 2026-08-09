@@ -116,13 +116,31 @@ final class OpenClickyLiquidGlassBackdropView: NSView {
         applyShape()
         updateLiquidGlassState()
 
+        // FIX(perf audit #334 P0-3): UserDefaults.didChange fires on
+        // every write app-wide (dozens/sec during voice streaming).
+        // updateLiquidGlassState() rebuilds an NSVisualEffectView tint
+        // — expensive. Debounce 300 ms so at most a few refreshes/sec
+        // regardless of write rate.
         defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.scheduleGlassRefresh()
+            }
+        }
+    }
+
+    private var pendingGlassRefresh: DispatchWorkItem?
+    @MainActor
+    private func scheduleGlassRefresh() {
+        pendingGlassRefresh?.cancel()
+        let item = DispatchWorkItem { [weak self] in
             self?.updateLiquidGlassState()
         }
+        pendingGlassRefresh = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
     }
 
     required init?(coder: NSCoder) {

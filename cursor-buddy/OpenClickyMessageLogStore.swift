@@ -7,6 +7,14 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
     private let lock = NSLock()
     private let writeQueue = DispatchQueue(label: "com.jkneen.openclicky.message-log-writes", qos: .utility)
 
+    // FIX(perf-2026-08-01): keep a long-lived FileHandle per-day to
+    // avoid open/seek/close/chmod syscall storm on every append. 60+
+    // append callsites fire per-audio-buffer / per-frame — closing +
+    // reopening on each was ~5-6 syscalls per event. Rotate at date
+    // boundary. Only the writeQueue touches these two fields.
+    private var cachedHandleURL: URL?
+    private var cachedHandle: FileHandle?
+
     let logDirectory: URL
 
     var reviewCommentsFile: URL {
@@ -32,7 +40,10 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
 
     /// Message logs can contain transcripts and agent output. Keep a short,
     /// privacy-oriented diagnostic window rather than a month of plaintext.
-    static let defaultRetentionDays: Int = 14
+    /// Old logs are diagnostic-only — nothing else reads them.
+    /// 1 day is enough for same-session bug reports; anything older
+    /// is dead weight (single day can already be tens of MB).
+    static let defaultRetentionDays: Int = 1
     static let reviewCommentRetentionDays: Int = 30
     private static let maximumConversationPreviewLength = 2_000
     private static let maximumReviewCommentLength = 2_000
@@ -166,9 +177,20 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
     }
 
     func append(lane: String, direction: String, event: String, fields: [String: Any] = [:]) {
-        let sanitizedFields = Self.sanitizedJSONObject(fields)
+        // FIX(perf-2026-08-01): 60+ callsites (some fire per audio buffer
+        // / per frame) call `append`. `sanitizedJSONObject` recursively
+        // walks the dict and applies 8 regex redactions to every string
+        // value — was running on the CALLER thread before the async
+        // hop, so main-actor callers paid the full CPU cost inline. That
+        // was the #1 identified main-thread stall in perf audit. Move
+        // the sanitize call inside the writeQueue.async so callers pay
+        // only the cost of enqueueing.
+        //
+        // Capture time on the caller (accurate) but do all work off it.
+        let capturedAt = Date()
         writeQueue.async { [weak self] in
             guard let self else { return }
+            let sanitizedFields = Self.sanitizedJSONObject(fields)
             self.lock.lock()
             defer { self.lock.unlock() }
 
@@ -179,7 +201,7 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
                 isoFormatter.timeZone = TimeZone(secondsFromGMT: 0)
 
                 let entry: [String: Any] = [
-                    "timestamp": isoFormatter.string(from: Date()),
+                    "timestamp": isoFormatter.string(from: capturedAt),
                     "lane": lane,
                     "direction": direction,
                     "event": event,
@@ -238,15 +260,32 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
     }
 
     private func append(_ data: Data, to fileURL: URL) throws {
-        if fileManager.fileExists(atPath: fileURL.path) {
-            let handle = try FileHandle(forWritingTo: fileURL)
-            handle.seekToEndOfFile()
-            handle.write(data)
-            handle.closeFile()
-        } else {
-            try writePrivateFile(data, to: fileURL)
+        // FIX(perf-2026-08-01): reuse a long-lived FileHandle instead
+        // of open+seek+close+chmod per append. Only invalidate on URL
+        // change (date rollover). Skip chmod after first write — dir
+        // is already 0700, per-file chmod on every append was a wasted
+        // syscall path.
+        if let h = cachedHandle, cachedHandleURL == fileURL {
+            h.write(data)
+            return
         }
-        try? fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: fileURL.path)
+        // Close previous day's handle if any.
+        if let prev = cachedHandle {
+            try? prev.close()
+            cachedHandle = nil
+            cachedHandleURL = nil
+        }
+        if !fileManager.fileExists(atPath: fileURL.path) {
+            try writePrivateFile(Data(), to: fileURL)
+            try? fileManager.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o600)],
+                ofItemAtPath: fileURL.path)
+        }
+        let handle = try FileHandle(forWritingTo: fileURL)
+        handle.seekToEndOfFile()
+        handle.write(data)
+        cachedHandle = handle
+        cachedHandleURL = fileURL
     }
 
     private func ensureEmptyJSONLReviewCommentsFileExists() throws {
@@ -510,6 +549,14 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
         #"(?i)\b(openai_api_key|anthropic_api_key|elevenlabs_api_key|api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s,}]{8,}"#
     ]
 
+    // FIX(perf-2026-08-01): pre-compile the redaction regexes ONCE.
+    // Previously `redactedSensitiveValues` compiled all 8 NSRegularExpression
+    // instances on every string in every log-append. 60+ callsites × 8
+    // recompiles was measurable main-thread CPU in the perf audit.
+    private static let compiledSensitivePatterns: [NSRegularExpression] = {
+        sensitiveValuePatterns.compactMap { try? NSRegularExpression(pattern: $0) }
+    }()
+
     private static func truncated(_ string: String, maxLength: Int = 12_000) -> String {
         let redactedString = redactedSensitiveValues(in: string)
         guard redactedString.count > maxLength else { return redactedString }
@@ -518,9 +565,11 @@ nonisolated final class OpenClickyMessageLogStore: @unchecked Sendable {
     }
 
     private static func redactedSensitiveValues(in string: String) -> String {
+        // Fast path: short strings never contain the 20+ char secrets
+        // we look for. Skips the whole regex loop for ~90% of log values.
+        if string.count < 20 { return string }
         var redacted = string
-        for pattern in sensitiveValuePatterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+        for regex in compiledSensitivePatterns {
             let range = NSRange(redacted.startIndex..<redacted.endIndex, in: redacted)
             redacted = regex.stringByReplacingMatches(in: redacted, options: [], range: range, withTemplate: "[redacted]")
         }

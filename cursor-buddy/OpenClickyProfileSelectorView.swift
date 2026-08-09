@@ -42,7 +42,7 @@ struct OpenClickyProfileSelectorView: View {
             companionManager.applyProfile(profile)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
-                Text(profile.displayName)
+                Text(LocalizedStringKey(profile.displayName))
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(isSelected ? DS.Colors.accentText : DS.Colors.textPrimary)
                 Text(Self.tagline(for: profile.id))
@@ -77,6 +77,12 @@ struct OpenClickyProfileSelectorView: View {
             return "Lowest latency — speech-to-speech"
         case "quality":
             return "Best accuracy — premium STT & voice"
+        case "heyclicky_free":
+            return "Free tier — cloud proxy, quota-limited"
+        case "ski_mode":
+            return "Talk to your CLI agent (Claude Code / Codex) via file bridge"
+        case "mirage":
+            return "Free Claude + Deepgram + Cartesia via aegis-proxy (~20/day)"
         default:
             return ""
         }

@@ -179,6 +179,18 @@ enum CompanionScreenCaptureUtility {
                 contentFilter: filter,
                 configuration: configuration
             )
+            OpenClickyMessageLogStore.shared.append(
+                lane: "system",
+                direction: "internal",
+                event: "screen_capture.geometry",
+                fields: [
+                    "display_wh": "\(display.width)x\(display.height)",
+                    "cfg_wh": "\(configuration.width)x\(configuration.height)",
+                    "cg_wh": "\(cgImage.width)x\(cgImage.height)",
+                    "point_wh": "\(Int(displayFrame.width))x\(Int(displayFrame.height))",
+                    "scale": backingScaleFactor
+                ]
+            )
 
             guard let jpegData = NSBitmapImageRep(cgImage: cgImage)
                     .representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {

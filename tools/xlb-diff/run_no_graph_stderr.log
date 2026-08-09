@@ -1,0 +1,41 @@
+Building for debugging...
+[0/3] Write swift-version--58304C5D6DBC2206.txt
+Build of product 'xlb-diff' complete! (0.12s)
+[xlb-diff] syncing Swift index...
+2026-08-03 17:15:06.567 xlb-diff[96745:1548558] [XLBTopicIndex] parsed 341 records / 26586 topics / 9987 edges from 39 files in 31.053s
+[xlb-diff] sync ok: 341 records / 26586 topics / 9987 edges in 31.05s
+[FAIL] A1: exact "AI Model" (overlap 10%)
+[FAIL] A2: exact "Vibe Coding" (overlap 50%)
+[FAIL] A3: exact "Awesome Search" (overlap 11%)
+[FAIL] A4: exact "Deep Learning" (overlap 18%)
+[PASS] A5: exact "MCP" (overlap 100%)
+[FAIL] A6: substring "vibe cod" (overlap 20%)
+[FAIL] A7: substring "deep lea" (overlap 18%)
+[FAIL] A8: substring "awesome" (overlap 33%)
+[FAIL] A9: substring "model" (overlap 33%)
+[FAIL] A10: substring "docker" (overlap 33%)
+[FAIL] B1: fuzzy ??vibe (overlap 86%)
+[FAIL] B2: fuzzy ??deep learning (overlap 57%)
+[PASS] B3: fuzzy ??cursor (overlap 100%)
+[FAIL] B4: fuzzy ??rust (overlap 78%)
+[FAIL] B5: fuzzy ??paper (overlap 77%)
+[FAIL] C1: path Vibe Coding -> AI (overlap 0%)
+[PASS] C2: path Vibe Coding -> LLM (overlap 100%)
+[FAIL] C3: path Vibe Coding -> Cursor (overlap 0%)
+[FAIL] C4: path PyTorch -> AI Model (overlap 0%)
+[FAIL] C5: path Deep Learning -> Transformer (overlap 0%)
+[ERROR] D1: explore AI Model hops=1 - python graph-explore failed
+[ERROR] D2: explore Vibe Coding hops=1 - python graph-explore failed
+[ERROR] D3: explore PyTorch hops=2 - python graph-explore failed
+[ERROR] D4: explore Docker hops=1 - python graph-explore failed
+[ERROR] D5: explore MCP hops=1 - python graph-explore failed
+[ERROR] E1: hubs top 10 - python graph-hubs failed
+[SKIP] E2: community peers of AI Model - python community unavailable
+[FAIL] F1: case-insensitive "vibe coding" (overlap 50%)
+[FAIL] F2: alias probe "gpt-4" (overlap 0%)
+[FAIL] F3: category ref "#AI" (overlap 67%)
+[FAIL] G1: meta AI Model (overlap 50%)
+[FAIL] G2: meta Vibe Coding (overlap 50%)
+[PASS] G3: meta Deep Learning (overlap 97%)
+[PASS] G4: meta Docker (overlap 100%)
+[FAIL] G5: meta MCP (overlap 40%)

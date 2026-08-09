@@ -137,19 +137,34 @@ struct ClickyResponseCard: Identifiable, Equatable {
     var rawText: String
     var contextTitle: String?
     var createdAt: Date
+    /// HeyClicky Free tool-call widgets emitted by the upstream model.
+    /// Empty for every other provider. Rendered as a slot inside
+    /// `ClickyResponseCardCompactView` below the sanitized display text.
+    var widgets: [WidgetPayload]
 
     init(
         id: String = UUID().uuidString,
         source: Source,
         rawText: String,
         contextTitle: String? = nil,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        widgets: [WidgetPayload] = []
     ) {
         self.id = id
         self.source = source
         self.rawText = rawText
         self.contextTitle = contextTitle
         self.createdAt = createdAt
+        self.widgets = widgets
+    }
+
+    static func == (lhs: ClickyResponseCard, rhs: ClickyResponseCard) -> Bool {
+        lhs.id == rhs.id
+            && lhs.source == rhs.source
+            && lhs.rawText == rhs.rawText
+            && lhs.contextTitle == rhs.contextTitle
+            && lhs.createdAt == rhs.createdAt
+            && lhs.widgets.count == rhs.widgets.count
     }
 
     var title: String {

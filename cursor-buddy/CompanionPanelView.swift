@@ -214,7 +214,7 @@ struct CompanionPanelView: View {
             }
             Spacer()
 
-            Text(statusText)
+            Text(LocalizedStringKey(statusText))
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Colors.textTertiary)
 
@@ -345,10 +345,10 @@ struct CompanionPanelView: View {
 
     private func keyChip(symbol: String, label: String) -> some View {
         HStack(spacing: 4) {
-            Text(symbol)
+            Text(LocalizedStringKey(symbol))
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
 
-            Text(label)
+            Text(LocalizedStringKey(label))
                 .font(.system(size: 11, weight: .bold, design: .monospaced))
         }
         .foregroundColor(DS.Colors.textPrimary)
@@ -469,14 +469,14 @@ struct CompanionPanelView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(title)
+                    Text(LocalizedStringKey(title))
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(DS.Colors.textSecondary)
-                    Text(status)
+                    Text(LocalizedStringKey(status))
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundColor(DS.Colors.textTertiary)
                 }
-                Text(detail)
+                Text(LocalizedStringKey(detail))
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -542,11 +542,11 @@ struct CompanionPanelView: View {
         return VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .top, spacing: 9) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(step.title)
+                    Text(LocalizedStringKey(step.title))
                         .font(.system(size: 14, weight: .bold))
                         .foregroundColor(DS.Colors.textPrimary)
 
-                    Text(step.detail)
+                    Text(LocalizedStringKey(step.detail))
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(DS.Colors.textTertiary)
                 }
@@ -861,7 +861,7 @@ struct CompanionPanelView: View {
                     .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
                     .frame(width: 16)
 
-                Text(label)
+                Text(LocalizedStringKey(label))
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
             }

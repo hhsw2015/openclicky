@@ -29,3 +29,35 @@ OpenClicky owns the macOS companion UI, voice flow, screen context, cursor overl
 - Avoid focus-stealing browser or window actions unless the task requires them.
 - Ask for missing permissions, keys, or files only when they block the task.
 - Keep all user-facing copy focused on OpenClicky.
+
+## Task planning contract (openclicky-driven)
+
+If environment variable `$OPENCLICKY_TASK_DIR` is set at spawn:
+
+1. **Read every file** in that directory as authoritative background.
+   Glob `$OPENCLICKY_TASK_DIR/**/*` and read each hit that looks readable
+   (`.md`, `.txt`, `.json`, `.yaml`, `.svg`, source files, etc.). Do NOT
+   skip supporting files; they were placed there deliberately by an
+   external planning skill or by openclicky's internal planning loop.
+2. Common files you may find: `SPEC.md`, `REQUIREMENTS.md`, `DESIGN.md`,
+   `reference/*.md`, `screenshots/*.png`, `api-schema.json`, etc. Every
+   file here is task context; absorb before acting.
+
+If environment variable `$OPENCLICKY_TASK_PROGRESS` is set:
+
+3. Read the file it points to. It is a checklist of what to execute.
+4. Work through the checklist in order.
+5. Mark items done in-file: `- [ ]` -> `- [x]` as each item completes.
+6. When ALL items done, append or update the marker line at the end of
+   the file:
+
+       LAST_COMPLETED: DONE
+
+   On its own line. Must match case-sensitive regex
+   `^\s*LAST_COMPLETED:\s*DONE\s*$` - openclicky's F28 auto-continue
+   observer polls this line to stop the loop.
+7. Do NOT write `LAST_COMPLETED: DONE` early. If unfinished, leave the
+   line blank or write a partial marker like `LAST_COMPLETED: <step>`.
+
+If either env var is unset, no planning-doc contract applies; behave as
+a normal short-task session.

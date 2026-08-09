@@ -11,15 +11,19 @@
 		24D85D632FBEE5D8004FEDAD /* OpenClickyCore in Frameworks */ = {isa = PBXBuildFile; productRef = 24D85D622FBEE5D8004FEDAD /* OpenClickyCore */; };
 		24D85D652FBEE5D8004FEDAD /* OpenClickyMarkdown in Frameworks */ = {isa = PBXBuildFile; productRef = 24D85D642FBEE5D8004FEDAD /* OpenClickyMarkdown */; };
 		24D85D672FBEE5D8004FEDAD /* OpenClickyMemory in Frameworks */ = {isa = PBXBuildFile; productRef = 24D85D662FBEE5D8004FEDAD /* OpenClickyMemory */; };
+		24CS000000000000000002 /* OpenClickyContextService in Frameworks */ = {isa = PBXBuildFile; productRef = 24CS000000000000000001 /* OpenClickyContextService */; };
 		24D85D692FBEE5D8004FEDAD /* OpenClickyUI in Frameworks */ = {isa = PBXBuildFile; productRef = 24D85D682FBEE5D8004FEDAD /* OpenClickyUI */; };
 		24E363952FB3400600B27AB1 /* GLTFSceneKit in Frameworks */ = {isa = PBXBuildFile; productRef = AA00BB042F6500040039DA55 /* GLTFSceneKit */; };
 		AA00BB032F6500030039DA55 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA00BB022F6500020039DA55 /* Sparkle */; };
 		AA00BB072F6500070039DA55 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = AA00BB062F6500060039DA55 /* FluidAudio */; };
+		AA10SV010000000000000001 /* SileroVAD in Frameworks */ = {isa = PBXBuildFile; productRef = AA10SV020000000000000001 /* SileroVAD */; };
 		AA20BF010000000000000001 /* OpenClickyWidgetModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA20FR010000000000000001 /* OpenClickyWidgetModels.swift */; };
 		AA20BF020000000000000001 /* OpenClickyWidgetSnapshotReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA20FR020000000000000001 /* OpenClickyWidgetSnapshotReader.swift */; };
 		AA20BF030000000000000001 /* OpenClickyWidgets.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA20FR030000000000000001 /* OpenClickyWidgets.swift */; };
 		AA20BF040000000000000001 /* OpenClickyWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = AA20FR060000000000000001 /* OpenClickyWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA77D0032FBF00010039DA55 /* DynamicNotchKit in Frameworks */ = {isa = PBXBuildFile; productRef = AA77D0022FBF00010039DA55 /* DynamicNotchKit */; };
+		AASQLCIPHER00000000000003 /* SQLCipher in Frameworks */ = {isa = PBXBuildFile; productRef = AASQLCIPHER00000000000002 /* SQLCipher */; };
+		24CWHR000000000000000001 /* CWhisper in Frameworks */ = {isa = PBXBuildFile; productRef = 24CWHR000000000000000003 /* CWhisper */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,6 +69,7 @@
 		24D85D5A2FBEE591004FEDAD /* OpenClickyCore */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = OpenClickyCore; sourceTree = "<group>"; };
 		24D85D5B2FBEE591004FEDAD /* OpenClickyMarkdown */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = OpenClickyMarkdown; sourceTree = "<group>"; };
 		24D85D5C2FBEE591004FEDAD /* OpenClickyMemory */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = OpenClickyMemory; sourceTree = "<group>"; };
+		24CS000000000000000003 /* OpenClickyContextService */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = OpenClickyContextService; sourceTree = "<group>"; };
 		24D85D5D2FBEE591004FEDAD /* OpenClickyUI */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = OpenClickyUI; sourceTree = "<group>"; };
 		28F22CBF2F56440300A0FC59 /* OpenClicky.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OpenClicky.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		28F22CCC2F56440300A0FC59 /* cursor-buddyTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "cursor-buddyTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -75,6 +80,7 @@
 		AA20FR040000000000000001 /* OpenClickyWidgets.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OpenClickyWidgets.entitlements; sourceTree = "<group>"; };
 		AA20FR050000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AA20FR060000000000000001 /* OpenClickyWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OpenClickyWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		24CWHR000000000000000002 /* CWhisper */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = CWhisper; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -116,12 +122,16 @@
 				24D85D632FBEE5D8004FEDAD /* OpenClickyCore in Frameworks */,
 				24D85D652FBEE5D8004FEDAD /* OpenClickyMarkdown in Frameworks */,
 				24D85D672FBEE5D8004FEDAD /* OpenClickyMemory in Frameworks */,
+				24CS000000000000000002 /* OpenClickyContextService in Frameworks */,
 				24E363952FB3400600B27AB1 /* GLTFSceneKit in Frameworks */,
 				AA00BB072F6500070039DA55 /* FluidAudio in Frameworks */,
+				AA10SV010000000000000001 /* SileroVAD in Frameworks */,
 				AA77D0032FBF00010039DA55 /* DynamicNotchKit in Frameworks */,
 				AA00BB032F6500030039DA55 /* Sparkle in Frameworks */,
 				24D85D692FBEE5D8004FEDAD /* OpenClickyUI in Frameworks */,
 				24D85D612FBEE5D8004FEDAD /* OpenClickyBrowser in Frameworks */,
+				AASQLCIPHER00000000000003 /* SQLCipher in Frameworks */,
+				24CWHR000000000000000001 /* CWhisper in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -156,7 +166,9 @@
 				24D85D5A2FBEE591004FEDAD /* OpenClickyCore */,
 				24D85D5B2FBEE591004FEDAD /* OpenClickyMarkdown */,
 				24D85D5C2FBEE591004FEDAD /* OpenClickyMemory */,
+				24CS000000000000000003 /* OpenClickyContextService */,
 				24D85D5D2FBEE591004FEDAD /* OpenClickyUI */,
+				24CWHR000000000000000002 /* CWhisper */,
 			);
 			path = Packages;
 			sourceTree = "<group>";
@@ -216,6 +228,8 @@
 				28F22CBD2F56440300A0FC59 /* Resources */,
 				AA20CF010000000000000001 /* Embed Foundation Extensions */,
 				AA00CC012F6600010039DA55 /* Copy OpenClicky App Resources */,
+				AA00CH010000000000000001 /* Build openclicky-context-hook */,
+				AA00OC010000000000000001 /* Build openclicky-ocr-helper */,
 			);
 			buildRules = (
 			);
@@ -230,12 +244,24 @@
 				AA00BB022F6500020039DA55 /* Sparkle */,
 				AA00BB042F6500040039DA55 /* GLTFSceneKit */,
 				AA00BB062F6500060039DA55 /* FluidAudio */,
+				AA10SV020000000000000001 /* SileroVAD */,
 				24D85D602FBEE5D8004FEDAD /* OpenClickyBrowser */,
 				24D85D622FBEE5D8004FEDAD /* OpenClickyCore */,
 				24D85D642FBEE5D8004FEDAD /* OpenClickyMarkdown */,
 				24D85D662FBEE5D8004FEDAD /* OpenClickyMemory */,
+				24CS000000000000000001 /* OpenClickyContextService */,
 				24D85D682FBEE5D8004FEDAD /* OpenClickyUI */,
 				AA77D0022FBF00010039DA55 /* DynamicNotchKit */,
+				AASQLCIPHER00000000000002 /* SQLCipher */,
+				24CWHR000000000000000003 /* CWhisper */,
+				AANIO0010100000000000010 /* NIO */,
+				AANIO0010200000000000011 /* NIOCore */,
+				AANIO0010300000000000012 /* NIOPosix */,
+				AANIO0020100000000000020 /* NIOHTTP2 */,
+				AANIO0020200000000000021 /* NIOHPACK */,
+				AANIO0030100000000000030 /* NIOSSL */,
+				AATRAN0010100000000000040 /* Transformers */,
+				AAORTRT0010100000000000050 /* onnxruntime */,
 			);
 			productName = "cursor-buddy";
 			productReference = 28F22CBF2F56440300A0FC59 /* OpenClicky.app */;
@@ -339,6 +365,7 @@
 			knownRegions = (
 				en,
 				Base,
+				"zh-Hans",
 			);
 			mainGroup = 28F22CB62F56440300A0FC59;
 			minimizedProjectReferenceProxies = 1;
@@ -346,7 +373,14 @@
 				AA00BB012F6500010039DA55 /* XCRemoteSwiftPackageReference "Sparkle" */,
 				AA00BB052F6500050039DA55 /* XCRemoteSwiftPackageReference "GLTFSceneKit" */,
 				AA00BB082F6500080039DA55 /* XCRemoteSwiftPackageReference "FluidAudio" */,
+				AA10SV030000000000000001 /* XCRemoteSwiftPackageReference "silero-vad-swift" */,
 				AA77D0012FBF00010039DA55 /* XCRemoteSwiftPackageReference "DynamicNotchKit" */,
+				AASQLCIPHER00000000000001 /* XCRemoteSwiftPackageReference "swift-sqlcipher" */,
+				AANIO0010000000000000001 /* XCRemoteSwiftPackageReference "swift-nio" */,
+				AANIO0020000000000000002 /* XCRemoteSwiftPackageReference "swift-nio-http2" */,
+				AANIO0030000000000000003 /* XCRemoteSwiftPackageReference "swift-nio-ssl" */,
+				AATRAN0010000000000000001 /* XCRemoteSwiftPackageReference "swift-transformers" */,
+				AAORTRT0010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 28F22CC02F56440300A0FC59 /* Products */;
@@ -410,7 +444,54 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nROOT=\"${PROJECT_DIR}/AppResources/OpenClicky\"\nDST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nmkdir -p \"$DST\"\nfor rel in SOUL.md OpenClickyModelInstructions.md AGENTS.md ATTRIBUTION.md ClickyBuildInfo.plist skill-suggestion-rules.json OpenClickyBundledSkills OpenClickyBundledWikiSeed CodexRuntime CuaDriverRuntime ClaudeAgentSDKBridge BackgroundComputerUseRuntime agent-done.mp3; do\n  if [ -e \"$ROOT/$rel\" ]; then\n    rm -rf \"$DST/$rel\"\n    /usr/bin/ditto \"$ROOT/$rel\" \"$DST/$rel\"\n  fi\ndone\n";
+			shellScript = "set -euo pipefail\nROOT=\"${PROJECT_DIR}/AppResources/OpenClicky\"\nDST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nmkdir -p \"$DST\"\nfor rel in SOUL.md OpenClickyModelInstructions.md AGENTS.md ATTRIBUTION.md ClickyBuildInfo.plist skill-suggestion-rules.json OpenClickyBundledSkills OpenClickyBundledWikiSeed skills CodexRuntime CuaDriverRuntime ClaudeAgentSDKBridge BackgroundComputerUseRuntime OpenConnectorRuntime OpenCLIRuntime OpenDiaRuntime agent-done.mp3 assist_agent_atlas.bin mirage-routelet; do\n  if [ -e \"$ROOT/$rel\" ]; then\n    rm -rf \"$DST/$rel\"\n    /usr/bin/ditto \"$ROOT/$rel\" \"$DST/$rel\"\n  fi\ndone\n";
+		};
+		AA00CH010000000000000001 /* Build openclicky-context-hook */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Packages/OpenClickyContextService/Sources/openclicky-context-hook/main.swift",
+				"$(SRCROOT)/Packages/OpenClickyContextService/Package.swift",
+			);
+			name = "Build openclicky-context-hook";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/Helpers/openclicky-context-hook",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\nif [ \"${CONFIGURATION}\" = \"Debug\" ]; then\n    HOOK_CONFIG=debug\nelse\n    HOOK_CONFIG=release\nfi\n\nPACKAGE_DIR=\"${SRCROOT}/Packages/OpenClickyContextService\"\n\n# Use xcrun swift build so it uses the same toolchain as Xcode\nxcrun --sdk macosx swift build \\\n    --package-path \"$PACKAGE_DIR\" \\\n    --product openclicky-context-hook \\\n    -c $HOOK_CONFIG\n\nHELPERS_DIR=\"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/Helpers\"\nmkdir -p \"$HELPERS_DIR\"\ncp \"$PACKAGE_DIR/.build/$HOOK_CONFIG/openclicky-context-hook\" \"$HELPERS_DIR/openclicky-context-hook\"\nchmod +x \"$HELPERS_DIR/openclicky-context-hook\"\n";
+		};
+		AA00OC010000000000000001 /* Build openclicky-ocr-helper */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/helpers/openclicky-ocr-helper/Sources/openclicky-ocr-helper/main.swift",
+				"$(SRCROOT)/helpers/openclicky-ocr-helper/Sources/openclicky-ocr-helper/OCRHelperProtocol.swift",
+				"$(SRCROOT)/helpers/openclicky-ocr-helper/Sources/openclicky-ocr-helper/OCRRunner.swift",
+				"$(SRCROOT)/helpers/openclicky-ocr-helper/Sources/openclicky-ocr-helper/VaultAccess.swift",
+				"$(SRCROOT)/helpers/openclicky-ocr-helper/Info.plist",
+				"$(SRCROOT)/helpers/openclicky-ocr-helper/Package.swift",
+			);
+			name = "Build openclicky-ocr-helper";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/XPCServices/com.jkneen.openclicky.ocr.xpc/Contents/MacOS/openclicky-ocr-helper",
+				"$(BUILT_PRODUCTS_DIR)/$(PRODUCT_NAME).app/Contents/XPCServices/com.jkneen.openclicky.ocr.xpc/Contents/Info.plist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\nif [ \"${CONFIGURATION}\" = \"Debug\" ]; then\n    OCR_CONFIG=debug\nelse\n    OCR_CONFIG=release\nfi\n\nPACKAGE_DIR=\"${SRCROOT}/helpers/openclicky-ocr-helper\"\n\nxcrun --sdk macosx swift build \\\n    --package-path \"$PACKAGE_DIR\" \\\n    --product openclicky-ocr-helper \\\n    -c $OCR_CONFIG\n\nXPC_ROOT=\"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/XPCServices/com.jkneen.openclicky.ocr.xpc\"\nmkdir -p \"$XPC_ROOT/Contents/MacOS\"\ncp \"$PACKAGE_DIR/.build/$OCR_CONFIG/openclicky-ocr-helper\" \"$XPC_ROOT/Contents/MacOS/openclicky-ocr-helper\"\nchmod +x \"$XPC_ROOT/Contents/MacOS/openclicky-ocr-helper\"\ncp \"$PACKAGE_DIR/Info.plist\" \"$XPC_ROOT/Contents/Info.plist\"\n\nif [ \"${CODE_SIGNING_ALLOWED}\" = \"YES\" ] && [ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]; then\n    codesign --force --sign \"${EXPANDED_CODE_SIGN_IDENTITY}\" \\\n             --options runtime \\\n             --timestamp=none \\\n             \"$XPC_ROOT\" || true\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -707,6 +788,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "cursor-buddy/cursor-buddy-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -753,6 +835,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "cursor-buddy/cursor-buddy-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -919,12 +1002,68 @@
 				version = 0.14.1;
 			};
 		};
+		AA10SV030000000000000001 /* XCRemoteSwiftPackageReference "silero-vad-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/paean-ai/silero-vad-swift.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.0;
+			};
+		};
 		AA77D0012FBF00010039DA55 /* XCRemoteSwiftPackageReference "DynamicNotchKit" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/MrKai77/DynamicNotchKit";
 			requirement = {
 				kind = upToNextMajorVersion;
 				minimumVersion = 1.1.0;
+			};
+		};
+		AASQLCIPHER00000000000001 /* XCRemoteSwiftPackageReference "swift-sqlcipher" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/skiptools/swift-sqlcipher.git";
+			requirement = {
+				kind = exactVersion;
+				version = 1.7.0;
+			};
+		};
+		AANIO0010000000000000001 /* XCRemoteSwiftPackageReference "swift-nio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.65.0;
+			};
+		};
+		AANIO0020000000000000002 /* XCRemoteSwiftPackageReference "swift-nio-http2" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio-http2.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.32.0;
+			};
+		};
+		AANIO0030000000000000003 /* XCRemoteSwiftPackageReference "swift-nio-ssl" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio-ssl.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.27.0;
+			};
+		};
+		AATRAN0010000000000000001 /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-transformers.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.1.20;
+			};
+		};
+		AAORTRT0010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/microsoft/onnxruntime-swift-package-manager.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.17.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
@@ -946,6 +1085,10 @@
 			isa = XCSwiftPackageProductDependency;
 			productName = OpenClickyMemory;
 		};
+		24CS000000000000000001 /* OpenClickyContextService */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = OpenClickyContextService;
+		};
 		24D85D682FBEE5D8004FEDAD /* OpenClickyUI */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = OpenClickyUI;
@@ -965,10 +1108,64 @@
 			package = AA00BB082F6500080039DA55 /* XCRemoteSwiftPackageReference "FluidAudio" */;
 			productName = FluidAudio;
 		};
+		AA10SV020000000000000001 /* SileroVAD */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA10SV030000000000000001 /* XCRemoteSwiftPackageReference "silero-vad-swift" */;
+			productName = SileroVAD;
+		};
 		AA77D0022FBF00010039DA55 /* DynamicNotchKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = AA77D0012FBF00010039DA55 /* XCRemoteSwiftPackageReference "DynamicNotchKit" */;
 			productName = DynamicNotchKit;
+		};
+		AASQLCIPHER00000000000002 /* SQLCipher */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AASQLCIPHER00000000000001 /* XCRemoteSwiftPackageReference "swift-sqlcipher" */;
+			productName = SQLCipher;
+		};
+		24CWHR000000000000000003 /* CWhisper */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CWhisper;
+		};
+		AANIO0010100000000000010 /* NIO */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AANIO0010000000000000001 /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = NIO;
+		};
+		AANIO0010200000000000011 /* NIOCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AANIO0010000000000000001 /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = NIOCore;
+		};
+		AANIO0010300000000000012 /* NIOPosix */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AANIO0010000000000000001 /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = NIOPosix;
+		};
+		AANIO0020100000000000020 /* NIOHTTP2 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AANIO0020000000000000002 /* XCRemoteSwiftPackageReference "swift-nio-http2" */;
+			productName = NIOHTTP2;
+		};
+		AANIO0020200000000000021 /* NIOHPACK */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AANIO0020000000000000002 /* XCRemoteSwiftPackageReference "swift-nio-http2" */;
+			productName = NIOHPACK;
+		};
+		AANIO0030100000000000030 /* NIOSSL */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AANIO0030000000000000003 /* XCRemoteSwiftPackageReference "swift-nio-ssl" */;
+			productName = NIOSSL;
+		};
+		AATRAN0010100000000000040 /* Transformers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AATRAN0010000000000000001 /* XCRemoteSwiftPackageReference "swift-transformers" */;
+			productName = Transformers;
+		};
+		AAORTRT0010100000000000050 /* onnxruntime */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AAORTRT0010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
+			productName = onnxruntime;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

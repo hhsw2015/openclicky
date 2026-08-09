@@ -25,8 +25,9 @@ struct CodexAgentModeTests {
         #expect(rendered.contains("https://developers.openai.com/mcp"))
         #expect(!rendered.contains("[mcp_servers.composio]"))
         #expect(!rendered.contains("https://connect.composio.dev/mcp"))
+        #expect(!rendered.contains("[mcp_servers.openclicky]"))
         #expect(!rendered.contains("[mcp_servers.openClickyControl]"))
-        #expect(!rendered.contains("http://127.0.0.1:32123/mcp"))
+        #expect(!rendered.contains("http://127.0.0.1:32123/mcp/openclicky"))
     }
 
     @Test func codexConfigCanPreferAPIKeyForDefaultOpenAIWhenConfigured() throws {
@@ -164,8 +165,9 @@ struct CodexAgentModeTests {
 
         let rendered = template.render()
 
-        #expect(rendered.contains("[mcp_servers.openClickyControl]"))
-        #expect(rendered.contains("http://127.0.0.1:32123/mcp"))
+        #expect(rendered.contains("[mcp_servers.openclicky]"))
+        #expect(rendered.contains("http://127.0.0.1:32123/mcp/openclicky"))
+        #expect(!rendered.contains("[mcp_servers.openClickyControl]"))
     }
 
     @Test func cuaDriverMCPConfigurationPrefersExplicitOpenClickyOverride() throws {

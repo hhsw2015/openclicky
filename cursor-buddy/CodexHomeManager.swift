@@ -173,6 +173,37 @@ final class CodexHomeManager {
         let cuaDriverCommand = AppBundleConfiguration.mcpComputerUseEnabled()
             ? AppBundleConfiguration.mcpCuaDriverCommand()
             : nil
+        // Phase 3 Layer 2 — sensor MCP registration. Only emit the
+        // block when a bridge token is actually configured; without
+        // it the codex agent would 401 on every sensor call and fail
+        // MCP handshake at startup. Env-var fallback matches the
+        // bridge's own auth lookup (OPENCLICKY_BRIDGE_TOKEN takes
+        // priority via AppBundleConfiguration, then
+        // OPENCLICKY_AUTOMATION_TOKEN as a dev-mode escape hatch).
+        //
+        // F27 review Issue 3 — the token value itself is NOT written
+        // into config.toml; the template emits
+        // `bearer_token_env_var = "OPENCLICKY_BRIDGE_TOKEN"` and the
+        // codex subprocess reads the value from its spawn env
+        // (populated by `CodexProcessManager.baseEnvironment`). What
+        // we pass here is used only to gate the block: a non-nil,
+        // non-empty token means "emit the sensor block".
+        let sensorToken: String? = AppBundleConfiguration.externalControlBridgeToken()
+            ?? ProcessInfo.processInfo.environment["OPENCLICKY_AUTOMATION_TOKEN"]
+
+        // F27 review Issue 1 — port drift. The bridge may bind on a
+        // port other than the compiled default when either
+        // `OPENCLICKY_MCP_PORT` is set or the bind-fallback ladder
+        // walks to a free sibling port. Prefer the live `activePort`
+        // when the bridge has already reached `.ready`; otherwise fall
+        // back to `resolveDefaultPort()` (env-aware) so a first-launch
+        // config write still honors OPENCLICKY_MCP_PORT. If the
+        // fallback ladder later picks a different port,
+        // `CompanionManager.startExternalControlBridgeIfNeeded` re-renders
+        // via the `onPortResolved` callback.
+        let bridgePort: UInt16 = OpenClickyExternalControlBridgeServer.activePort
+            ?? OpenClickyExternalControlBridgeServer.resolveDefaultPort()
+
         let config = ClickyCodexConfigTemplate(
             model: model,
             reasoningEffort: reasoningEffort,
@@ -183,6 +214,8 @@ final class CodexHomeManager {
             includeOpenAIDeveloperDocsMCP: AppBundleConfiguration.mcpDeveloperDocsEnabled(),
             includeComposioConnectMCP: AppBundleConfiguration.mcpComposioConnectEnabled(),
             cuaDriverMCPCommand: cuaDriverCommand,
+            sensorMCPToken: sensorToken,
+            bridgePort: bridgePort,
             preferAPIKeyAuthForDefaultOpenAI: Self.hasConfiguredOpenAIAPIKey()
         )
         let configFile = codexHomeDirectory.appendingPathComponent("config.toml", isDirectory: false)

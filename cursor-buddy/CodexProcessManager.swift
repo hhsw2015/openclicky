@@ -18,7 +18,12 @@ nonisolated final class CodexProcessManager: @unchecked Sendable {
         stateQueue.sync { process?.isRunning == true }
     }
 
-    func start(executableURL: URL, codexHome: URL) throws {
+    func start(
+        executableURL: URL,
+        codexHome: URL,
+        taskDir: String? = nil,
+        taskProgressPath: String? = nil
+    ) throws {
         if isRunning { return }
 
         let process = Process()
@@ -47,19 +52,104 @@ nonisolated final class CodexProcessManager: @unchecked Sendable {
 
         var environment = Self.baseEnvironment(codexHome: codexHome, runtimeExecutableURL: executableURL)
 
+        // Openclicky task-planning contract (see docs/OPENCLICKY_TASK_SPEC.md).
+        // Injected here so codex, on spawn, can glob $OPENCLICKY_TASK_DIR and
+        // drive $OPENCLICKY_TASK_PROGRESS to `LAST_COMPLETED: DONE`. The
+        // AGENTS-longrun-template.md session-instructions block references
+        // these env var names verbatim.
+        if let dir = taskDir?.trimmingCharacters(in: .whitespacesAndNewlines), !dir.isEmpty {
+            environment["OPENCLICKY_TASK_DIR"] = dir
+        }
+        if let progressPath = taskProgressPath?.trimmingCharacters(in: .whitespacesAndNewlines), !progressPath.isEmpty {
+            environment["OPENCLICKY_TASK_PROGRESS"] = progressPath
+        }
+
         let configFile = codexHome.appendingPathComponent("config.toml", isDirectory: false)
         let configText = (try? String(contentsOf: configFile, encoding: .utf8)) ?? ""
         let prefersChatGPTAuth = configText.contains("preferred_auth_method = \"chatgpt\"")
         if let configuredAPIKey = AppBundleConfiguration.openAIAPIKey(),
            !configuredAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             environment["OPENAI_API_KEY"] = configuredAPIKey
+        } else if let codexEphemeral = HeyClickySessionTokenClient.shared.peekCachedCodexToken(),
+                  !codexEphemeral.isEmpty {
+            // Heyclicky lane: prefer the SHORT-LIVED codex ephemeral
+            // token minted via POST /agent/session-token, matching
+            // HeyClicky-1.0.40's own path (`cachedBackendAgentSession
+            // Token` + `agentSessionTokenInjectedAtLastProcessSpawn`).
+            // Sending the raw Supabase JWT to /agent/openai/v1/
+            // responses gets 401 "Invalid or expired HeyClicky session
+            // token" — the proxy expects the ephemeral only.
+            environment["OPENAI_API_KEY"] = codexEphemeral
+        } else if let jwt = AppBundleConfiguration.heyClickySessionAccessToken(),
+                  !jwt.isEmpty {
+            // Fallback: no codex ephemeral cached yet (very first spawn
+            // before preamble ran). Use the Supabase JWT so the child
+            // at least starts; the ~1s first /responses will 401 and
+            // the recovery loop will mint + rekey. Better than
+            // "Missing environment variable: OPENAI_API_KEY".
+            environment["OPENAI_API_KEY"] = jwt
         } else if prefersChatGPTAuth {
             environment.removeValue(forKey: "OPENAI_API_KEY")
         }
 
+        // HeyClicky Free gate: only inject proxy env when the CURRENT
+        // agent model is heyclicky. Previously this keyed only on the
+        // snapshot (`heyClickyPreviousAgentBaseURL != nil`), so after a
+        // user switched Agent Mode from heyclicky to their own BYOK codex,
+        // the stale snapshot kept injecting CLICKY_WORKER_BASE_URL +
+        // OPENAI_BASE_URL into the BYOK child — every response request
+        // got routed through the heyclicky proxy and 401/402'd.
+        //
+        // Endpoints (IDA HeyClicky-1.0.40 @ 0x1011bb470):
+        //   OPENAI_BASE_URL             - <proxy>/agent/openai/v1
+        //   CLICKY_WORKER_BASE_URL      - proxy root
+        //   CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codex_app
+        let currentAgentModel = UserDefaults.standard.string(forKey: "clickyCodexModel") ?? ""
+        // Detect heyclicky lane by any of:
+        //   1) UI-selected agent model is heyclicky-free-*
+        //   2) HeyClicky hook has already been activated (snapshot set)
+        //   3) User is signed into heyclicky and no BYOK openai key —
+        //      this is the automation-API path where the caller sets
+        //      no `clickyCodexModel` UserDefault but still expects the
+        //      heyclicky proxy env, because they have no other agent key.
+        let uiIsHeyClicky = currentAgentModel.hasPrefix("heyclicky-free-")
+        let hookIsActive = AppBundleConfiguration.heyClickyPreviousAgentBaseURL() != nil
+        let signedIn = AppBundleConfiguration.heyClickySignedIn()
+        let hasByok = !((AppBundleConfiguration.openAIAPIKey() ?? "").isEmpty)
+        let automationDefault = signedIn && !hasByok
+        let agentIsHeyClickyLane = uiIsHeyClicky || hookIsActive || automationDefault
+        if agentIsHeyClickyLane,
+           let proxyBase = try? AppBundleConfiguration.heyClickyProxyBaseURL() {
+            environment["CLICKY_WORKER_BASE_URL"] = proxyBase.absoluteString
+            environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "codex_app"
+            let responsesBase = proxyBase
+                .appendingPathComponent("agent")
+                .appendingPathComponent("openai")
+                .appendingPathComponent("v1")
+            environment["OPENAI_BASE_URL"] = responsesBase.absoluteString
+        } else {
+            // BYOK codex must NOT inherit any proxy env from the parent
+            // process (which itself may have OPENAI_BASE_URL set from a
+            // dev shell). Strip so the child hits api.openai.com.
+            environment.removeValue(forKey: "CLICKY_WORKER_BASE_URL")
+            environment.removeValue(forKey: "CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
+            environment.removeValue(forKey: "OPENAI_BASE_URL")
+        }
+
         process.environment = environment
         process.terminationHandler = { [weak self] terminated in
-            self?.failAllPendingRequests(message: "Codex app-server exited with status \(terminated.terminationStatus).")
+            let statusCode = terminated.terminationStatus
+            self?.failAllPendingRequests(message: "Codex app-server exited with status \(statusCode).")
+            // Notify the higher layer so it can clear thread/lease
+            // state and let the next follow-up prompt re-run the
+            // preamble against a fresh codex process. Without this,
+            // ensureThread's early-return path keeps using the dead
+            // thread and every subsequent turn hangs.
+            NotificationCenter.default.post(
+                name: .heyClickyCodexProcessExited,
+                object: nil,
+                userInfo: ["exit_status": statusCode]
+            )
         }
 
         // H5: assign process/pipe ivars behind stateQueue so concurrent
@@ -106,6 +196,57 @@ nonisolated final class CodexProcessManager: @unchecked Sendable {
             )
         )
         applyGogCLIEnvironment(to: &environment)
+
+        // F27 review Issue 3 — inject the bridge bearer token into the
+        // codex spawn env under the name referenced by
+        // `ClickyCodexConfigTemplate.bridgeTokenEnvVarName`. Codex's
+        // rmcp client resolves `bearer_token_env_var` from its
+        // process env at MCP handshake time, so this env var is what
+        // authenticates every sensor / openClickyControl call. Also
+        // covers the `OPENCLICKY_AUTOMATION_TOKEN` dev-mode fallback
+        // to match `hasValidBridgeToken` acceptance in
+        // OpenClickyExternalControlBridge.swift. Kept out of a
+        // separate helper because this is the single spawn point and
+        // the coupling is deliberate.
+        let bridgeTokenEnvName = ClickyCodexConfigTemplate.bridgeTokenEnvVarName
+        if environment[bridgeTokenEnvName] == nil {
+            if let configured = AppBundleConfiguration.externalControlBridgeToken(),
+               !configured.isEmpty {
+                environment[bridgeTokenEnvName] = configured
+            } else if let dev = environment["OPENCLICKY_AUTOMATION_TOKEN"], !dev.isEmpty {
+                environment[bridgeTokenEnvName] = dev
+            }
+        }
+        // Bridge macOS network-preferences HTTP proxy into the child
+        // process env so codex-sandboxed shell/curl invocations honor
+        // it. macOS GUI apps get proxy config via SystemConfiguration,
+        // not shell env — subprocesses inherit that but Chromium /
+        // curl / requests read HTTP_PROXY env instead. Copy the
+        // configured proxy in.
+        if environment["HTTP_PROXY"] == nil, environment["http_proxy"] == nil {
+            let proxies = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [CFString: Any]
+            if let dict = proxies,
+               let httpEnable = dict[kCFNetworkProxiesHTTPEnable as CFString] as? Int, httpEnable == 1,
+               let host = dict[kCFNetworkProxiesHTTPProxy as CFString] as? String,
+               let port = dict[kCFNetworkProxiesHTTPPort as CFString] as? Int {
+                let url = "http://\(host):\(port)"
+                environment["HTTP_PROXY"] = url
+                environment["http_proxy"] = url
+                environment["HTTPS_PROXY"] = url
+                environment["https_proxy"] = url
+                environment["ALL_PROXY"] = url
+                environment["all_proxy"] = url
+                // Localhost + heyclicky must NOT go through the proxy,
+                // otherwise the ephemeral OPENAI_BASE_URL loops through
+                // the user's own worker adding latency.
+                // Derive the bypass host from the configured proxy rather than
+                // repeating the literal; empty template contributes nothing.
+                let proxyHost = URL(string: HeyClickySecrets.proxyBaseURL)?.host
+                environment["NO_PROXY"] = (["localhost", "127.0.0.1", ".local"] + [proxyHost].compactMap { $0 })
+                    .joined(separator: ",")
+                environment["no_proxy"] = environment["NO_PROXY"]!
+            }
+        }
         return environment
     }
 
@@ -470,6 +611,34 @@ nonisolated final class CodexProcessManager: @unchecked Sendable {
             }
             if let output = CodexJSON.string(item["aggregatedOutput"]) {
                 summary["aggregatedOutputLength"] = output.count
+            }
+        }
+        // MCP startup diagnostics — we want to see the actual failure
+        // reason when a configured MCP server can't reach us, not just
+        // an opaque "keys=[error,name,status]".
+        if method == "mcpServer/startupStatus/updated" {
+            if let name = CodexJSON.string(params["name"]) {
+                summary["mcp_name"] = name
+            }
+            if let status = CodexJSON.string(params["status"]) {
+                summary["mcp_status"] = status
+            } else if let statusDict = CodexJSON.dictionary(params["status"]) {
+                summary["mcp_status_keys"] = Array(statusDict.keys).sorted()
+                if let kind = CodexJSON.string(statusDict["kind"]) {
+                    summary["mcp_status_kind"] = kind
+                }
+            }
+            if let err = params["error"] {
+                if let s = CodexJSON.string(err) {
+                    summary["mcp_error"] = Self.shortLogSnippet(s, maxLength: 1500)
+                } else if let dict = CodexJSON.dictionary(err) {
+                    if let msg = CodexJSON.string(dict["message"]) {
+                        summary["mcp_error_message"] = Self.shortLogSnippet(msg, maxLength: 1500)
+                    }
+                    if let kind = CodexJSON.string(dict["kind"]) {
+                        summary["mcp_error_kind"] = kind
+                    }
+                }
             }
         }
         if summary.isEmpty {

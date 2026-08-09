@@ -130,7 +130,7 @@ struct ThreeDChatBubbleView: View {
     private func placeholder(_ message: String, systemImage: String = "cube.transparent") -> some View {
         VStack(spacing: 8) {
             Image(systemName: systemImage).font(.system(size: 24))
-            Text(message).font(.caption).multilineTextAlignment(.center)
+            Text(LocalizedStringKey(message)).font(.caption).multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .foregroundStyle(.secondary)

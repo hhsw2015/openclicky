@@ -192,14 +192,14 @@ struct OpenClickyLogViewerView: View {
 
                 Picker("Lane", selection: $laneFilter) {
                     ForEach(laneOptions, id: \.self) { option in
-                        Text(option).tag(option)
+                        Text(LocalizedStringKey(option)).tag(option)
                     }
                 }
                 .frame(width: 130)
 
                 Picker("Direction", selection: $directionFilter) {
                     ForEach(directionOptions, id: \.self) { option in
-                        Text(option).tag(option)
+                        Text(LocalizedStringKey(option)).tag(option)
                     }
                 }
                 .frame(width: 150)
@@ -301,7 +301,7 @@ struct OpenClickyLogViewerView: View {
     }
 
     private func metadataPill(_ text: String) -> some View {
-        Text(text)
+        Text(LocalizedStringKey(text))
             .font(.system(size: 11, weight: .medium))
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
@@ -313,7 +313,7 @@ struct OpenClickyLogViewerView: View {
 
     private func jsonBlock(title: String, text: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title)
+            Text(LocalizedStringKey(title))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(.secondary)
             ScrollView(.horizontal) {

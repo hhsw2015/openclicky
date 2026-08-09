@@ -6,6 +6,15 @@ extension OpenClickyNotchPanelView {
 
     var panelRoot: some View {
         VStack(spacing: 0) {
+            // Live assist-agent progress — collapses to zero height
+            // when no agent is running so the panel layout stays
+            // unchanged during simple direct-answer flows.
+            AssistAgentProgressBadge()
+            // SKI approve-before-send overlay: only visible when the
+            // toggle is on AND there is a pending utterance.
+            SKIModeApproveOverlay(companionManager: companionManager)
+                .padding(.horizontal, 10)
+                .padding(.top, 4)
             mainSurface
         }
         .frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -284,6 +293,11 @@ extension OpenClickyNotchPanelView {
             // Terminal-first backend family: Apple / Codex / Claude with auto-discovery.
             OpenClickyVoiceBackendSelector(companion: companionManager, style: .compact)
                 .help("Voice backend: Apple on-device, Codex, or Claude Agent SDK")
+
+            // FIX(ui-2026-07-31): removed Screen History status pill.
+            // The menu-bar `ScreenHistoryNotchBadge` already shows
+            // recording state (frames indexed / recording indicator)
+            // so this in-panel pill was redundant chrome.
         }
         .padding(.leading, 2)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
@@ -303,7 +317,7 @@ extension OpenClickyNotchPanelView {
                     HStack(spacing: 7) {
                         Image(systemName: tab.systemImageName)
                             .font(panelUIFont(size: 15, weight: .heavy))
-                        Text(tab.title)
+                        Text(LocalizedStringKey(tab.title))
                             .font(panelUIFont(size: 10, weight: .heavy))
                     }
                     .foregroundColor(selectedTab == tab ? DS.Colors.textPrimary : DS.Colors.textSecondary)
@@ -467,7 +481,7 @@ extension OpenClickyNotchPanelView {
                     .fill(agentStatusColor(for: session))
                     .frame(width: 7, height: 7)
                     .shadow(color: agentStatusColor(for: session).opacity(0.7), radius: 4, x: 0, y: 0)
-                Text(session.title)
+                Text(LocalizedStringKey(session.title))
                     .font(appUIFont(size: max(9, subtextFontSize - 1), weight: .heavy))
                     .foregroundColor(DS.Colors.textPrimary)
                     .lineLimit(1)
@@ -567,7 +581,7 @@ extension OpenClickyNotchPanelView {
             HStack(spacing: 5) {
                 Image(systemName: suggestion.systemImageName)
                     .font(panelUIFont(size: 10, weight: .black))
-                Text(suggestion.title)
+                Text(LocalizedStringKey(suggestion.title))
                     .font(panelUIFont(size: 9, weight: .heavy))
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
@@ -783,7 +797,7 @@ extension OpenClickyNotchPanelView {
                 .frame(width: 34, height: 34)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(agent.metadata.displayName)
+                    Text(LocalizedStringKey(agent.metadata.displayName))
                         .font(panelUIFont(size: 11, weight: .heavy))
                         .foregroundColor(DS.Colors.textPrimary)
                         .lineLimit(1)
@@ -1075,7 +1089,7 @@ extension OpenClickyNotchPanelView {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(suggestion.title)
+                    Text(LocalizedStringKey(suggestion.title))
                         .font(panelUIFont(size: 11, weight: .heavy))
                         .foregroundColor(DS.Colors.textPrimary)
                         .lineLimit(1)
@@ -1086,7 +1100,7 @@ extension OpenClickyNotchPanelView {
                         .padding(.vertical, 2)
                         .background(Capsule(style: .continuous).fill(DS.Colors.accentText.opacity(0.12)))
                 }
-                Text(suggestion.detail)
+                Text(LocalizedStringKey(suggestion.detail))
                     .font(panelUIFont(size: 9, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
                     .lineLimit(2)
@@ -1305,7 +1319,9 @@ extension OpenClickyNotchPanelView {
                     .font(appUIFont(size: max(9, subtextFontSize - 2), weight: .black))
                     .foregroundColor(compactChatRoleColor(for: entry.role))
                 Text(entry.text)
-                    .font(appUIFont(size: max(11, bodyFontSize - 1), weight: .medium))
+                    .font(entry.role == .command
+                          ? .system(size: max(10, bodyFontSize - 2), weight: .medium, design: .monospaced)
+                          : appUIFont(size: max(11, bodyFontSize - 1), weight: .medium))
                     .foregroundColor(DS.Colors.textPrimary)
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1666,7 +1682,7 @@ extension OpenClickyNotchPanelView {
                         }
 
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(session.title)
+                            Text(LocalizedStringKey(session.title))
                                 .font(panelUIFont(size: 12, weight: .heavy))
                                 .foregroundColor(DS.Colors.textPrimary)
                                 .lineLimit(1)
@@ -2094,6 +2110,32 @@ extension OpenClickyNotchPanelView {
     }
 
     private func connectionRow(_ row: OpenClickyNotchConnectionRow) -> some View {
+        let content = connectionRowContent(row)
+        if row.title == "HeyClicky Free" {
+            return AnyView(
+                content
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if AppBundleConfiguration.heyClickySignedIn() {
+                            _ = HeyClickyAccountResetManager.shared.attemptReset(reason: "notch_tap")
+                            Task { await HeyClickyPlanClient.shared.refresh() }
+                        } else {
+                            try? HeyClickyOAuthHandler.shared.startSignIn()
+                        }
+                    }
+                    // NOTE: no .onAppear refresh here — SwiftUI fires
+                    // .onAppear every time the row scrolls back into the
+                    // viewport, which was creating a body-invalidate loop
+                    // (refresh → publish → body rebuild → onAppear → refresh).
+                    // HeyClickyPlanClient refreshes on its own timer + on
+                    // quota-changing events. If the user wants an explicit
+                    // refresh they tap the row (see .onTapGesture above).
+            )
+        }
+        return AnyView(content)
+    }
+
+    private func connectionRowContent(_ row: OpenClickyNotchConnectionRow) -> some View {
         HStack(spacing: 10) {
             Image(systemName: row.systemImageName)
                 .font(panelUIFont(size: 15, weight: .heavy))
@@ -2103,17 +2145,17 @@ extension OpenClickyNotchPanelView {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(row.title)
+                    Text(LocalizedStringKey(row.title))
                         .font(panelUIFont(size: 12, weight: .heavy))
                         .foregroundColor(DS.Colors.textPrimary)
-                    Text(row.state.title)
+                    Text(LocalizedStringKey(row.state.title))
                         .font(appUIFont(size: max(9, subtextFontSize - 2), weight: .black))
                         .foregroundColor(row.state.color)
                         .padding(.horizontal, max(6, subtextFontSize * 0.58))
                         .padding(.vertical, max(3, subtextFontSize * 0.28))
                         .background(Capsule(style: .continuous).fill(row.state.color.opacity(0.14)))
                 }
-                Text(row.detail)
+                Text(LocalizedStringKey(row.detail))
                     .font(panelUIFont(size: 10, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
                     .lineLimit(2)
@@ -2137,10 +2179,10 @@ extension OpenClickyNotchPanelView {
                 .frame(width: 28, height: 28)
                 .background(Circle().fill(DS.Colors.accentText.opacity(0.12)))
             VStack(alignment: .leading, spacing: 1) {
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(panelUIFont(size: 10, weight: .heavy))
                     .foregroundColor(DS.Colors.textSecondary)
-                Text(detail)
+                Text(LocalizedStringKey(detail))
                     .font(panelUIFont(size: 12, weight: .heavy))
                     .foregroundColor(DS.Colors.textPrimary)
                     .lineLimit(1)
@@ -2168,7 +2210,7 @@ extension OpenClickyNotchPanelView {
             HStack(spacing: 6) {
                 Image(systemName: systemImageName)
                     .font(panelUIFont(size: 13, weight: .black))
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(panelUIFont(size: 11, weight: .heavy))
             }
             .foregroundColor(DS.Colors.textOnAccent)
@@ -2191,7 +2233,7 @@ extension OpenClickyNotchPanelView {
             HStack(spacing: 6) {
                 Image(systemName: systemImageName)
                     .font(panelUIFont(size: 13, weight: .black))
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(panelUIFont(size: 11, weight: .heavy))
             }
             .foregroundColor(DS.Colors.textPrimary)
@@ -2325,7 +2367,7 @@ extension OpenClickyNotchPanelView {
                                 .font(appUIFont(size: max(10, subtextFontSize), weight: .heavy))
                                 .foregroundColor(DS.Colors.textPrimary)
                                 .lineLimit(1)
-                            Text(attachment.displayName)
+                            Text(LocalizedStringKey(attachment.displayName))
                                 .font(appUIFont(size: max(8, subtextFontSize - 3), weight: .semibold))
                                 .foregroundColor(DS.Colors.textTertiary)
                                 .lineLimit(1)

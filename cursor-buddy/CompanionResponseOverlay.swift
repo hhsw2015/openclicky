@@ -279,7 +279,7 @@ private struct CompanionResponseOverlayView: View {
                 if let companion = viewModel.companion {
                     OpenClickyVoiceBackendSelector(companion: companion, style: .compact)
                 } else if let family = viewModel.providerFamily {
-                    Text(family.displayName)
+                    Text(LocalizedStringKey(family.displayName))
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                         .foregroundColor(DS.Colors.textTertiary)
                 }

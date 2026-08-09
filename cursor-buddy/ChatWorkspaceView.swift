@@ -236,7 +236,7 @@ struct ChatWorkspaceView: View {
                 .font(appUIFont(size: max(10, subtextFontSize), weight: .bold))
                 .foregroundColor(Self.textPrimary)
                 .lineLimit(1)
-              Text(attachment.displayName)
+              Text(LocalizedStringKey(attachment.displayName))
                 .font(appUIFont(size: max(8, subtextFontSize - 3), weight: .semibold))
                 .foregroundColor(Self.textSecondary.opacity(0.75))
                 .lineLimit(1)
@@ -284,7 +284,7 @@ struct ChatWorkspaceView: View {
 
   private var modelPill: some View {
     let label = currentModelLabel
-    return Text(label)
+    return Text(LocalizedStringKey(label))
       .font(appUIFont(size: max(11, subtextFontSize), weight: .medium))
       .foregroundColor(Self.textSecondary)
       .padding(.horizontal, max(8, subtextFontSize * 0.72))

@@ -6,6 +6,12 @@ nonisolated enum OpenClickyModelProvider: String, Equatable {
     case openAI
     case codex
     case deepgram
+    case heyclickyFree
+    /// Mirage — free-tier Claude via the aegis-proxy Cloudflare Worker.
+    /// Wire format matches the upstream reference client; requests are
+    /// anonymous (rotating UUID header, no login). See MirageBackendClient.swift
+    /// for the transport.
+    case peekyFree
 
     var displayName: String {
         switch self {
@@ -19,6 +25,10 @@ nonisolated enum OpenClickyModelProvider: String, Equatable {
             return "Codex"
         case .deepgram:
             return "Deepgram"
+        case .heyclickyFree:
+            return "HeyClicky Free"
+        case .peekyFree:
+            return "Peeky Free"
         }
     }
 
@@ -36,6 +46,12 @@ nonisolated enum OpenClickyModelProvider: String, Equatable {
             return .codex
         case .deepgram:
             return nil
+        case .heyclickyFree:
+            return nil
+        case .peekyFree:
+            // Mirage is Claude underneath. Family = claude so the bubble
+            // selector treats it consistently with paid Anthropic paths.
+            return .claude
         }
     }
 }
@@ -129,7 +145,32 @@ nonisolated enum OpenClickyModelCatalog {
         OpenClickyModelOption(id: "gpt-5.5", label: "GPT-5.5", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-5.4", label: "GPT-5.4", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-5.4-mini", label: "GPT-5.4 Mini", provider: .openAI, maxOutputTokens: 128_000),
-        OpenClickyModelOption(id: "gpt-5.2", label: "GPT-5.2", provider: .openAI, maxOutputTokens: 128_000)
+        OpenClickyModelOption(id: "gpt-5.2", label: "GPT-5.2", provider: .openAI, maxOutputTokens: 128_000),
+        OpenClickyModelOption(id: "heyclicky-free-chat", label: "HeyClicky Free (chat)", provider: .heyclickyFree, maxOutputTokens: 64_000),
+        // Mirage — free-tier Claude via the aegis-proxy Cloudflare Worker.
+        // Wire format matches the upstream reference client; requests use a
+        // rotating anonymous UUID header,
+        // no login. Model IDs are the raw upstream identifiers (dashes only —
+        // `claude-opus-4-6`, never `4.6`). Charged: nothing to the user;
+        // upstream author's Anthropic account pays. Trial-tier quota of ~20
+        // turns per UUID per UTC day is handled transparently by
+        // MirageBackendClient via UUID rotation. The `.mirage` provider case
+        // is what routes these to the free backend.
+        // Catalog IDs use CPA's `mirage/` routing namespace so a caller can
+        // migrate a config line-for-line between CPA and OpenClicky. The
+        // slash prefix also keeps these entries distinct from the paid
+        // Anthropic ones above (`claude-haiku-4-5` would collide otherwise).
+        // MirageBackendClient strips the prefix before sending upstream so
+        // aegis-proxy still sees the bare `claude-*` identifier it expects.
+        OpenClickyModelOption(id: "mirage/claude-haiku-4-5-20251001", label: "Haiku 4.5", provider: .peekyFree, maxOutputTokens: 64_000),
+        OpenClickyModelOption(id: "mirage/claude-sonnet-4-5", label: "Sonnet 4.5", provider: .peekyFree, maxOutputTokens: 64_000),
+        OpenClickyModelOption(id: "mirage/claude-sonnet-4-6", label: "Sonnet 4.6", provider: .peekyFree, maxOutputTokens: 64_000),
+        OpenClickyModelOption(id: "mirage/claude-sonnet-5", label: "Sonnet 5", provider: .peekyFree, maxOutputTokens: 64_000),
+        OpenClickyModelOption(id: "mirage/claude-opus-4-6", label: "Opus 4.6", provider: .peekyFree, maxOutputTokens: 128_000),
+        OpenClickyModelOption(id: "mirage/claude-opus-4-7", label: "Opus 4.7", provider: .peekyFree, maxOutputTokens: 128_000),
+        OpenClickyModelOption(id: "mirage/claude-opus-4-8", label: "Opus 4.8", provider: .peekyFree, maxOutputTokens: 128_000),
+        OpenClickyModelOption(id: "mirage/claude-opus-5", label: "Opus 5", provider: .peekyFree, maxOutputTokens: 128_000),
+        OpenClickyModelOption(id: "mirage/claude-fable-5", label: "Fable 5", provider: .peekyFree, maxOutputTokens: 128_000)
     ]
 
     static let speechModels: [OpenClickyModelOption] = [
@@ -142,7 +183,13 @@ nonisolated enum OpenClickyModelCatalog {
         OpenClickyModelOption(id: "gpt-realtime-2.1-mini", label: "GPT Realtime 2.1 mini", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-realtime-2.1", label: "GPT Realtime 2.1", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-realtime-1.5", label: "GPT Realtime 1.5", provider: .openAI, maxOutputTokens: 128_000),
-        OpenClickyModelOption(id: "deepgram-voice-agent", label: "Deepgram Voice Agent", provider: .deepgram, maxOutputTokens: 128_000)
+        OpenClickyModelOption(id: "deepgram-voice-agent", label: "Deepgram Voice Agent", provider: .deepgram, maxOutputTokens: 128_000),
+        // HeyClicky Free realtime speech model: same underlying OpenAI
+        // Realtime WS transport as GPT Realtime, but authenticated with
+        // a proxy-minted ephemeral so listening + speaking are both
+        // free. Selecting this makes the STT + TTS lanes collapse into
+        // one "HeyClicky Free" pill in the Listen / Think / Speak strip.
+        OpenClickyModelOption(id: "heyclicky-free-speech", label: "HeyClicky Free (realtime)", provider: .heyclickyFree, maxOutputTokens: 128_000)
     ]
 
     static let responseVoiceModels: [OpenClickyModelOption] = speechModels + voiceResponseModels
@@ -164,7 +211,8 @@ nonisolated enum OpenClickyModelCatalog {
         OpenClickyModelOption(id: "gpt-5.4-mini", label: "GPT-5.4 Mini", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-5.3-codex", label: "GPT-5.3 Codex", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-5.2-codex", label: "GPT-5.2 Codex", provider: .openAI, maxOutputTokens: 128_000),
-        OpenClickyModelOption(id: "gpt-5.2", label: "GPT-5.2", provider: .openAI, maxOutputTokens: 128_000)
+        OpenClickyModelOption(id: "gpt-5.2", label: "GPT-5.2", provider: .openAI, maxOutputTokens: 128_000),
+        OpenClickyModelOption(id: "heyclicky-free", label: "HeyClicky Free", provider: .heyclickyFree, maxOutputTokens: 128_000)
     ]
     // Local MLX models are intentionally NOT offered for Agent Mode: the local
     // endpoint (mlx_lm at 127.0.0.1:32124) only speaks /v1/chat/completions,
@@ -202,6 +250,15 @@ nonisolated enum OpenClickyModelCatalog {
             let resolved = normalizedModelID(modelID)
             if !isSpeechModelID(resolved),
                let match = voiceResponseModels.first(where: { $0.id == resolved }) {
+                return match
+            }
+            // HeyClicky Free realtime speech (`heyclicky-free-speech`)
+            // must route through `heyclicky-free-chat` for its
+            // visual/tool-call turns, NOT the default Codex bundled
+            // executable — spawning Codex from a menu-bar app that
+            // never packaged the runtime just errors out.
+            if resolved.hasPrefix("heyclicky-free-"),
+               let match = voiceResponseModels.first(where: { $0.id == "heyclicky-free-chat" }) {
                 return match
             }
         }

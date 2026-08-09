@@ -928,6 +928,24 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             ]
         )
 
+        // Long-term memory: post every non-empty final PTT transcript
+        // so CompanionManager can persist it to the vault via
+        // ConversationLogger, even when the utterance is never fed to
+        // the LLM (journaling / user hits ESC / SKI fire-and-forget).
+        // The downstream rememberVoiceExchange path already handles
+        // the "with reply" case; this covers the user-only-side.
+        if !finalTranscriptText.isEmpty {
+            NotificationCenter.default.post(
+                name: Notification.Name("com.openclicky.voice.dictation.finalTranscriptForLTM"),
+                object: nil,
+                userInfo: [
+                    "text": finalTranscriptText,
+                    "reason": completionReason,
+                    "submitted": submittedFinalDraft
+                ]
+            )
+        }
+
         if !shouldSubmitFinalDraft && !finalDraftText.isEmpty {
             currentDraftCallbacks?.updateDraftText(finalDraftText)
         }
@@ -1080,6 +1098,26 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let rootMeanSquare = sqrt(summedSquares / Float(frameCount))
         let boostedLevel = min(max(rootMeanSquare * 10.2, 0), 1)
 
+        // FIX(perf audit #334 P0-5): this ran per audio buffer at
+        // ~50 Hz. Every fire scheduled a MainActor hop + wrote to a
+        // @Published property; every write bumps objectWillChange even
+        // when the value delta is inaudible. Gate on the audio queue:
+        // when the level barely moved AND we're not due for a history
+        // sample, skip the main hop entirely. `lastForwardedPowerLevel`
+        // + `lastForwardedAt` are only touched here on the audio queue
+        // (serial upstream), so no cross-thread state on the gate.
+        let previous = self.lastForwardedPowerLevel
+        let delta = abs(Float(boostedLevel) - previous)
+        let nowMonotonic = ProcessInfo.processInfo.systemUptime
+        let sinceLastForward = nowMonotonic - self.lastForwardedAt
+        // Match the ~1 s history sampler on the main side — pass through
+        // at least once per second even at rest so the recorded history
+        // buffer sees a heartbeat sample.
+        let heartbeatDue = sinceLastForward >= 0.9
+        if delta < 0.02 && !heartbeatDue { return }
+        self.lastForwardedPowerLevel = Float(boostedLevel)
+        self.lastForwardedAt = nowMonotonic
+
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
 
@@ -1099,6 +1137,15 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             }
         }
     }
+
+    /// Last-forwarded audio power level, tracked off-main so the
+    /// per-buffer path can filter out sub-threshold jitter without
+    /// hopping to MainActor. See perf audit #334 P0-5. Only touched
+    /// from the serial audio queue.
+    nonisolated(unsafe) private var lastForwardedPowerLevel: Float = 0
+    /// Monotonic timestamp (systemUptime) of the last main-actor
+    /// forward. Used so we still flush once/sec at rest.
+    nonisolated(unsafe) private var lastForwardedAt: TimeInterval = 0
 
     private func appendRecordedAudioPowerSample(_ audioPowerSample: CGFloat) {
         var updatedRecordedAudioPowerHistory = recordedAudioPowerHistory

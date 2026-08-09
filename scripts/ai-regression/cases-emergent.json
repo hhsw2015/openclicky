@@ -1,0 +1,79 @@
+[
+  {
+    "name": "intent-combine-history-and-web",
+    "category": "emergent_intent",
+    "seed": "我之前在看 kafka 消费者偏移量重置的资料.",
+    "query": "沿着我之前查的方向, 帮我确认下 Kafka 0.11 之后偏移量存储的位置改到哪了?",
+    "expect_include": ["__consumer_offsets"],
+    "expect_wrote": 2
+  },
+  {
+    "name": "intent-tool-selection-past",
+    "category": "emergent_intent",
+    "seed": "记住我在 Xcode 里改了 CGEventTap 相关文件.",
+    "query": "根据我今天做的事, 我最应该继续看的是哪个文件?",
+    "expect_include": ["CGEventTap"],
+    "expect_wrote": 2
+  },
+  {
+    "name": "intent-tool-selection-web",
+    "category": "emergent_intent",
+    "query": "帮我查一下 Rust 1.75 引入的 async trait 特性叫什么?",
+    "expect_include": ["async fn in trait"],
+    "expect_wrote": 2
+  },
+  {
+    "name": "reasoning-multi-step",
+    "category": "reasoning",
+    "seed": "记住我团队3人, 每人5天可完成 2 个功能点.",
+    "query": "如果我要交付 30 个功能点, 团队大约需要几天?",
+    "expect_include": ["25"],
+    "expect_wrote": 2
+  },
+  {
+    "name": "reasoning-summarize-thread",
+    "category": "reasoning",
+    "seed": "我们讨论过 3 个方案: A. 用 embedding 检索, B. 加 SessionCache, C. 引入向量数据库.",
+    "noise": ["A 方案实现快但精度低.", "C 方案精度高但运维成本大."],
+    "query": "综合起来, 你会推荐哪个方案给中期项目使用?",
+    "expect_include": ["B"],
+    "expect_wrote": 2
+  },
+  {
+    "name": "screen-context-aware",
+    "category": "live_context",
+    "query": "根据你现在能看到的屏幕上下文, 我在哪个应用做什么?",
+    "expect_min_ltm_injection": true,
+    "expect_wrote": 2
+  },
+  {
+    "name": "ambiguous-follow-up",
+    "category": "reasoning",
+    "seed": "看我之前的截图, 那个报错主要跟 tokio async 有关.",
+    "query": "那个报错在哪一行代码?",
+    "expect_min_honesty": true,
+    "expect_wrote": 2
+  },
+  {
+    "name": "chain-of-thought-numeric",
+    "category": "reasoning",
+    "query": "42 的二进制表示、十六进制表示、以及乘以 3 的结果各是多少?",
+    "expect_include": ["101010", "2a", "126"],
+    "expect_wrote": 2
+  },
+  {
+    "name": "personalization-user-profile",
+    "category": "emergent_intent",
+    "seed": "记住我是 macOS 用户, 主力 IDE 是 Xcode, 后端语言 Swift, 讨厌 Java.",
+    "query": "给我推荐一门下班后放松学的语言, 结合我的偏好.",
+    "expect_exclude": ["Java "],
+    "expect_wrote": 2
+  },
+  {
+    "name": "verify-time-anchored-fact",
+    "category": "world_knowledge",
+    "query": "GPT-4 是 OpenAI 哪一年发布的?",
+    "expect_include": ["2023"],
+    "expect_wrote": 2
+  }
+]

@@ -208,7 +208,7 @@ struct ConversationSidebarView: View {
   }
 
   private func sectionLabel(_ text: String) -> some View {
-    Text(text)
+    Text(LocalizedStringKey(text))
       .font(appUIFont(size: max(11, subtextFontSize), weight: .semibold))
       .foregroundColor(Self.textSecondary)
       .padding(.horizontal, 14)
@@ -221,7 +221,7 @@ struct ConversationSidebarView: View {
     return HStack(spacing: 0) {
       Button(action: { companion.selectCodexAgentSession(session.id) }) {
         HStack(spacing: 8) {
-          Text(session.title)
+          Text(LocalizedStringKey(session.title))
             .font(appUIFont(size: max(12, bodyFontSize - 1), weight: .regular))
             .foregroundColor(isActive ? Self.textPrimary : Self.textPrimary.opacity(0.85))
             .lineLimit(1)

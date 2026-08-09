@@ -1,0 +1,14 @@
+finder-empty-folder
+finder-pdf-selected
+safari-url
+terminal-scrollback
+browser-tabs
+# runtime-2026-07-23 golden-diff fixtures (SnapshotContext, PickElement,
+# LinkRect, Whiteboard). Each requires programmatic keystroke injection
+# (osascript/cliclick with TCC AX permission). See
+# docs/ROADMAP/.review-notes/golden-diff-runtime-2026-07-23.md.
+snapshotcontext-finder-documents
+snapshotcontext-arc-apple
+pickelement-textedit-hello
+linkrect-safari-wikipedia
+whiteboard-notes-underline-test

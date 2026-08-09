@@ -86,8 +86,14 @@ enum OpenClickyOpenableLinkExtractor {
         .map { $0 }
     }
 
+    // FIX(perf-2026-08-01 swiftui-audit): NSDataDetector init compiles
+    // a regex (~500 us) — was re-compiled every hover card body eval.
+    // Cache as static so the compilation happens once.
+    private static let linkDetector: NSDataDetector? =
+        try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
     private static func appendWebLinks(from text: String, to urls: inout [URL]) {
-        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else { return }
+        guard let detector = linkDetector else { return }
         let nsText = text as NSString
         let range = NSRange(location: 0, length: nsText.length)
         detector.enumerateMatches(in: text, options: [], range: range) { match, _, _ in
@@ -149,6 +155,7 @@ struct ClickyAgentDockHoverCard: View {
     let chat: () -> Void
     let text: () -> Void
     let voice: () -> Void
+    let mini: () -> Void
     let close: () -> Void
     let stop: () -> Void
     /// Called when the user taps "Dismiss" on a terminal (`.done`/`.failed`)
@@ -171,7 +178,7 @@ struct ClickyAgentDockHoverCard: View {
                     .kerning(1.4)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text(statusText)
+                Text(LocalizedStringKey(statusText))
                     .font(.system(size: 9, weight: .heavy, design: .rounded))
                     .foregroundColor(titleAccentColor)
                     .padding(.horizontal, 9)
@@ -218,7 +225,7 @@ struct ClickyAgentDockHoverCard: View {
                             Button(action: {
                                 runSuggestedAction(actionTitle)
                             }) {
-                                Text(actionTitle)
+                                Text(LocalizedStringKey(actionTitle))
                             }
                             .buttonStyle(ClickyAgentDockPillButtonStyle())
                         }
@@ -440,6 +447,11 @@ struct ClickyAgentDockHoverCard: View {
                 HoverExpandIconActionButton(icon: "message", label: "Chat", isExpanded: hoveredQuickAction == .dashboard, action: chat)
                     .onHover { hoveredQuickAction = $0 ? .dashboard : nil }
             }
+            HoverExpandIconActionButton(icon: "rectangle.on.rectangle",
+                                        label: "Mini",
+                                        isExpanded: hoveredQuickAction == .mini,
+                                        action: mini)
+                .onHover { hoveredQuickAction = $0 ? .mini : nil }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -492,7 +504,7 @@ struct ClickyAgentDockHoverCard: View {
         }
     }
 
-    private enum QuickAction { case voice, text, dashboard }
+    private enum QuickAction { case voice, text, dashboard, mini }
 
     private var hasTaskActionButtons: Bool {
         !item.suggestedNextActions.isEmpty || !linkTargets.isEmpty
@@ -596,7 +608,7 @@ struct HoverExpandIconActionButton: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                if isExpanded { Text(label) }
+                if isExpanded { Text(LocalizedStringKey(label)) }
             }
         }
         .buttonStyle(ClickyAgentDockPillButtonStyle())

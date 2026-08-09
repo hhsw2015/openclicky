@@ -196,12 +196,17 @@ private final class AssemblyAIStreamingTranscriptionSession: StreamingWebSocketT
             websocketRequest.setValue(apiKey, forHTTPHeaderField: "Authorization")
         }
 
-        openWebSocket(with: websocketRequest)
-
+        // FIX(stability-2026-08-01 concurrency-audit #4): register the
+        // continuation BEFORE starting the WebSocket. Previously
+        // `openWebSocket` could synchronously fire `handleReceiveFailure`
+        // → `failSession` → `resolveReadyContinuationIfNeeded` before
+        // the async block below had a chance to store the continuation
+        // → the continuation was lost and the caller hung forever.
         try await withCheckedThrowingContinuation { continuation in
-            stateQueue.async {
+            stateQueue.sync {
                 self.readyContinuation = continuation
             }
+            openWebSocket(with: websocketRequest)
         }
     }
 

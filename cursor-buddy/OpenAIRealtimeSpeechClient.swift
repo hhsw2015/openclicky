@@ -14,6 +14,50 @@ import Foundation
 /// through ElevenLabs, Cartesia, or Deepgram.
 @MainActor
 final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
+    /// Builds the realtime session's audio.input.transcription config,
+    /// honoring the user's `voiceResponseLanguage` preference. Without
+    /// a language hint gpt-4o-mini-transcribe often mistakes short
+    /// Chinese sentences for English homophones ("six" instead of
+    /// "输入框"), which then routes the turn into a dead-end reply.
+    static func buildTranscriptionConfig() -> [String: Any] {
+        var config: [String: Any] = ["model": "gpt-4o-mini-transcribe"]
+        let lang = AppBundleConfiguration.voiceResponseLanguage()
+        // Map our preference codes to ISO-639-1 codes accepted by the
+        // Whisper-family transcriber. "auto" leaves the hint off so
+        // detection stays automatic.
+        let langCode: String? = {
+            switch lang {
+            case "zh": return "zh"
+            case "en": return "en"
+            case "ja": return "ja"
+            case "es": return "es"
+            case "fr": return "fr"
+            case "de": return "de"
+            default: return nil
+            }
+        }()
+        if let langCode {
+            config["language"] = langCode
+        }
+        return config
+    }
+
+    /// Public helper so external callers (e.g. CompanionManager's in-
+    /// session tool handler) can pull the `transcript` JSON field out
+    /// of the realtime tool arguments without duplicating the parse
+    /// logic living inside the nested BidirectionalVoiceTurn class.
+    nonisolated static func parseTranscriptArgument(_ arguments: String?) -> String? {
+        guard let arguments,
+              let data = arguments.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        if let v = json["transcript"] as? String, !v.isEmpty { return v }
+        if let v = json["query"] as? String, !v.isEmpty { return v }
+        if let v = json["text"] as? String, !v.isEmpty { return v }
+        return nil
+    }
+
     nonisolated static let streamSampleRate: Double = 24_000
     private nonisolated static let defaultVoiceID = "cedar"
     private nonisolated static let minimumInputAudioBytes = Int(streamSampleRate * 2 * 0.18)
@@ -35,6 +79,53 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
     private var playerNode: AVAudioPlayerNode?
     private var streamingTask: Task<Void, Error>?
     private var activeBidirectionalVoiceTurn: BidirectionalVoiceTurn?
+
+    // MARK: HeyClicky Free Realtime WS extension (spec §5.3)
+
+    /// Overrides the WSS base URL for the four connect sites.
+    /// nil → default `wss://api.openai.com/v1/realtime`.
+    private(set) var realtimeBaseURL: URL?
+    /// Optional server-side instructions override for the current
+    /// session. Stored but not yet consumed on session.update because
+    /// openclicky's tool routing needs its own client-side
+    /// `instructions` field. Wire this in when a caller genuinely
+    /// wants the "server bakes the prompt" path (R2 review #12).
+    private(set) var serverInstructions: String?
+    /// Ephemeral refresh hook. Called when a WS reconnect needs a
+    /// fresh ephemeral token (returns value + optional epoch expiry).
+    private(set) var onEphemeralRefreshNeeded: (@Sendable () async throws -> (String, Int?))?
+    /// Buffered synthetic follow-up text (e.g. guided_click_follow_up).
+    /// Consumed by the WS runloop on `session.created`.
+    private var _pendingFollowUp: String?
+    private let followUpQueue = DispatchQueue(label: "com.jkneen.openclicky.realtime.followup")
+    var pendingFollowUp: String? {
+        get { followUpQueue.sync { _pendingFollowUp } }
+        set { followUpQueue.sync { _pendingFollowUp = newValue } }
+    }
+    func consumePendingFollowUp() -> String? {
+        followUpQueue.sync {
+            let value = _pendingFollowUp
+            _pendingFollowUp = nil
+            return value
+        }
+    }
+    /// Hand a synthetic user turn (e.g. guided_click_follow_up) to the
+    /// active Realtime session. If no session is active, buffer it and
+    /// the WS runloop drains it after the next session.created.
+    func injectFollowUp(_ text: String) {
+        if let turn = activeBidirectionalVoiceTurn {
+            HeyClickyLog.log("realtime.follow_up_inject", lane: "voice", direction: "outgoing", [
+                "text_len": text.count,
+                "route": "active_turn"
+            ])
+            turn.injectUserText(text)
+        } else {
+            HeyClickyLog.log("realtime.follow_up_buffered", lane: "voice", direction: "internal", [
+                "text_len": text.count
+            ])
+            pendingFollowUp = text
+        }
+    }
 
     nonisolated static func realtimeReasoningConfiguration(for modelID: String) -> [String: String]? {
         let normalizedModel = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -70,13 +161,18 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         [
             "type": "function",
             "name": "openclicky_use_screen_context",
-            "description": "Route a screen-aware voice request back to OpenClicky's app so it can take a fresh screenshot and inspect the visible screen before answering. Use this for anything about what is on screen, the current window, visible UI, screenshots, pointing, highlighting, drawing rectangles/circles/scribbles, screen calibration, layout, icons, buttons, fields, menus, pages, or visible objects. Do not answer these requests from Realtime audio alone; this tool lets the voice lane see the screen.",
+            "description": "Route a screen-aware voice request back to OpenClicky's app. Use for: (a) anything about what's on screen / current window / visible UI / pointing / highlighting / drawing / screen calibration / layout / icons / buttons / menus; (b) short read-only lookups (ask/check/verify/count/summarise) where the user waits seconds; (c) **following a TODO / TODO.md checklist file** — the local assist agent plans and executes the tasks inside, including small writes/edits/shell commands. Do NOT answer these from audio alone.",
             "parameters": [
                 "type": "object",
                 "properties": [
                     "transcript": [
                         "type": "string",
                         "description": "The user's exact spoken request that needs OpenClicky's screenshot-aware voice path."
+                    ],
+                    "intent": [
+                        "type": "string",
+                        "enum": ["world_knowledge", "past_memory", "live_context", "recent_conv", "other"],
+                        "description": "Classify the user's intent so downstream can pick the right context:\n- world_knowledge: general facts, not about the user's history/screen (e.g. \"苹果哪年成立\", \"光速是多少\").\n- past_memory: refers to something the user did / said / saw previously (e.g. \"我上周问过 kafka 什么\", \"上次那个项目\").\n- live_context: needs to see the current screen / active app right now (e.g. \"这个报错什么意思\", \"点亮这个按钮\").\n- recent_conv: direct follow-up to the last few voice exchanges (e.g. \"接着刚才说\", \"再解释下\").\n- other: doesn't fit above."
                     ]
                 ],
                 "required": ["transcript"],
@@ -86,7 +182,7 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         [
             "type": "function",
             "name": "openclicky_start_background_agent",
-            "description": "Route deeper work to OpenClicky's background Agent Mode full model. Use this for code, files, research, settings, logs, memory, builds, installs, refactors, or long-running work. Do not use this for ordinary app control; use openclicky_use_computer instead.",
+            "description": "Route deeper work to OpenClicky's background Agent Mode full model. Use for: refactors, multi-file changes, building/installing packages, writing new features, running long test suites — real engineering sessions the user knowingly waits minutes for. Do NOT use for: short lookups, checklist / TODO.md execution, or anything answerable in seconds (those go through openclicky_use_screen_context). Do NOT use for ordinary app control (use openclicky_use_computer).",
             "parameters": [
                 "type": "object",
                 "properties": [
@@ -121,6 +217,108 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         if !trimmedVoice.isEmpty {
             self.voiceID = trimmedVoice
         }
+    }
+
+    /// Extended configuration for HeyClicky Free's Realtime WS lane (§5.3).
+    /// `realtimeBaseURL` nil = default OpenAI endpoint.
+    /// `serverInstructions` nil = keep current; empty string = clear.
+    func updateConfiguration(
+        apiKey: String,
+        voiceID: String,
+        realtimeBaseURL: URL?,
+        serverInstructions: String?,
+        onEphemeralRefreshNeeded: (@Sendable () async throws -> (String, Int?))?
+    ) async {
+        self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedVoice = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedVoice.isEmpty {
+            self.voiceID = trimmedVoice
+        }
+        self.realtimeBaseURL = realtimeBaseURL
+        if let serverInstructions {
+            self.serverInstructions = serverInstructions.isEmpty ? nil : serverInstructions
+        }
+        self.onEphemeralRefreshNeeded = onEphemeralRefreshNeeded
+    }
+
+    /// Public barge-in for HeyClicky guided-click follow-ups and PTT
+    /// interruptions. Cancels the current assistant response, clears
+    /// the input buffer, truncates the last item, and stops playback.
+    func bargeIn() {
+        HeyClickyLog.log("realtime.barge_in", lane: "voice", direction: "outgoing", [
+            "turn_active": activeBidirectionalVoiceTurn != nil
+        ])
+        activeBidirectionalVoiceTurn?.sendBargeInCancel()
+        playerNode?.stop()
+    }
+
+    /// Resolves the Authorization Bearer value used for WS connect.
+    /// If a HeyClicky ephemeral refresh hook is configured, we mint a
+    /// fresh ephemeral token; otherwise we fall back to the caller's
+    /// BYOK apiKey. IDA-verified path (0x1012cc5c0): HeyClicky Free
+    /// sends the mint response's `client_secret.value` as Bearer.
+    fileprivate func resolveAuthToken(fallback: String) async throws -> String {
+        if let hook = onEphemeralRefreshNeeded {
+            do {
+                let (ephemeral, _) = try await hook()
+                if !ephemeral.isEmpty { return ephemeral }
+                HeyClickyLog.log("realtime.hook_returned_empty", direction: "error")
+            } catch {
+                HeyClickyLog.log("realtime.hook_failed", direction: "error", [
+                    "error": "\(error)"
+                ])
+            }
+            // Hook is installed but couldn't produce a token (network
+            // blip, mint 5xx, refresh burn, etc). Do NOT fall through
+            // to an empty BYOK apiKey — the server would report
+            // "Incorrect API key provided: ''" and mislead the user
+            // into thinking their credentials are broken.
+            if fallback.isEmpty {
+                throw NSError(
+                    domain: "OpenAIRealtimeSpeechClient",
+                    code: -1001,
+                    userInfo: [NSLocalizedDescriptionKey: "HeyClicky Free proxy is temporarily unreachable — try again in a moment."]
+                )
+            }
+        }
+        return fallback
+    }
+
+    /// When the ephemeral hook is installed (HeyClicky Free path) and
+    /// the mint response carried a server-baked model name, prefer it
+    /// over our local `model` — the proxy signs the ephemeral against
+    /// its own model choice and refuses connects that ask for a
+    /// different one. This is async because on cold start the baked
+    /// model isn't known until a mint has actually completed; block
+    /// on one round-trip so the WS URL uses the right model name.
+    fileprivate func effectiveModel(fallback: String) async -> String {
+        guard onEphemeralRefreshNeeded != nil else { return fallback }
+        if let baked = HeyClickySessionTokenClient.shared.bakedRealtimeModel,
+           !baked.isEmpty {
+            return baked
+        }
+        // Cold path — force a mint so the baked model shows up.
+        _ = try? await HeyClickySessionTokenClient.shared.mintRealtimeToken()
+        if let baked = HeyClickySessionTokenClient.shared.bakedRealtimeModel,
+           !baked.isEmpty {
+            return baked
+        }
+        return fallback
+    }
+
+    /// Base URL for WS connect sites — the four call sites use this.
+    fileprivate func realtimeWSBase() -> String {
+        if let realtimeBaseURL {
+            // Convert https:// → wss://, http:// → ws:// while preserving path.
+            var comps = URLComponents(url: realtimeBaseURL, resolvingAgainstBaseURL: false)
+            switch comps?.scheme {
+            case "https", "wss": comps?.scheme = "wss"
+            case "http", "ws": comps?.scheme = "ws"
+            default: comps?.scheme = "wss"
+            }
+            return comps?.url?.absoluteString ?? "wss://api.openai.com/v1/realtime"
+        }
+        return "wss://api.openai.com/v1/realtime"
     }
 
     func warmUpConnection() {
@@ -265,7 +463,11 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         activeBidirectionalVoiceTurn?.cancel()
         activeBidirectionalVoiceTurn = nil
 
-        guard let apiKey, !apiKey.isEmpty else {
+        // HeyClicky Free path: apiKey is intentionally empty because
+        // `onEphemeralRefreshNeeded` mints a proxy-minted Bearer token
+        // just before each WS connect. Only bail when neither is set.
+        let hasHeyClickyHook = onEphemeralRefreshNeeded != nil
+        guard hasHeyClickyHook || (apiKey?.isEmpty == false) else {
             throw NSError(
                 domain: "OpenAIRealtimeSpeechClient",
                 code: -1000,
@@ -273,44 +475,71 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
             )
         }
         try await ensureMicrophonePermission()
-        guard var components = URLComponents(string: "wss://api.openai.com/v1/realtime") else {
-            throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL is invalid."])
+        // Try to check out a pre-warmed realtime WS first (HeyClicky Free
+        // lane only; other lanes have no proxy hook and don't warm).
+        // WarmStreamingConnection parity — IDA-verified path used by the
+        // real app for `didStartFromWarmConnection`.
+        let warm: HeyClickyWarmRealtimeSession? = await MainActor.run {
+            hasHeyClickyHook ? HeyClickyRealtimeWarmConnection.shared.checkOut() : nil
         }
-        components.queryItems = [URLQueryItem(name: "model", value: model)]
-        guard let url = components.url else {
-            throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL could not be created."])
+        let webSocket: URLSessionWebSocketTask
+        let usedWarmConnection: Bool
+        if let warm {
+            webSocket = warm.webSocket
+            usedWarmConnection = true
+            HeyClickyLog.log("realtime.warm_used", lane: "voice", direction: "internal", [
+                "baked_model": warm.bakedModel,
+                "age_ms": Int(Date().timeIntervalSince(warm.createdAt) * 1000)
+            ])
+        } else {
+            // Cold path: mint + open WS from scratch.
+            let effectiveToken = try await resolveAuthToken(fallback: apiKey ?? "")
+            guard var components = URLComponents(string: realtimeWSBase()) else {
+                throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL is invalid."])
+            }
+            components.queryItems = [URLQueryItem(name: "model", value: await effectiveModel(fallback: model))]
+            guard let url = components.url else {
+                throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL could not be created."])
+            }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 60
+            request.setValue("Bearer \(effectiveToken)", forHTTPHeaderField: "Authorization")
+            webSocket = session.webSocketTask(with: request)
+            webSocket.resume()
+            usedWarmConnection = false
         }
         guard let streamFormat = Self.makeStreamFormat() else {
             throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -3, userInfo: [NSLocalizedDescriptionKey: "Could not build OpenAI Realtime PCM stream format."])
         }
-
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 60
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
         let inputCapture = RealtimeInputCapture(
             targetSampleRate: Self.streamSampleRate,
             onInputPowerLevel: onInputPowerLevel
         )
         try inputCapture.start()
-
-        let webSocket = session.webSocketTask(with: request)
-        webSocket.resume()
         do {
             try await waitForRealtimeConnection(on: webSocket)
 
             let historyText = conversationHistory.suffix(8).map { entry in
                 "User: \(entry.userPlaceholder)\nOpenClicky: \(entry.assistantResponse)"
             }.joined(separator: "\n\n")
+            // Long-term memory: pull the same context block the main
+            // dialog model gets. Realtime carries it inside `instructions`
+            // for the session; refreshed every session start. Cheap
+            // (a few hundred ms), returns empty when Screen History off.
+            let ltmBlock = await LongTermMemoryContext.build()
             let instructions = [
+                AppBundleConfiguration.voiceResponseLanguageInstruction(),
                 systemPrompt,
                 historyText.isEmpty ? nil : "Recent conversation:\n\(historyText)",
-                "You are in OpenClicky's bidirectional Realtime voice mode. Listen to the user's live microphone audio directly and reply out loud as OpenClicky in one concise spoken answer. Do not claim you will start background work, take care of a task, or start an agent unless the app already routed the turn before you receive it. You cannot see the user's screen inside this live Realtime turn; for any request about what is on screen, the current window, visible UI, screenshots, pointing, highlighting, drawing, or screen calibration, call openclicky_use_screen_context with the exact transcript instead of answering from audio alone. Do not mention transcription, Whisper, markdown, or [POINT:] tags."
+                ltmBlock.isEmpty ? nil : ltmBlock,
+                "You are in OpenClicky's bidirectional Realtime voice mode. Listen to the user's live microphone audio directly and reply out loud as OpenClicky in one concise spoken answer. Do not claim you will start background work, take care of a task, or start an agent unless the app already routed the turn before you receive it. You cannot see the user's screen inside this live Realtime turn; for any request about what is on screen, the current window, visible UI, screenshots, pointing, highlighting, drawing, or screen calibration, call openclicky_use_screen_context with the exact transcript instead of answering from audio alone. Do not mention transcription, Whisper, markdown, or [POINT:] tags. Note: openclicky_use_screen_context also handles short read-only lookups (ask/check/verify/count/summarise) — route those there, not to background_agent."
             ].compactMap { $0 }.joined(separator: "\n\n")
 
+            let wsModel = await effectiveModel(fallback: model)
             var sessionConfiguration: [String: Any] = [
                 "type": "realtime",
-                "model": model,
+                "model": wsModel,
                 "instructions": instructions,
                 "output_modalities": ["audio"],
                 "tools": Self.realtimeRoutingTools,
@@ -321,9 +550,7 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
                                 "type": "audio/pcm",
                                 "rate": Int(Self.streamSampleRate)
                             ],
-                            "transcription": [
-                                "model": "gpt-4o-mini-transcribe"
-                            ],
+                            "transcription": Self.buildTranscriptionConfig(),
                             "turn_detection": NSNull()
                         ],
                         "output": [
@@ -355,6 +582,12 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
             playerNode = turn.playerNode
             turn.startInputCapture()
             turn.startReceiving()
+            // Drain any HeyClicky follow-up buffered while the WS
+            // was offline (e.g. guided_click_follow_up captured
+            // before the session came up).
+            if let buffered = consumePendingFollowUp() {
+                turn.injectUserText(buffered)
+            }
         } catch {
             inputCapture.stop()
             webSocket.cancel(with: .goingAway, reason: nil)
@@ -364,7 +597,8 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
 
     func finishBidirectionalVoiceTurn(
         routeUserTranscriptBeforeAssistantResponse: (@MainActor @Sendable (String) -> Bool)? = nil,
-        routeRealtimeToolCallBeforeAssistantResponse: (@MainActor @Sendable (String, String) -> Bool)? = nil
+        routeRealtimeToolCallBeforeAssistantResponse: (@MainActor @Sendable (String, String) -> Bool)? = nil,
+        handleRealtimeToolCall: (@Sendable (String, String, String) async -> String?)? = nil
     ) async throws -> BidirectionalVoiceTurnResult {
         guard let turn = activeBidirectionalVoiceTurn else {
             throw CancellationError()
@@ -372,7 +606,8 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         do {
             let result = try await turn.finish(
                 routeUserTranscriptBeforeAssistantResponse: routeUserTranscriptBeforeAssistantResponse,
-                routeRealtimeToolCallBeforeAssistantResponse: routeRealtimeToolCallBeforeAssistantResponse
+                routeRealtimeToolCallBeforeAssistantResponse: routeRealtimeToolCallBeforeAssistantResponse,
+                handleRealtimeToolCall: handleRealtimeToolCall
             )
             if activeBidirectionalVoiceTurn === turn {
                 activeBidirectionalVoiceTurn = nil
@@ -458,17 +693,21 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         onPlaybackStarted: @escaping @MainActor () -> Void
     ) async throws -> String {
         stopPlaybackInternal()
-        guard let apiKey, !apiKey.isEmpty else {
+        // HeyClicky Free path: apiKey is intentionally empty because
+        // `onEphemeralRefreshNeeded` mints a proxy-minted Bearer token
+        // just before each WS connect. Only bail when neither is set.
+        let hasHeyClickyHook = onEphemeralRefreshNeeded != nil
+        guard hasHeyClickyHook || (apiKey?.isEmpty == false) else {
             throw NSError(
                 domain: "OpenAIRealtimeSpeechClient",
                 code: -1000,
                 userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime response needs a Codex/OpenAI API key in Settings or OPENAI_API_KEY in the launch environment."]
             )
         }
-        guard var components = URLComponents(string: "wss://api.openai.com/v1/realtime") else {
+        guard var components = URLComponents(string: realtimeWSBase()) else {
             throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL is invalid."])
         }
-        components.queryItems = [URLQueryItem(name: "model", value: model)]
+        components.queryItems = [URLQueryItem(name: "model", value: await effectiveModel(fallback: model))]
         guard let url = components.url else {
             throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL could not be created."])
         }
@@ -492,7 +731,8 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 60
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let effectiveToken = try await resolveAuthToken(fallback: apiKey ?? "")
+        request.setValue("Bearer \(effectiveToken)", forHTTPHeaderField: "Authorization")
 
         let webSocket = session.webSocketTask(with: request)
         webSocket.resume()
@@ -502,9 +742,10 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         }
 
         try await waitForRealtimeConnection(on: webSocket)
+        let sessionModel = await effectiveModel(fallback: model)
         var sessionConfiguration: [String: Any] = [
             "type": "realtime",
-            "model": model,
+            "model": sessionModel,
             "output_modalities": ["audio"],
             "audio": [
                     "output": [
@@ -516,7 +757,7 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
                     ]
                 ]
             ]
-        Self.addRealtimeReasoningConfiguration(to: &sessionConfiguration, modelID: model)
+        Self.addRealtimeReasoningConfiguration(to: &sessionConfiguration, modelID: sessionModel)
         try await sendJSON([
             "type": "session.update",
             "session": sessionConfiguration
@@ -525,9 +766,12 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         let historyText = conversationHistory.suffix(8).map { entry in
             "User: \(entry.userPlaceholder)\nOpenClicky: \(entry.assistantResponse)"
         }.joined(separator: "\n\n")
+        let ltmBlock = await LongTermMemoryContext.build(query: userPrompt)
         let instructions = [
+            AppBundleConfiguration.voiceResponseLanguageInstruction(),
             systemPrompt,
             historyText.isEmpty ? nil : "Recent conversation:\n\(historyText)",
+            ltmBlock.isEmpty ? nil : ltmBlock,
             "Current user request:\n\(userPrompt)",
             "Reply out loud as OpenClicky in one concise spoken answer. Do not include markdown. Do not include [POINT:] tags."
         ].compactMap { $0 }.joined(separator: "\n\n")
@@ -615,14 +859,18 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         userPrompt: String,
         onTextChunk: @MainActor @Sendable @escaping (String) -> Void
     ) async throws -> String {
-        guard let apiKey, !apiKey.isEmpty else {
+        // HeyClicky Free path: apiKey is intentionally empty because
+        // `onEphemeralRefreshNeeded` mints a proxy-minted Bearer token
+        // just before each WS connect. Only bail when neither is set.
+        let hasHeyClickyHook = onEphemeralRefreshNeeded != nil
+        guard hasHeyClickyHook || (apiKey?.isEmpty == false) else {
             throw NSError(
                 domain: "OpenAIRealtimeSpeechClient",
                 code: -1000,
                 userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime image analysis needs a Codex/OpenAI API key in Settings or OPENAI_API_KEY in the launch environment."]
             )
         }
-        guard var components = URLComponents(string: "wss://api.openai.com/v1/realtime") else {
+        guard var components = URLComponents(string: realtimeWSBase()) else {
             throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL is invalid."])
         }
         let requestModel = modelID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? modelID! : model
@@ -633,7 +881,8 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 60
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let effectiveToken = try await resolveAuthToken(fallback: apiKey ?? "")
+        request.setValue("Bearer \(effectiveToken)", forHTTPHeaderField: "Authorization")
 
         let webSocket = session.webSocketTask(with: request)
         webSocket.resume()
@@ -757,7 +1006,11 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
     }
 
     func fetchSentenceSamples(_ text: String) async throws -> [Int16] {
-        guard let apiKey, !apiKey.isEmpty else {
+        // HeyClicky Free path: apiKey is intentionally empty because
+        // `onEphemeralRefreshNeeded` mints a proxy-minted Bearer token
+        // just before each WS connect. Only bail when neither is set.
+        let hasHeyClickyHook = onEphemeralRefreshNeeded != nil
+        guard hasHeyClickyHook || (apiKey?.isEmpty == false) else {
             throw NSError(
                 domain: "OpenAIRealtimeSpeechClient",
                 code: -1000,
@@ -765,17 +1018,18 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
             )
         }
 
-        guard var components = URLComponents(string: "wss://api.openai.com/v1/realtime") else {
+        guard var components = URLComponents(string: realtimeWSBase()) else {
             throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL is invalid."])
         }
-        components.queryItems = [URLQueryItem(name: "model", value: model)]
+        components.queryItems = [URLQueryItem(name: "model", value: await effectiveModel(fallback: model))]
         guard let url = components.url else {
             throw NSError(domain: "OpenAIRealtimeSpeechClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "OpenAI Realtime WebSocket URL could not be created."])
         }
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 60
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let effectiveToken = try await resolveAuthToken(fallback: apiKey ?? "")
+        request.setValue("Bearer \(effectiveToken)", forHTTPHeaderField: "Authorization")
         // GPT Realtime 2 is GA-only. The old beta header makes the server reject
         // gpt-realtime-2 with "only available on the GA API", so keep this
         // connection on the GA Realtime WebSocket interface.
@@ -786,9 +1040,10 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
 
         try await waitForRealtimeConnection(on: webSocket)
 
+        let streamModel = await effectiveModel(fallback: model)
         var sessionConfiguration: [String: Any] = [
             "type": "realtime",
-            "model": model,
+            "model": streamModel,
             "output_modalities": ["audio"],
             "audio": [
                     "output": [
@@ -978,11 +1233,25 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         private var responseFallbackTask: Task<Void, Never>?
         private var routeUserTranscriptBeforeAssistantResponse: (@MainActor @Sendable (String) -> Bool)?
         private var routeRealtimeToolCallBeforeAssistantResponse: (@MainActor @Sendable (String, String) -> Bool)?
+        /// (name, arguments, call_id) → JSON output string, or nil when
+        /// the client couldn't produce one. When non-nil, tool_calls are
+        /// executed IN-SESSION: we don't break the receive loop, we run
+        /// the handler, post `conversation.item.create` type=`function_call_output`,
+        /// and trigger `response.create` so the same realtime WS
+        /// continues speaking with the tool result inline (clicky-mac parity).
+        fileprivate var handleRealtimeToolCall: (@Sendable (String, String, String) async -> String?)?
         private var didStartPlayback = false
         private var didCommitInput = false
         private var didRequestAssistantResponse = false
         private var didRouteByClient = false
         private var isCancelled = false
+        /// Tracks the last assistant item ID + audio played, used by
+        /// bargeIn() to send conversation.item.truncate to the server.
+        var currentAssistantItemID: String?
+        var playedAudioBytes: Int = 0
+        /// PCM16 mono @ 24 kHz → 48 bytes per ms.
+        private var bytesPerMillisecond: Int { 48 }
+        var playedAudioMilliseconds: Int { playedAudioBytes / bytesPerMillisecond }
 
         init(
             client: OpenAIRealtimeSpeechClient,
@@ -1040,8 +1309,10 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
 
         func finish(
             routeUserTranscriptBeforeAssistantResponse: (@MainActor @Sendable (String) -> Bool)? = nil,
-            routeRealtimeToolCallBeforeAssistantResponse: (@MainActor @Sendable (String, String) -> Bool)? = nil
+            routeRealtimeToolCallBeforeAssistantResponse: (@MainActor @Sendable (String, String) -> Bool)? = nil,
+            handleRealtimeToolCall: (@Sendable (String, String, String) async -> String?)? = nil
         ) async throws -> BidirectionalVoiceTurnResult {
+            self.handleRealtimeToolCall = handleRealtimeToolCall
             try Task.checkCancellation()
             guard !isCancelled else { throw CancellationError() }
             stopInputCapture()
@@ -1136,6 +1407,10 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
                 if (type == "response.output_audio.delta" || type == "response.audio.delta"),
                    let delta = event["delta"] as? String,
                    let chunk = Data(base64Encoded: delta) {
+                    if let itemID = event["item_id"] as? String {
+                        currentAssistantItemID = itemID
+                    }
+                    playedAudioBytes += chunk.count
                     let samples = OpenAIRealtimeSpeechClient.int16Samples(fromLittleEndianPCM: chunk)
                     let frames = await MainActor.run {
                         TTSStreamingPlaybackEngine.scheduleSamples(
@@ -1168,10 +1443,32 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
                 } else if type == "response.function_call_arguments.done",
                           let name = event["name"] as? String {
                     let arguments = event["arguments"] as? String
+                    let callID = event["call_id"] as? String
                     let routedTranscript = Self.transcriptArgument(from: arguments) ?? userTranscript
                     if !routedTranscript.isEmpty {
                         userTranscript = routedTranscript
                         await MainActor.run { onUserTranscript(routedTranscript) }
+                    }
+                    // In-session tool execution (clicky-mac parity) — only
+                    // for openclicky_use_screen_context. Agent tools still
+                    // take the outer app-level route (they intentionally
+                    // break out of realtime to trigger background agent).
+                    if name == "openclicky_use_screen_context",
+                       let handler = handleRealtimeToolCall,
+                       let callID {
+                        Task { [webSocket] in
+                            let output = await handler(name, arguments ?? "", callID)
+                                ?? #"{"error":"internal_error"}"#
+                            await Self.postToolResult(
+                                on: webSocket,
+                                callID: callID,
+                                output: output
+                            )
+                        }
+                        // do NOT break — receive loop keeps reading audio
+                        // deltas from the follow-up response.create the
+                        // server issues after our function_call_output.
+                        continue
                     }
                     let routed = await MainActor.run {
                         routeRealtimeToolCallBeforeAssistantResponse?(
@@ -1271,6 +1568,42 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
             return trimmed.isEmpty ? nil : trimmed
         }
 
+        /// Post a tool result back into an active realtime WS. Two-message
+        /// sequence per OpenAI Realtime API: (1) `conversation.item.create`
+        /// with type `function_call_output` carrying `call_id` + JSON
+        /// `output`; (2) `response.create` so the server generates the
+        /// spoken follow-up. Fire-and-forget — errors here just get logged
+        /// upstream by the receive loop when audio never arrives.
+        fileprivate static func postToolResult(
+            on webSocket: URLSessionWebSocketTask,
+            callID: String,
+            output: String
+        ) async {
+            let toolItem: [String: Any] = [
+                "type": "conversation.item.create",
+                "item": [
+                    "type": "function_call_output",
+                    "call_id": callID,
+                    "output": output
+                ]
+            ]
+            let createResponse: [String: Any] = [
+                "type": "response.create"
+            ]
+            do {
+                if let data = try? JSONSerialization.data(withJSONObject: toolItem),
+                   let str = String(data: data, encoding: .utf8) {
+                    try await webSocket.send(.string(str))
+                }
+                if let data = try? JSONSerialization.data(withJSONObject: createResponse),
+                   let str = String(data: data, encoding: .utf8) {
+                    try await webSocket.send(.string(str))
+                }
+            } catch {
+                // silent — receive loop surfaces downstream absence of audio.
+            }
+        }
+
         private static func firstFunctionCall(in event: [String: Any]) -> (name: String, arguments: String?)? {
             guard let response = event["response"] as? [String: Any],
                   let output = response["output"] as? [[String: Any]] else {
@@ -1284,6 +1617,56 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
         }
 
         private func sendJSON(_ payload: [String: Any]) async throws {
+            let data = try JSONSerialization.data(withJSONObject: payload)
+            guard let string = String(data: data, encoding: .utf8) else { return }
+            try await webSocket.send(.string(string))
+        }
+
+        /// Fire the §5.3 barge-in sequence: response.cancel →
+        /// input_audio_buffer.clear → conversation.item.truncate.
+        /// IDA-verified strings 0x1012caeee / 0x1012cae80 / 0x1012ccf40.
+        /// Truncate carries the last assistant item_id and the number
+        /// of milliseconds the client has already played.
+        func sendBargeInCancel() {
+            let webSocketRef = webSocket
+            let itemID = currentAssistantItemID
+            let audioEndMs = playedAudioMilliseconds
+            Task {
+                try? await sendJSONStandalone(["type": "response.cancel"], on: webSocketRef)
+                try? await sendJSONStandalone(["type": "input_audio_buffer.clear"], on: webSocketRef)
+                if let itemID {
+                    try? await sendJSONStandalone([
+                        "type": "conversation.item.truncate",
+                        "item_id": itemID,
+                        "content_index": 0,
+                        "audio_end_ms": audioEndMs
+                    ], on: webSocketRef)
+                }
+            }
+        }
+
+        /// Injects synthetic user text (e.g. guided_click_follow_up)
+        /// and requests a fresh assistant response. Demo-verified:
+        /// conversation.item.create + response.create.
+        func injectUserText(_ text: String) {
+            let webSocketRef = webSocket
+            Task {
+                try? await sendJSONStandalone([
+                    "type": "conversation.item.create",
+                    "item": [
+                        "type": "message",
+                        "role": "user",
+                        "content": [[
+                            "type": "input_text",
+                            "text": text
+                        ]]
+                    ]
+                ], on: webSocketRef)
+                try? await sendJSONStandalone(["type": "response.create"], on: webSocketRef)
+            }
+        }
+
+        private func sendJSONStandalone(_ payload: [String: Any], on webSocket: URLSessionWebSocketTask) async throws {
             let data = try JSONSerialization.data(withJSONObject: payload)
             guard let string = String(data: data, encoding: .utf8) else { return }
             try await webSocket.send(.string(string))
@@ -1402,6 +1785,33 @@ final class OpenAIRealtimeSpeechClient: OpenClickyTTSClient {
     private nonisolated func realtimeError(from event: [String: Any]) -> NSError {
         let errorPayload = event["error"] as? [String: Any]
         let message = errorPayload?["message"] as? String ?? "OpenAI Realtime playback failed."
+        let code = (errorPayload?["code"] as? String) ?? ""
+        let type = (errorPayload?["type"] as? String) ?? ""
+        // HeyClicky Free path: if the ephemeral was invalid/expired,
+        // drop it from cache so the next connect mints a fresh one.
+        // Match on OpenAI Realtime error taxonomy: invalid_authentication
+        // / invalid_api_key / expired_token / any explicit 401.
+        let lowered = "\(code) \(type) \(message)".lowercased()
+        if lowered.contains("invalid_authentication")
+            || lowered.contains("invalid_api_key")
+            || lowered.contains("expired")
+            || lowered.contains("401") {
+            // A bad WS Bearer only proves the *ephemeral* is stale —
+            // NOT that the user's Supabase session is dead. Only drop
+            // the ephemeral cache; leave sign-in state alone so we
+            // don't kick the user out of HeyClicky Free for a WS retry.
+            HeyClickyLog.log("realtime.ephemeral_invalid", direction: "error", [
+                "code": code,
+                "type": type
+            ])
+            HeyClickySessionTokenClient.shared.invalidateAll()
+        } else {
+            HeyClickyLog.log("realtime.ws_error", direction: "error", [
+                "code": code,
+                "type": type,
+                "message": message
+            ])
+        }
         return NSError(domain: "OpenAIRealtimeSpeechClient", code: -2, userInfo: [NSLocalizedDescriptionKey: message])
     }
 

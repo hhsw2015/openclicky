@@ -10,10 +10,20 @@ struct OpenClickyProfileTests {
         return defaults
     }
 
-    @Test func catalogExposesThreeProfiles() {
+    @Test func catalogExposesSixProfiles() {
         let ids = OpenClickyProfileCatalog.all.map(\.id)
-        #expect(ids == ["local", "realtime", "quality"])
+        #expect(ids == ["local", "realtime", "quality", "heyclicky_free", "ski_mode", "mirage"])
         #expect(OpenClickyProfileCatalog.defaultProfileID == "local")
+    }
+
+    @Test func mirageProfileDefaultsToFreeTierProviders() {
+        let mirage = OpenClickyProfileCatalog.profile(withID: "mirage")
+        #expect(mirage.id == "mirage")
+        #expect(mirage.displayName == "Peeky Free")
+        #expect(mirage.sttProvider == BuddyTranscriptionProviderID.mirageDeepgram.rawValue)
+        #expect(mirage.ttsProvider == OpenClickyTTSProvider.mirageCartesia.rawValue)
+        #expect(mirage.responseModelID == "mirage/claude-fable-5")
+        #expect(mirage.agentModelID == "mirage/claude-haiku-4-5-20251001")
     }
 
     @Test func taskCompletionVoiceDefaultsOn() {

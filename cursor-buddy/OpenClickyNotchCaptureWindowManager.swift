@@ -58,6 +58,11 @@ final class OpenClickyNotchCaptureWindowManager {
     private var persistentAgentLiveActivity = OpenClickyAgentLiveActivity()
     private var currentVoicePhase: OpenClickyNotchVoicePhase = .idle
     private var currentAudioPowerLevel: CGFloat = 0
+    /// When non-nil, the voice pill's title is replaced by this caption
+    /// (e.g. "正在为你自动续期额度…"). Cleared when the recovery pipeline
+    /// posts `.ready`. Wired from CompanionManager's
+    /// `heyClickyStatusCaption` binding.
+    private var backendStatusOverrideCaption: String?
     private var isUsingDynamicNotchKitStatusSurface = false
     private var anchorScreenOverride: NSScreen?
     private var keepAnchorForNextMainPanelOpen = false
@@ -117,6 +122,7 @@ final class OpenClickyNotchCaptureWindowManager {
     private static let contextAffordanceCooldown: TimeInterval = 12
 
     init() {
+        Self.shared = self
         mainPanelContentSizeObserver = NotificationCenter.default.addObserver(
             forName: .clickyPanelContentSizeDidChange,
             object: nil,
@@ -129,7 +135,7 @@ final class OpenClickyNotchCaptureWindowManager {
         }
         let foregroundApp = Self.detectForegroundApp()
         foregroundAppIcon = foregroundApp.icon
-        foregroundAppName = foregroundApp.name
+        foregroundAppName = Self.appNameWithSKISuffix(foregroundApp.name)
         foregroundAppActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
@@ -157,10 +163,50 @@ final class OpenClickyNotchCaptureWindowManager {
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            // FIX(perf-2026-08-01): defaults changes fire on ANY key
+            // write across the app (60+ writers). Refreshing accent
+            // synchronously on each triggered a full panel didSet
+            // cascade (needsDisplay=true on 6+ layer properties).
+            // Coalesce to a single deferred refresh per runloop tick.
+            self?.scheduleAccentRefreshCoalesced()
+        }
+        // When a CLI agent connects/disconnects from the UDS, the
+        // SKI status dot in the collapsed pill label needs to flip.
+        // Redraw whatever mode we're currently in.
+        NotificationCenter.default.addObserver(
+            forName: OpenClickyAgentsSocketServer.connectionsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
             Task { @MainActor [weak self] in
-                self?.refreshAccentColorFromDefaults()
+                guard let self else { return }
+                let refreshed = Self.appNameWithSKISuffix(self.rawForegroundAppName())
+                self.foregroundAppName = refreshed
+                self.contentView?.updateForegroundApp(icon: self.foregroundAppIcon, name: refreshed)
             }
         }
+    }
+
+    /// The un-suffixed foreground app name — used when the SKI
+    /// suffix helper needs to re-compute the label from scratch.
+    private func rawForegroundAppName() -> String {
+        let currentApp = NSWorkspace.shared.frontmostApplication
+        return currentApp?.localizedName
+            ?? currentApp?.bundleURL?.deletingPathExtension().lastPathComponent
+            ?? "Current app"
+    }
+
+    private var accentRefreshWorkItem: DispatchWorkItem?
+    @MainActor
+    private func scheduleAccentRefreshCoalesced() {
+        accentRefreshWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.refreshAccentColorFromDefaults()
+        }
+        accentRefreshWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80),
+                                      execute: item)
     }
 
     deinit {
@@ -259,6 +305,14 @@ final class OpenClickyNotchCaptureWindowManager {
     ) -> Bool {
         #if canImport(DynamicNotchKit)
         guard let screen, Self.hasPhysicalNotch(on: screen) else { return false }
+        // When the assist agent has a caption that's too long for the
+        // DynamicNotchKit fixed-title layout, fall back to our own
+        // width-adaptive status panel so the text fits. DynamicNotchKit
+        // otherwise renders only the phase icon and clips long text.
+        let assistCaption = AssistAgentRegistry.shared.notchPillCaption ?? ""
+        if assistCaption.count > 4 {
+            return false  // let showFallbackStatusPanel take over
+        }
         dynamicNotchKitBridge.showVoice(
             voicePhase,
             audioPowerLevel: audioPowerLevel,
@@ -339,6 +393,14 @@ final class OpenClickyNotchCaptureWindowManager {
             dynamicNotchKitBridge.updateAgentLiveActivity(activity)
         }
 
+        // If the notch pill is currently showing voice, re-render it so
+        // the freshly-updated agent detail line appears/updates under the
+        // voice title. Otherwise voice-triggered agent runs would show
+        // stale "Thinking…" for the whole duration.
+        if activeMode == .voice {
+            updateVoiceState(currentVoicePhase, audioPowerLevel: currentAudioPowerLevel)
+        }
+
         guard activeMode == .collapsedText else { return }
         contentView?.setAgentWorkActive(activity.isActive, foregroundAppName: foregroundAppName)
     }
@@ -411,6 +473,22 @@ final class OpenClickyNotchCaptureWindowManager {
         showTextInput(accentTheme: accentTheme, submitText: submitText)
     }
 
+    /// Update the caption shown in the voice pill from the backend
+    /// recovery pipeline. Pass nil to clear. When set, the caption
+    /// replaces the phase-derived text ("Listening"/"Thinking"/etc.)
+    /// so the user always sees what's REALLY happening — including
+    /// "正在续期额度…" during auto-reset.
+    func updateBackendStatusCaption(_ caption: String?) {
+        let normalized = caption?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let next: String? = (normalized?.isEmpty == false) ? normalized : nil
+        guard next != backendStatusOverrideCaption else { return }
+        backendStatusOverrideCaption = next
+        // Re-render whatever phase is currently active with the new caption.
+        if activeMode == .voice {
+            updateVoiceState(currentVoicePhase, audioPowerLevel: currentAudioPowerLevel)
+        }
+    }
+
     func updateVoiceState(_ voicePhase: OpenClickyNotchVoicePhase, audioPowerLevel: CGFloat) {
         currentVoicePhase = voicePhase
         currentAudioPowerLevel = audioPowerLevel
@@ -439,6 +517,8 @@ final class OpenClickyNotchCaptureWindowManager {
                 foregroundAppIcon: foregroundAppIcon,
                 foregroundAppName: foregroundAppName,
                 hidesStatusText: hidesStatusText,
+                overrideCaption: backendStatusOverrideCaption,
+                agentDetail: persistentAgentLiveActivity.isActive ? persistentAgentLiveActivity.detail : nil,
                 expand: { [weak self] in
                     self?.pinAnchorScreenToActiveInteractionIfNeeded()
                     self?.persistentShowMainPanel?()
@@ -472,7 +552,17 @@ final class OpenClickyNotchCaptureWindowManager {
     }
 
     func hide() {
+        let windowNum = panel?.windowNumber ?? 0
         panel?.orderOut(nil)
+        HeyClickyLog.log(
+            "openclicky.window.dismissed.notch_capture_status",
+            lane: "system",
+            direction: "internal",
+            [
+                "window_num": windowNum,
+                "reason": "hide",
+            ]
+        )
         hideDynamicNotchKitStatusSurface()
         hideMainPanel(restoresStatusSurface: false)
         stopCollapsedHoverProbe()
@@ -482,7 +572,17 @@ final class OpenClickyNotchCaptureWindowManager {
     }
 
     private func hideMainPanel(restoresStatusSurface: Bool = true) {
+        let mainPanelNum = mainPanel?.windowNumber ?? 0
         mainPanel?.orderOut(nil)
+        HeyClickyLog.log(
+            "openclicky.window.dismissed.notch_capture_main",
+            lane: "system",
+            direction: "internal",
+            [
+                "window_num": mainPanelNum,
+                "reason": "hideMainPanel",
+            ]
+        )
         mainPanelContentResizeWorkItem?.cancel()
         mainPanelContentResizeWorkItem = nil
         mainPanelOpenSettlingWorkItem?.cancel()
@@ -654,6 +754,21 @@ final class OpenClickyNotchCaptureWindowManager {
             panel?.orderFrontRegardless()
         }
         panel?.orderFrontRegardless()
+        if let p = panel {
+            HeyClickyLog.log(
+                "openclicky.window.installed.notch_capture_status",
+                lane: "system",
+                direction: "internal",
+                [
+                    "window_num": p.windowNumber,
+                    "size_w": Int(p.frame.width),
+                    "size_h": Int(p.frame.height),
+                    "level": p.level.rawValue,
+                    "alpha": Double(p.alphaValue),
+                    "purpose": "notch_status_pill_or_input",
+                ]
+            )
+        }
     }
 
     private func showFallbackStatusPanel(width: CGFloat, height: CGFloat) {
@@ -677,6 +792,21 @@ final class OpenClickyNotchCaptureWindowManager {
             mainPanel?.orderFrontRegardless()
         }
         mainPanel?.orderFrontRegardless()
+        if let p = mainPanel {
+            HeyClickyLog.log(
+                "openclicky.window.installed.notch_capture_main",
+                lane: "system",
+                direction: "internal",
+                [
+                    "window_num": p.windowNumber,
+                    "size_w": Int(p.frame.width),
+                    "size_h": Int(p.frame.height),
+                    "level": p.level.rawValue,
+                    "alpha": Double(p.alphaValue),
+                    "purpose": "notch_capture_main_panel",
+                ]
+            )
+        }
         installMainPanelEscapeKeyMonitor()
         installMainPanelClickOutsideMonitors()
         refreshFallbackStatusPanelOrderingIfNeeded()
@@ -957,6 +1087,18 @@ final class OpenClickyNotchCaptureWindowManager {
         let targetFrame = constrainedMainPanelFrame(NSRect(origin: origin, size: size))
 
         guard targetFrame.integral != mainPanel.frame.integral else { return }
+        // FIX(task #326 UI-10): skip micro-resizes (< 8pt height delta,
+        // no width change). Under a busy SKI tool_call burst
+        // `activityStatusLines` mutates rapidly; each mutation posted
+        // .clickyMainPanelResizeStateDidChange which triggered a full
+        // `setFrame` even when the fitted height moved by 1-2 pt.
+        // That's the source of the observed jitter.
+        let heightDelta = abs(targetFrame.height - mainPanel.frame.height)
+        let widthDelta = abs(targetFrame.width - mainPanel.frame.width)
+        let originYDelta = abs(targetFrame.origin.y - mainPanel.frame.origin.y)
+        if !animated, heightDelta < 8, widthDelta < 1, originYDelta < 8 {
+            return
+        }
 
         let updateHostingFrame = { [weak self] in
             self?.mainHostingView?.frame = NSRect(origin: .zero, size: size)
@@ -1207,7 +1349,13 @@ final class OpenClickyNotchCaptureWindowManager {
 
     private func startCollapsedHoverProbe() {
         guard collapsedHoverProbeTimer == nil else { return }
-        let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
+        // FIX(perf-2026-08-01): 80 ms timer = 12.5 Hz, and each fire
+        // called `probeCollapsedNotchHover` which scans every NSScreen
+        // to test mouse position. On multi-display setups that's a
+        // per-screen sync round-trip 12× per second, all on main.
+        // Lower to 250 ms (4 Hz) — hover-in perception latency still
+        // human-imperceptible while cutting main-thread wake cost 3×.
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.probeCollapsedNotchHover()
             }
@@ -1288,19 +1436,31 @@ final class OpenClickyNotchCaptureWindowManager {
 
 
     private static func notchHoverRegion(on screen: NSScreen) -> NSRect {
-        let baseWidth = collapsedPanelWidth(for: screen) + 28
-        let physicalNotchWidth = hasPhysicalNotch(on: screen)
+        // Hover region should match what the user SEES, not a wide
+        // catchment. Previously this inflated by +28 wide × +28 tall
+        // and pulled the bottom edge down 16pt, so cursors near the
+        // top of the screen but nowhere near the pill triggered expand.
+        // Now: exactly the pill footprint on side-notch screens, and
+        // exactly the physical notch cutout + a small 6pt border for
+        // Fitts on notch-having screens.
+        let physicalNotch = hasPhysicalNotch(on: screen)
             ? (physicalNotchWidth(on: screen) ?? 0)
             : 0
-        // DynamicNotchKit's compact SwiftUI content only lives on the small
-        // leading/trailing icon areas. Keep the global hover probe wide enough
-        // to include the black physical notch itself so hovering the main
-        // island surface opens it, not just the icons.
-        let width = max(baseWidth, physicalNotchWidth + 72, 196)
-        let height = max(collapsedPanelHeight + 28, 48)
+        let pillWidth = collapsedPanelWidth(for: screen)
+        let width: CGFloat
+        if physicalNotch > 0 {
+            // Snap to the black island itself — the hover target IS
+            // the physical notch. Small 6pt border so a 1-pixel-off
+            // pointer still counts.
+            width = physicalNotch + 12
+        } else {
+            width = pillWidth
+        }
+        let height = collapsedPanelHeight
+        let size = NSSize(width: width, height: height)
         return NSRect(
             x: screen.frame.midX - width / 2,
-            y: statusLozengeY(for: NSSize(width: width, height: height), on: screen) - 16,
+            y: statusLozengeY(for: size, on: screen),
             width: width,
             height: height
         )
@@ -1340,26 +1500,78 @@ final class OpenClickyNotchCaptureWindowManager {
         guard let screen else { return Self.minimumBuiltInCollapsedPanelWidth }
 
         if isLikelyBuiltInNotchScreen(screen) {
-            // On the built-in MacBook Pro notch display, voice state is carried
-            // by iconography only: foreground app icon, phase icon, and the
-            // right-side live indicator.
-            return Self.compactBuiltInVoicePanelWidth
+            // On the built-in MacBook Pro notch display, voice state
+            // is normally carried by icons only ("Speaking" / "Ready"
+            // etc. fit the compact pill fine). We ONLY widen the pill
+            // when the assist agent is running AND its caption is
+            // long enough that it would visibly truncate — otherwise
+            // stick to the compact icon-first layout.
+            let base = Self.compactBuiltInVoicePanelWidth
+            let caption = Self.currentAssistCaption()
+            let compactCaptionCharLimit = 4  // 4 CJK chars fit the compact pill
+            guard caption.count > compactCaptionCharLimit else { return base }
+            // Widen aggressively for long file paths — a full path
+            // like /Users/name/Dev/proj/foo/bar/baz.md deserves the
+            // extra pixels so the user knows exactly what's running.
+            let perChar: CGFloat = 12   // slightly narrower per-char = more headroom
+            let extra = CGFloat(caption.count - compactCaptionCharLimit) * perChar + 24
+            let maxWidth: CGFloat = min(screen.frame.width * 0.80, 720)
+            return min(maxWidth, base + extra)
         }
 
         let preferredWidth = expandedStatusPanelWidth(for: screen)
+        // Assist-agent caption widening also applies to non-built-in
+        // (external) displays. If the caption would clip at the
+        // default width, extend up to a screen-relative cap.
+        let caption = Self.currentAssistCaption()
+        let compactLimit = 4
+        var widened = preferredWidth
+        if caption.count > compactLimit {
+            let perChar: CGFloat = 12
+            let extra = CGFloat(caption.count - compactLimit) * perChar + 24
+            let capacity: CGFloat = min(screen.frame.width * 0.80, 720)
+            widened = min(capacity, preferredWidth + extra)
+        }
         guard usesWideExternalNonNotchedStatusPill(on: screen) else {
-            return preferredWidth
+            return widened
         }
         return min(
-            Self.maximumExternalNonNotchedStatusPanelWidth,
-            max(Self.minimumExternalNonNotchedStatusPanelWidth, preferredWidth)
+            max(Self.maximumExternalNonNotchedStatusPanelWidth, widened),
+            max(Self.minimumExternalNonNotchedStatusPanelWidth, widened)
         )
     }
 
     private static func hidesVoiceStatusText(on screen: NSScreen?) -> Bool {
         guard let screen else { return false }
-        return isLikelyBuiltInNotchScreen(screen)
+        // Normally the built-in notch is icon-only. Only show text
+        // when the assist agent has a caption AND it's long enough
+        // to warrant the widening (otherwise the compact icon-only
+        // layout is preserved for short phase labels).
+        if isLikelyBuiltInNotchScreen(screen) {
+            let caption = Self.currentAssistCaption()
+            return caption.count <= 4  // ≤ 4 chars → keep icon-only
+        }
+        return false
     }
+
+    /// Reach into AssistAgentRegistry to read the pill caption
+    /// synchronously. Returns "" when nothing is active. MainActor-
+    /// isolated read; called only from MainActor callers.
+    @MainActor
+    private static func currentAssistCaption() -> String {
+        // The assist-agent path publishes into `notchPillCaption`; the
+        // SKI / backend path publishes via `updateBackendStatusCaption`
+        // → `backendStatusOverrideCaption` (instance-level). Return
+        // the longer of the two so notch widening + text visibility
+        // fire for either source.
+        let assist = AssistAgentRegistry.shared.notchPillCaption ?? ""
+        let backend = shared?.backendStatusOverrideCaption ?? ""
+        return backend.count > assist.count ? backend : assist
+    }
+
+    /// Weakly-held handle so the static caption resolver can read the
+    /// current instance's backend caption without holding a hard ref.
+    private static weak var shared: OpenClickyNotchCaptureWindowManager?
 
     private static func isPlaceholderAppName(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
@@ -1605,7 +1817,7 @@ final class OpenClickyNotchCaptureWindowManager {
         } else {
             foregroundAppIcon = nil
         }
-        foregroundAppName = name
+        foregroundAppName = Self.appNameWithSKISuffix(name)
         contentView?.updateForegroundApp(icon: foregroundAppIcon, name: foregroundAppName)
         if isUsingDynamicNotchKitStatusSurface {
             dynamicNotchKitBridge.updateForegroundApp(icon: foregroundAppIcon, name: foregroundAppName)
@@ -1842,6 +2054,35 @@ final class OpenClickyNotchCaptureWindowManager {
         resizeAndReposition(width: primaryWidth, height: height)
     }
 
+    /// When SKI Mode is the active profile and a workspace is bound
+    /// (either pinned or auto-resolved), append " · <workspace-dir>"
+    /// to the collapsed pill's app-name label so the user sees which
+    /// project their voice is being routed to without opening any
+    /// panel. Non-SKI profiles or no workspace: unchanged.
+    static func appNameWithSKISuffix(_ name: String) -> String {
+        let base = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard OpenClickyProfileCatalog.activeProfile().id == "ski_mode" else {
+            return base
+        }
+        let pinned = UserDefaults.standard.string(forKey: "openclicky.voice.pinnedActiveProjectRoot")
+        let workspacePath: String?
+        if let pinned, !pinned.isEmpty {
+            workspacePath = pinned
+        } else if let auto = OpenClickyWorkspaceResolver.resolveActiveWorkspace() {
+            workspacePath = auto.path
+        } else {
+            workspacePath = nil
+        }
+        guard let path = workspacePath, !path.isEmpty else { return base }
+        let dir = (path as NSString).lastPathComponent
+        // Per-workspace status dot: only green when a CLI agent has
+        // announced itself for THIS specific project-root over the
+        // UDS. Filled circle = connected, hollow = not connected.
+        let hasConnection = OpenClickyAgentsSocketServer.connectionCount(forRoot: path) > 0
+        let statusMark = hasConnection ? "●" : "○"
+        return "\(statusMark) \(dir)"
+    }
+
     private static func detectForegroundApp() -> (icon: NSImage?, name: String) {
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != Bundle.main.bundleIdentifier else {
@@ -1970,7 +2211,14 @@ private final class OpenClickyNotchCaptureRootView: NSView {
     }
 
     deinit {
+        // FIX(perf-2026-08-01 mem-audit #7): `removeObserver(self)` does
+        // not release block-based observer tokens. Explicitly remove
+        // the stored token so the UserDefaults observer doesn't leak.
         NotificationCenter.default.removeObserver(self)
+        if let t = shellFillObserverToken {
+            NotificationCenter.default.removeObserver(t)
+        }
+        shellFillCoalesceItem?.cancel()
     }
 
     private func updateShellViewFillColor() {
@@ -2034,6 +2282,8 @@ private final class OpenClickyNotchCaptureRootView: NSView {
         foregroundAppIcon: NSImage?,
         foregroundAppName: String,
         hidesStatusText: Bool = false,
+        overrideCaption: String? = nil,
+        agentDetail: String? = nil,
         expand: (() -> Void)? = nil
     ) {
         mode = .voice
@@ -2060,7 +2310,7 @@ private final class OpenClickyNotchCaptureRootView: NSView {
         shellView.roundedShadowOffset = .zero
         updateAccentColors()
         updateForegroundApp(icon: foregroundAppIcon, name: foregroundAppName)
-        updateVoiceLabels(for: phase, foregroundAppName: foregroundAppName, hidesStatusText: hidesStatusText)
+        updateVoiceLabels(for: phase, foregroundAppName: foregroundAppName, hidesStatusText: hidesStatusText, overrideCaption: overrideCaption, agentDetail: agentDetail)
         waveformView.audioPowerLevel = audioPowerLevel
         waveformView.accentColor = accentColor
         updateShellConstraints(animated: true)
@@ -2204,7 +2454,14 @@ private final class OpenClickyNotchCaptureRootView: NSView {
                 self.voiceStackTrailingConstraint?.constant = -OpenClickyNotchCaptureWindowManager.builtInVoiceTrailingInset
                 
                 self.voiceNotchSpacer.isHidden = false
-                self.voiceCopyStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+                // When an assist caption is on the pill, let the text
+                // stack expand to fill the widened pill; otherwise keep
+                // the tight built-in-notch layout so idle Speaking /
+                // Ready state doesn't visually shift.
+                let hasAssistCaption = !(AssistAgentRegistry.shared.notchPillCaption?.isEmpty ?? true)
+                self.voiceCopyStack.setContentHuggingPriority(
+                    hasAssistCaption ? .defaultLow : .defaultHigh,
+                    for: .horizontal)
             } else {
                 self.collapsedStackLeadingConstraint?.constant = 10
                 self.collapsedPlayIconTrailingConstraint?.constant = -OpenClickyNotchCaptureWindowManager.externalStatusTrailingInset
@@ -2257,16 +2514,33 @@ private final class OpenClickyNotchCaptureRootView: NSView {
         }
     }
 
+    private var shellFillObserverToken: NSObjectProtocol?
+    private var shellFillCoalesceItem: DispatchWorkItem?
+
     private func buildViewHierarchy() {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
 
-        NotificationCenter.default.addObserver(
+        // FIX(perf-2026-08-01 mem-audit #7): previously discarded the
+        // token → observer never removed AND every UserDefaults write
+        // in the app (60+ writers/day) triggered a shell fill refresh.
+        // Store token + coalesce writes with 80 ms debounce.
+        if let old = shellFillObserverToken {
+            NotificationCenter.default.removeObserver(old)
+        }
+        shellFillObserverToken = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.updateShellViewFillColor()
+            guard let self else { return }
+            self.shellFillCoalesceItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                self?.updateShellViewFillColor()
+            }
+            self.shellFillCoalesceItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80),
+                                          execute: item)
         }
 
         notchHandle.translatesAutoresizingMaskIntoConstraints = false
@@ -2416,9 +2690,13 @@ private final class OpenClickyNotchCaptureRootView: NSView {
         voiceCopyStack.orientation = .vertical
         voiceCopyStack.alignment = .leading
         voiceCopyStack.spacing = 0
+        // Text stack claims extra pill width first. Notch spacer +
+        // waveform give ground when a long assist caption arrives,
+        // so the file path becomes visible instead of clipping.
         voiceCopyStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        voiceCopyStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        voiceNotchSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        voiceCopyStack.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        voiceTitleLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        voiceNotchSpacer.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         voiceNotchSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         voiceTitleLabel.font = .systemFont(ofSize: 14, weight: .heavy)
         voiceTitleLabel.textColor = NSColor.white.withAlphaComponent(0.96)
@@ -2454,8 +2732,14 @@ private final class OpenClickyNotchCaptureRootView: NSView {
         // edge and the live indicator hugs the trailing edge instead of both
         // components clustering in the center of the notch.
         voiceNotchSpacer.widthAnchor.constraint(greaterThanOrEqualToConstant: 4).isActive = true
+        // Prefer that the text label eats extra pill width instead
+        // of the notch-spacer. When an assist caption is running the
+        // caption often exceeds the base pill width; the spacer's
+        // 64-px expansion desire would keep the label clipped. Only
+        // ask the spacer to widen when there's NO active assist
+        // caption — then normal Speaking / Ready layout looks nice.
         let voiceSpacerExpansionConstraint = voiceNotchSpacer.widthAnchor.constraint(greaterThanOrEqualToConstant: 64)
-        voiceSpacerExpansionConstraint.priority = .defaultLow
+        voiceSpacerExpansionConstraint.priority = NSLayoutConstraint.Priority(1)
         voiceSpacerExpansionConstraint.isActive = true
         waveformView.widthAnchor.constraint(equalToConstant: 14).isActive = true
         waveformView.heightAnchor.constraint(equalToConstant: 8).isActive = true
@@ -2482,9 +2766,19 @@ private final class OpenClickyNotchCaptureRootView: NSView {
         shellView.needsDisplay = true
     }
 
-    private func updateVoiceLabels(for phase: OpenClickyNotchVoicePhase, foregroundAppName _: String, hidesStatusText: Bool) {
-        voiceSubtitleLabel.stringValue = ""
-        voiceSubtitleLabel.isHidden = true
+    private func updateVoiceLabels(for phase: OpenClickyNotchVoicePhase, foregroundAppName _: String, hidesStatusText: Bool, overrideCaption: String? = nil, agentDetail: String? = nil) {
+        // Show agent progress line under voice title so the user sees the
+        // agent's live status ("Writing the response", "Planning next steps"…)
+        // even while the pill is in voice mode. This closes the "I said start
+        // this task → notch just says Thinking forever" gap.
+        let cleanedAgentDetail = agentDetail?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let cleanedAgentDetail, !cleanedAgentDetail.isEmpty, !hidesStatusText {
+            voiceSubtitleLabel.stringValue = cleanedAgentDetail
+            voiceSubtitleLabel.isHidden = false
+        } else {
+            voiceSubtitleLabel.stringValue = ""
+            voiceSubtitleLabel.isHidden = true
+        }
         voiceTitleLabel.isHidden = hidesStatusText
         voiceCopyStack.isHidden = hidesStatusText
         voicePhaseIconView.isHidden = !hidesStatusText
@@ -2508,8 +2802,31 @@ private final class OpenClickyNotchCaptureRootView: NSView {
             symbolName = "checkmark.circle.fill"
             waveformView.isActive = false
         }
+        // Backend recovery caption overrides the phase title so the user
+        // sees "正在为你自动续期额度…" instead of a stale "Thinking" while
+        // auto-reset runs behind the scenes.
+        if let override = overrideCaption, !override.isEmpty {
+            voiceTitleLabel.stringValue = override
+        }
         voicePhaseIconView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: voiceTitleLabel.stringValue)
         voicePhaseIconView.contentTintColor = accentColor
+        // Compact mode (physical-notch adjacent): the copy stack is hidden
+        // so only the icon shows. Attach a tooltip that carries the
+        // full phrase (title + optional recovery caption + agent detail)
+        // so hovering explains what the icon means. Without this the
+        // user sees `waveform`/`brain.head.profile` with no context.
+        if hidesStatusText {
+            var lines: [String] = [voiceTitleLabel.stringValue]
+            if let override = overrideCaption, !override.isEmpty, !lines.contains(override) {
+                lines.append(override)
+            }
+            if let cleanedAgentDetail, !cleanedAgentDetail.isEmpty, !lines.contains(cleanedAgentDetail) {
+                lines.append(cleanedAgentDetail)
+            }
+            voicePhaseIconView.toolTip = lines.joined(separator: " — ")
+        } else {
+            voicePhaseIconView.toolTip = nil
+        }
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }

@@ -1,0 +1,75 @@
+{
+  "_note": "Anchor examples for the embedding-based query classifier. Add rows to any category to expand recall — the classifier averages cosine similarity between the user's query embedding and every anchor in each category, then picks the winning category. Zero hardcoded rules; edit this file to reshape behavior.",
+  "categories": [
+    {
+      "id": "world_knowledge",
+      "description": "General facts that don't depend on the user's own history/screen.",
+      "action": "skip_memory_retrieval",
+      "anchors": [
+        "水的沸点是多少摄氏度",
+        "苹果公司哪年成立",
+        "牛顿三大定律是什么",
+        "光速是多少",
+        "太阳系有几颗行星",
+        "What is the boiling point of water",
+        "Who is the president of the United States",
+        "When was the moon landing",
+        "Explain quantum entanglement",
+        "How does photosynthesis work"
+      ]
+    },
+    {
+      "id": "past_memory",
+      "description": "Refers to something the user did, saw, or asked previously.",
+      "action": "retrieve_from_vault",
+      "anchors": [
+        "我上周做过什么",
+        "我之前问过 kafka 的什么",
+        "刚才那个项目代号叫什么",
+        "上次跟你聊的那个方案",
+        "我最近在读的那本书",
+        "记得我告诉过你的 API key 吗",
+        "What did I tell you earlier about my stack",
+        "Show me the file I was editing yesterday",
+        "Remind me what we decided last time",
+        "Did I mention my deadline",
+        "Where did I leave off on the report"
+      ]
+    },
+    {
+      "id": "live_context",
+      "description": "Refers to whatever is currently on screen or the current active app.",
+      "action": "attach_screenshot_and_frontmost",
+      "anchors": [
+        "我现在在哪个应用",
+        "屏幕上这个报错什么意思",
+        "帮我看下这段代码",
+        "这个页面里有什么",
+        "当前窗口是啥",
+        "这里显示的数字对吗",
+        "What is on my screen right now",
+        "Explain this error visible here",
+        "Read the text in this window",
+        "Point at the save button",
+        "Highlight the login field"
+      ]
+    },
+    {
+      "id": "recent_conv",
+      "description": "Direct follow-up to the last few voice / chat exchanges.",
+      "action": "use_conversation_history_only",
+      "anchors": [
+        "你刚才怎么回答的",
+        "接着刚才说",
+        "再多说一点",
+        "换个方式说",
+        "总结下我们刚才聊的",
+        "So what did you say a moment ago",
+        "Elaborate on your last answer",
+        "Continue from where we left off",
+        "Rephrase that",
+        "Summarize this conversation"
+      ]
+    }
+  ]
+}
