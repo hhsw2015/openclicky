@@ -183,10 +183,15 @@ enum OpenClickyConnectorCredentialStore {
     static func listConnections(
         providerId: String? = nil
     ) throws -> [OpenClickyConnectorConnectionSummary] {
+        // NOTE: `kSecReturnData: true` together with `kSecMatchLimitAll` is
+        // rejected outright with errSecParam (-50) — Security will not stream
+        // payloads for an unbounded match. This query used to request both,
+        // so listConnections() ALWAYS threw and never returned a single
+        // connection. Ask for attributes here; the payload for each hit is
+        // fetched individually below.
         var query: [String: Any] = [
             kSecClass as String: secClass,
             kSecReturnAttributes as String: true,
-            kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitAll
         ]
         if let providerId {
@@ -209,10 +214,21 @@ enum OpenClickyConnectorCredentialStore {
             let rawAccount = item[kSecAttrAccount as String] as? String ?? ""
             let connectionId: String? = rawAccount.isEmpty ? nil : rawAccount
 
+            // Second, bounded lookup per hit — the bulk query above cannot
+            // carry payloads. A single-item match may return data.
             var authType: String?
             var displayName: String?
             var accountId: String?
-            if let data = item[kSecValueData as String] as? Data,
+            var dataQuery: [String: Any] = [
+                kSecClass as String: secClass,
+                kSecAttrService as String: service,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne
+            ]
+            dataQuery[kSecAttrAccount as String] = rawAccount
+            var payload: CFTypeRef?
+            if SecItemCopyMatching(dataQuery as CFDictionary, &payload) == errSecSuccess,
+               let data = payload as? Data,
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 authType = obj["auth_type"] as? String
                 displayName = obj["display_name"] as? String

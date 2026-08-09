@@ -59,8 +59,14 @@ struct OpenClickyWhiteboardStrokeClassifierTests {
         for i in 0...30 {
             let t = CGFloat(i) / 30
             // Start at (0, 0), curve to (200, 60) with a mid-bump.
+            //
+            // Amplitude was 20, which gives straightness 0.98 -- a 20 pt bow
+            // across a 209 pt chord is a straight line by any measure, so the
+            // classifier correctly returned .underline and the test had been
+            // red since it was written. 140 puts straightness at 0.58, inside
+            // the [0.3, 0.75] band this test says it is exercising.
             let x = t * 200
-            let y = 60 * t + 20 * sin(t * .pi)
+            let y = 60 * t + 140 * sin(t * .pi)
             pts.append(CGPoint(x: x, y: y))
         }
         let result = OpenClickyWhiteboardStrokeClassifier.classifySingle(points: pts)
