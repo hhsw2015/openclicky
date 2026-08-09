@@ -1473,9 +1473,26 @@ guard let self else { throw CancellationError() }
     }
 
     static func computerUsePointingResolver(
-        selectedVoiceModelID _: String,
+        selectedVoiceModelID: String,
         selectedComputerUseModelID: String
     ) -> OpenClickyComputerUsePointingResolver {
+        // The voice model was accepted and discarded (`selectedVoiceModelID _`),
+        // so a live realtime voice session still routed pointing through
+        // whatever the computer-use setting said — typically Codex CLI. That
+        // means leaving the open realtime socket mid-turn to spawn a separate
+        // process, when the session already has vision and can answer inline.
+        //
+        // Realtime speech models take the direct Realtime API path (CLAUDE.md
+        // "Inference Routing", the stated exemption to the money rule), and
+        // that applies to pointing within such a session too.
+        // Test the id directly. `voiceAnalysisModel(withID:)` searches
+        // voiceResponseModels, and realtime ids live in speechModels, so it
+        // silently falls back to the default (gpt-5.5) for exactly the ids
+        // this check cares about.
+        if OpenClickyModelCatalog.isSpeechModelID(selectedVoiceModelID) {
+            return .openAIRealtime
+        }
+
         let pointingModel = OpenClickyModelCatalog.computerUseModel(withID: selectedComputerUseModelID)
         if pointingModel.provider == .openAI,
            OpenClickyModelCatalog.isSpeechModelID(pointingModel.id) {

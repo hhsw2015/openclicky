@@ -30,7 +30,10 @@ struct OpenClickyComputerUseTests {
         )
 
         #expect(status.isReadyForComputerUse)
-        #expect(status.summary == "Enabled · AX ready · screen ready · SkyLight keyboard ready · Safari")
+        // The fixture leaves fullDiskAccessLikelyGranted at its `false`
+        // default, so the summary correctly reports it as not detected. That
+        // segment was added to the summary after this expectation was written.
+        #expect(status.summary == "Enabled · AX ready · screen ready · SkyLight keyboard ready · Full Disk Access not detected · Safari")
         #expect(status.focusedTargetSummary == "Safari — OpenClicky Test · pid 1234 · window 42")
     }
 
@@ -88,7 +91,9 @@ struct OpenClickyComputerUseTests {
 
         #expect(capture.agentContextNote.contains("Screenshot is a proportional downsample of the focused window, not full native display pixels"))
         #expect(capture.agentContextNote.contains("xScale 1.2547"))
-        #expect(capture.agentContextNote.contains("yScale 1.2550"))
+        // 1089 / 867 = 1.25606 -> 1.2561. The old 1.2550 was simply the
+        // wrong number; the arithmetic in the note is correct.
+        #expect(capture.agentContextNote.contains("yScale 1.2561"))
     }
 
     @MainActor @Test func realtimeCompositeAppCommandIsNotReducedToOpenApp() throws {
@@ -218,14 +223,14 @@ struct OpenClickyComputerUseTests {
 
     @MainActor @Test func spotifySearchPlayRouteStaysOnComputerUseExecution() throws {
         let nativeMethods = CompanionManager.testSpotifySearchPlayExecutionMethods(for: .nativeSwift)
-        #expect(nativeMethods.started == "NSWorkspace.open_spotify_uri + OpenClickyNativeComputerUseController.pressKey + AppleScript playback verification")
-        #expect(nativeMethods.completed == "NSWorkspace.open_spotify_uri + OpenClickyNativeComputerUseController.pressKey + AppleScript playback verification")
+        #expect(nativeMethods.started == "NSWorkspace.open_spotify_uri + OpenClickyNativeComputerUseController.pressKey + AppleScript play retry + playback verification")
+        #expect(nativeMethods.completed == "NSWorkspace.open_spotify_uri + OpenClickyNativeComputerUseController.pressKey + AppleScript play retry + playback verification")
         #expect(nativeMethods.completed.localizedCaseInsensitiveContains("AppleScript"))
         #expect(nativeMethods.completed.localizedCaseInsensitiveContains("verification"))
 
         let backgroundMethods = CompanionManager.testSpotifySearchPlayExecutionMethods(for: .backgroundComputerUse)
-        #expect(backgroundMethods.started == "NSWorkspace.open_spotify_uri + BackgroundComputerUse /v1/press_key + AppleScript playback verification")
-        #expect(backgroundMethods.completed == "NSWorkspace.open_spotify_uri + BackgroundComputerUse /v1/press_key + AppleScript playback verification")
+        #expect(backgroundMethods.started == "NSWorkspace.open_spotify_uri + BackgroundComputerUse /v1/press_key + AppleScript play retry + playback verification")
+        #expect(backgroundMethods.completed == "NSWorkspace.open_spotify_uri + BackgroundComputerUse /v1/press_key + AppleScript play retry + playback verification")
         #expect(backgroundMethods.completed.localizedCaseInsensitiveContains("AppleScript"))
         #expect(backgroundMethods.completed.localizedCaseInsensitiveContains("verification"))
     }

@@ -14050,7 +14050,14 @@ final class CompanionManager: ObservableObject {
             "youtube",
             "youtube video"
         ]
-        return ambiguousTargets.contains(normalized)
+        if ambiguousTargets.contains(normalized) { return true }
+
+        // Generic quantifiers are a "just start playing" instruction, not a
+        // track title. "play anything in Spotify" was searching for a song
+        // called "anything in Spotify" and finding nothing; the playback
+        // control path already resolves it to a plain `play`.
+        let genericPattern = #"^(?:some|any)(?:thing|music|songs?)?(?:\s+(?:music|songs?|tunes?))?(?:\s+(?:on|in|from)\s+spotify)?$"#
+        return normalized.range(of: genericPattern, options: .regularExpression) != nil
     }
 
     private static func systemVolumeControlAction(from transcript: String) -> OpenClickySystemVolumeControlAction? {
@@ -14216,6 +14223,12 @@ final class CompanionManager: ObservableObject {
         guard !trimmedTranscript.isEmpty else { return nil }
         guard !isExplicitAgentRoutingCandidate(trimmedTranscript) else { return nil }
         guard compositeAppActionRequest(from: trimmedTranscript) == nil else { return nil }
+        // "Open Chrome and go to amazon.co.uk" is a navigation request, not a
+        // request to open Chrome. webOpenRequest already resolves it fully
+        // (URL + browser), but compositeAppActionRequest does not treat
+        // "go to <url>" as a second action, so nothing stopped this path from
+        // matching "open Chrome" and dropping the destination on the floor.
+        guard webOpenRequest(from: trimmedTranscript) == nil else { return nil }
 
         let pattern = #"(?i)^\s*(?:(?:can|could|would|will)\s+you\s+|you\s+)?(?:please\s+)?(?:(?:ask|tell)\s+(?:an?\s+|the\s+)?agent\s+to\s+)?(?:open|launch|start|switch\s+to)\s+(?:up\s+)?(.+?)(?:\s+for\s+me)?[\.\!\?]*\s*$"#
         if let regex = try? NSRegularExpression(pattern: pattern),
@@ -19283,7 +19296,14 @@ extension CompanionManager {
     static func testStandaloneSpotifyPlaybackQuery(from transcript: String) -> String? {
         guard let request = standaloneSpotifyPlaybackRequest(from: transcript),
               request.appName == "Spotify" else { return nil }
-        return spotifyPlaybackQuery(from: request.actionText)
+        // Re-apply the ambiguity filter. standaloneSpotifyPlaybackRequest
+        // already rejects ambiguous targets before building a request, but
+        // this helper then calls spotifyPlaybackQuery a SECOND time on the
+        // raw actionText — unfiltered — so it could hand back a "query" the
+        // request path had deliberately discarded.
+        guard let query = spotifyPlaybackQuery(from: request.actionText),
+              !isAmbiguousStandaloneSpotifyPlaybackQuery(query) else { return nil }
+        return query
     }
 
     static func testSpotifyPlaybackControlAction(from transcript: String) -> String? {
