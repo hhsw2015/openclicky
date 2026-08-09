@@ -1168,3 +1168,127 @@ Added the floor wait, placed **after** the response card and
 feedback that a reply arrived and must not be delayed, and the exchange is
 paired against `lastTranscript`, which can change during a 30 s wait. Only
 the audio defers.
+
+### 12.13 Gate H — screen-history search (the last untested claim)
+
+§0 called screen-history search "the largest untapped multimodal win" and
+"the one use case where none of the three alternatives work". It was also
+the only claim never measured. Now measured.
+
+Harness `/tmp/gateH/`: 20 synthetic frames of ordinary work — editors,
+browsers, Slack, Mail, Music, Finder — with exactly one error dialog
+planted at index 10. Each frame judged independently; precision, recall
+and per-frame latency recorded.
+
+#### Result
+
+| query | precision | recall | verdict |
+| --- | --- | --- | --- |
+| "does this show an error dialog?" | **1.00** | **1.00** | found the one frame in twenty, no false positives |
+| "is this a code editor?" | **1.00** | **1.00** | 4/4 exact |
+| "is this a terminal?" | 0.43 | 1.00 | **fails** — 4 false positives |
+
+**~1.15 s/frame, so ~23 s to sweep twenty frames.** Local, no quota, no
+egress. Claude would be thousands of tokens and comparable wall-clock for
+a single pass; OCR cannot answer "which frame had an error" at all.
+
+The headline case works. A user asking "which screen had that error?"
+gets the right frame.
+
+#### Two of my own mistakes, corrected mid-gate
+
+Worth recording because both would have been reported as model failures:
+
+1. **Disjunctive questions collapse.** "Is this a terminal **or**
+   command-line window?" returned YES for 14/20. The single-clause
+   "terminal emulator with a shell prompt" took it to 9/20. Same model,
+   same frames — the "or" was doing the damage.
+2. **Every fixture rendered in monospace.** `-apple-system` is absent in
+   headless Chrome, so all 20 frames fell back to the second font in the
+   stack. Monospace is the strongest visual cue for "terminal", so the
+   harness built twenty terminal-looking frames and then blamed the model.
+   Fixing it moved precision 0.33 → 0.43.
+
+#### The real finding: never ask "is this an X?"
+
+Asked **"what application is this?"**, frame 03 answers `Slack`. Asked
+**"is this a terminal?"** about the same frame, it answers `YES`.
+
+Perception is correct; the yes/no framing is not. A leading question gets
+agreement. This sharpens §12.4's "closed questions only" — closed is
+necessary but not sufficient, and the constraint should read:
+
+> **Ask what something is, then match the answer. Never ask whether it is
+> a specific thing.** A yes/no question naming the target invites
+> agreement; naming forces commitment.
+
+Switching to naming took terminal precision 0.43 → **0.75** (the one
+remaining false positive is a Safari page displaying a `llama-server`
+command line — arguably a fair mistake). It costs code-editor precision,
+though, because the model returns "text editor" for browsers and notes:
+free-text answers need a synonym map, and the categories have to be
+mutually exclusive.
+
+#### Verdict
+
+**Ship the error-dialog / distinctive-event case; do not ship generic
+category filtering yet.** Finding one unusual frame among many is exactly
+what this is good at, and is the use case §0 argued for. Bucketing every
+frame by app type needs a fixed label set and a forced choice between
+them — untested, and a different prompt shape from what was measured here.
+
+Caveat on fixtures: these are synthetic renders, not real captures. Real
+screenshots have window chrome, menu bars, wallpaper and overlapping
+windows. The error-dialog result should be re-confirmed against real
+`ContextExtractor` frames before building on it.
+
+#### Re-confirmed on real captures
+
+§12.13 ended with a caveat: the fixtures were synthetic renders, and the
+result should be re-checked against real screenshots with window chrome,
+wallpaper and overlapping windows. Done — eight real windows captured off
+this machine by CGWindowID (`screencapture -l`), no activation, downscaled
+to 1280.
+
+**7/8 correctly categorised, 1628 ms/frame.** Better than the synthetic
+set, not worse. The single miss is a small configuration panel called
+"text editor" — genuinely ambiguous, not a perception failure.
+
+Find-one-frame, which is the actual use case:
+
+| query | result |
+| --- | --- |
+| "which frame was the video site?" | **exactly 1 of 8**, correct, no false positives |
+| "which frame is Chinese?" | returned nothing — see below |
+
+The Chinese query looks like a failure and is not. The terminal in
+question shows Chinese prose interleaved with English shell output, so
+"Mixed" was the honest answer to "mainly Chinese, mainly English, or
+mixed?". Asked "what language is the text?" the same frame answers
+`Chinese`; asked "does this contain Chinese characters?" it answers `YES`.
+My gold label was wrong, not the model.
+
+So both §12.13 corrections hold up on real data, and a third joins them:
+**offer the categories the screen can actually be in.** A three-way choice
+including "mixed" gets used correctly — which is right, and which means
+the caller has to handle that bucket rather than treating it as a miss.
+
+#### Privacy, observed rather than argued
+
+Building this set surfaced the §12.9 argument as a concrete event rather
+than a claim. Enumerating windows turned up one titled with a live
+Cloudflare tunnel token, and a Finder window listing
+`client_secret_...json` among the downloads. Both were dropped before any
+inference ran — an OCR pass over each capture, grepping for
+credential-shaped strings, was what caught them.
+
+Everything here went to `127.0.0.1:8081`. Nothing left the machine. That
+is the property being claimed, demonstrated on the first real screen
+capture attempted — and note that the same two windows would have been
+uploaded verbatim under today's architecture, which attaches the whole
+screen or nothing.
+
+It also argues for a pre-flight redaction pass in the shipping product:
+`ContextExtractor` already runs Vision OCR, so the same credential-shaped
+grep is nearly free and should gate any frame before it reaches either a
+local or a remote model.
