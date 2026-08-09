@@ -1032,12 +1032,45 @@ final class OpenClickyExternalControlBridgeServer: @unchecked Sendable {
     // did O(N) work per call. Memoize once at class load. Nothing in
     // the pool depends on runtime state (all appends are compile-time
     // conditionals on constants), so a static let is safe.
-    private static let mcpToolDescriptorsCached: [[String: Any]] = {
-        return mcpToolDescriptorsBuilt
-    }()
+    // CORRECTION to the note above: the appends are NOT compile-time
+    // conditionals on constants. Three of them read UserDefaults —
+    // visualDrawingOverlayToolsEnabled, gmailOAuthToolsEnabled, xlbEnabled —
+    // which the user toggles in Settings. A plain `static let` froze the tool
+    // list at first access, so flipping any of those switches did nothing
+    // until the app restarted, and the capability metadata (rebuilt each
+    // call) disagreed with the advertised tools in the meantime.
+    //
+    // Keep the memoization — the O(N) rebuild per tools/list was a real
+    // cost — but key it on the flags that actually vary. Recomputing three
+    // bools is cheap next to allocating ~30 KB of descriptors.
+    private struct MCPToolDescriptorCacheKey: Equatable {
+        let visualDrawing: Bool
+        let gmail: Bool
+        let xlb: Bool
+
+        static var current: MCPToolDescriptorCacheKey {
+            MCPToolDescriptorCacheKey(
+                visualDrawing: AppBundleConfiguration.visualDrawingOverlayToolsEnabled(),
+                gmail: AppBundleConfiguration.gmailOAuthToolsEnabled(),
+                xlb: AppBundleConfiguration.xlbEnabled()
+            )
+        }
+    }
+
+    nonisolated(unsafe) private static var mcpToolDescriptorsCache:
+        (key: MCPToolDescriptorCacheKey, value: [[String: Any]])?
+    private static let mcpToolDescriptorsCacheLock = NSLock()
 
     private static var mcpToolDescriptors: [[String: Any]] {
-        return mcpToolDescriptorsCached
+        let key = MCPToolDescriptorCacheKey.current
+        mcpToolDescriptorsCacheLock.lock()
+        defer { mcpToolDescriptorsCacheLock.unlock() }
+        if let cached = mcpToolDescriptorsCache, cached.key == key {
+            return cached.value
+        }
+        let built = mcpToolDescriptorsBuilt
+        mcpToolDescriptorsCache = (key, built)
+        return built
     }
 
     // Removed publicMCPToolDescriptors — mirage's Claude Code agent path
@@ -1492,6 +1525,31 @@ final class OpenClickyExternalControlBridgeServer: @unchecked Sendable {
             [
                 "name": "show_highlight",
                 "description": "Draw a temporary rectangle highlight over visible screen content. Coordinates are global AppKit screen points.",
+                "compatibility": ["status": "supported", "capability": "visual_guidance.rectangle"],
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "x": ["type": "number"],
+                        "y": ["type": "number"],
+                        "width": ["type": "number"],
+                        "height": ["type": "number"],
+                        "durationMs": ["type": "number"],
+                        "accentHex": ["type": "string"],
+                        "lineWidth": ["type": "number"],
+                        "fillOpacity": ["type": "number"],
+                        "caption": ["type": "string"]
+                    ],
+                    "required": ["x", "y", "width", "height"]
+                ]
+            ],
+            // `show_rectangle` is accepted by dispatch and advertised in the
+            // visual_guidance.rectangle capability's `tools` list, but was
+            // missing from the descriptor list -- so an MCP client reading
+            // tools/list could never discover a tool the capability metadata
+            // told it existed. Same schema and handler as show_highlight.
+            [
+                "name": "show_rectangle",
+                "description": "Draw a temporary rectangle highlight over visible screen content. Alias of show_highlight. Coordinates are global AppKit screen points.",
                 "compatibility": ["status": "supported", "capability": "visual_guidance.rectangle"],
                 "inputSchema": [
                     "type": "object",

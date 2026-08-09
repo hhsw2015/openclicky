@@ -1311,7 +1311,15 @@ guard let self else { throw CancellationError() }
     private static func isVisualGuidanceDrawingRequest(normalized: String, commandText: String) -> Bool {
         let visualDrawPatterns = [
             #"\b(?:draw|put|place|add|show|make)\s+(?:a\s+|an\s+|the\s+)?(?:rectangle|rect|box|circle|oval|ring|outline|shape)\s+(?:around|round|over|on|onto)\b"#,
-            #"\b(?:circle|box|outline|mark|highlight)\s+(?:the\s+|this\s+|that\s+|a\s+|an\s+)?[a-z0-9][a-z0-9\s-]{0,80}\b"#,
+            // `mark` is deliberately NOT in this list. Unlike circle / box /
+            // outline / highlight, it is overloaded: "mark this task as done
+            // later" and "mark this as read" are to-do phrasing, not drawing
+            // requests, and matched here they forced a screenshot capture on
+            // every such utterance. The unambiguous verbs stay.
+            #"\b(?:circle|box|outline|highlight)\s+(?:the\s+|this\s+|that\s+|a\s+|an\s+)?[a-z0-9][a-z0-9\s-]{0,80}\b"#,
+            // `mark` only counts when a drawing preposition follows the
+            // target — "mark around the icon", "mark over the button".
+            #"\bmark\s+(?:around|round|over|onto)\b"#,
             #"\b(?:draw|trace|scribble)\s+(?:around|round|over|on|onto)\b"#
         ]
 
