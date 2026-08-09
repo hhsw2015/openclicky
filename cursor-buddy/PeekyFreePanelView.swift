@@ -30,6 +30,8 @@ struct PeekyFreePanelView: View {
     @State private var classifierReadyRefreshTick: Int = 0
     @State private var lastAutomationResult: String = ""
     @State private var showsCustomVoiceUUID: Bool = false
+    @State private var localModelServerState: String = ""
+    @State private var localModelProbing: Bool = false
 
     private var lang: String { openClickyLocale.currentLanguage }
     private func t(_ en: String, _ zh: String) -> String {
@@ -54,6 +56,7 @@ struct PeekyFreePanelView: View {
             claudeCodeSettingsGroup
             configExportGroup
             classifierGroup
+            localModelGroup
         }
         .padding(.top, 4)
         // Re-render with the active locale so both `Text` literals and
@@ -650,6 +653,86 @@ struct PeekyFreePanelView: View {
                     .foregroundColor(.secondary)
                 Spacer()
             }
+        }
+    }
+
+    // MARK: - Local model
+
+    private var localModelGroup: some View {
+        settingsGroup(t("Local translation model", "本地翻译模型")) {
+            let configured = OpenClickyLocalLLMClient.isConfigured
+
+            Text(t("The classifier above is English-only — its base is bge-small-en and its training data has no Chinese, so a Chinese utterance scores `none` at 0.99 every time and falls through to Claude. When a local llama.cpp model is present, non-Latin transcripts are translated to English first: measured 0% -> 78% classification accuracy, ~350 ms, no quota. Optional — without it, Chinese behaves exactly as before.",
+                   "上面的分类器只懂英文 —— 它基于 bge-small-en, 训练数据没有中文, 所以中文每次都以 0.99 判为 `none` 并落到 Claude。装了本地 llama.cpp 模型后, 非拉丁语转写会先翻成英文: 实测分类准确率 0% -> 78%, 约 350 ms, 不耗额度。可选 —— 没有它中文行为与之前完全一致。"))
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(configured ? Color.green : Color.secondary.opacity(0.4))
+                    .frame(width: 8, height: 8)
+                Text(configured
+                     ? t("Runtime and weights found", "已找到运行时和权重")
+                     : t("Not installed", "未安装"))
+                    .font(.system(size: 11))
+                Spacer()
+            }
+
+            if configured {
+                // Paths, so a wrong pick (projector chosen as main weights,
+                // an unexpected quantisation) is visible rather than showing
+                // up later as an unexplained load failure.
+                if let runtime = OpenClickyLocalLLMLocator.resolve() {
+                    Text(verbatim: runtime.serverExecutable.path)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                    Text(verbatim: runtime.modelURL.lastPathComponent
+                         + (runtime.supportsVision ? " + mmproj" : ""))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Text(t("Install with `brew install llama.cpp`, then put GGUF weights in ~/models (Gemma 4 E4B, main file plus mmproj).",
+                       "用 `brew install llama.cpp` 安装, 然后把 GGUF 权重放到 ~/models (Gemma 4 E4B, 主文件加 mmproj)。"))
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 8) {
+                Button(t("Test", "测试")) {
+                    localModelProbing = true
+                    localModelServerState = t("Starting (first run loads ~5 GB)...", "启动中 (首次加载约 5 GB)...")
+                    Task {
+                        let translated = try? await OpenClickyLocalLLMClient()
+                            .translateToEnglish("搜索框在哪")
+                        await MainActor.run {
+                            localModelProbing = false
+                            if let translated, !translated.isEmpty {
+                                localModelServerState = "搜索框在哪 -> \(translated)"
+                            } else {
+                                localModelServerState = OpenClickyLocalLLMServerManager.shared.lastLaunchError
+                                    ?? t("No response.", "无响应。")
+                            }
+                        }
+                    }
+                }
+                .disabled(!configured || localModelProbing)
+
+                Text(localModelServerState)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+            }
+
+            Text(t("The server starts on demand and shuts down after 10 minutes idle (it holds ~5 GB). A llama-server you started yourself is reused, and never stopped by OpenClicky.",
+                   "服务按需启动, 空闲 10 分钟后关闭 (常驻约 5 GB)。你自己启动的 llama-server 会被复用, OpenClicky 不会关闭它。"))
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
