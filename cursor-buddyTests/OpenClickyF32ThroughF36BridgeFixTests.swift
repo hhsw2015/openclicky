@@ -16,6 +16,9 @@
 import Foundation
 import XCTest
 @testable import OpenClicky
+// OpenClickyMetaSelfExpandGate is declared in the context-service package,
+// not the app target, so @testable import OpenClicky alone does not see it.
+import OpenClickyContextService
 
 final class OpenClickyF32ThroughF36BridgeFixTests: XCTestCase {
 

@@ -18,7 +18,10 @@
 
 import Testing
 import Foundation
-@testable import cursor_buddy
+// Module is `OpenClicky` (PRODUCT_MODULE_NAME), not the legacy target
+// directory name. Importing `cursor_buddy` failed to resolve and took the
+// whole test target down with it, so no test in this suite could run.
+@testable import OpenClicky
 
 @Suite struct MiragePeekyOrchestratorTests {
 
@@ -150,12 +153,12 @@ import Foundation
 
     @Test func parsePlainModelIsPassthrough() {
         let s = MirageThinkingSuffix.parse("claude-opus-5")
-        #expect(s.baseModel == "claude-opus-5")
+        #expect(s.modelName == "claude-opus-5")
     }
 
     @Test func parseMaxSuffixMapsToMaxLevel() {
         let s = MirageThinkingSuffix.parse("claude-opus-5(max)")
-        #expect(s.baseModel == "claude-opus-5")
+        #expect(s.modelName == "claude-opus-5")
         // We do not depend on the internal enum shape here — just that
         // parsing didn't drop the base model or crash on the suffix.
     }
@@ -164,6 +167,6 @@ import Foundation
         let s = MirageThinkingSuffix.parse("mirage/claude-fable-5(xhigh)")
         // Prefix stripping is MirageBackendClient's job — the suffix
         // parser should keep the base intact.
-        #expect(s.baseModel.contains("claude-fable-5"))
+        #expect(s.modelName.contains("claude-fable-5"))
     }
 }

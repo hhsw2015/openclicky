@@ -10,6 +10,7 @@
 // for every shipped entry, and trimming never eats the grounding content.
 
 import XCTest
+@testable import OpenClicky
 
 final class OpenClickyAppSkillContextTests: XCTestCase {
 

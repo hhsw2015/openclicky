@@ -4,7 +4,7 @@ import Testing
 @testable import OpenClicky
 
 struct OpenClickyVisualGuidanceOverlayTests {
-    @Test func rectangleNormalizesClampsAndSerializes() throws {
+    @MainActor @Test func rectangleNormalizesClampsAndSerializes() throws {
         let overlay = OpenClickyVisualGuidanceOverlay.rectangle(
             rect: CGRect(x: 120, y: 90, width: -80, height: 60),
             accentHex: "#60A5FA",
@@ -134,7 +134,7 @@ struct OpenClickyVisualGuidanceOverlayTests {
         #expect(body["tool"] as? String == "gmail_list_messages")
     }
 
-    @Test func bridgeParsesScribbleAndRectangleToolCalls() throws {
+    @MainActor @Test func bridgeParsesScribbleAndRectangleToolCalls() throws {
         let scribble = OpenClickyExternalControlBridgeServer.testCommand(from: [
             "tool": "show_scribble",
             "arguments": [
@@ -166,7 +166,7 @@ struct OpenClickyVisualGuidanceOverlayTests {
         }
     }
 
-    @Test func voiceLaneParsesRectangleAndScribbleGuidanceTags() throws {
+    @MainActor @Test func voiceLaneParsesRectangleAndScribbleGuidanceTags() throws {
         let rectangle = CompanionManager.parsePointingCoordinates(
             from: "that is the block to focus on. [RECT:10,20,300,140:error block:screen2]"
         )
@@ -193,14 +193,14 @@ struct OpenClickyVisualGuidanceOverlayTests {
         ])
     }
 
-    @Test func voiceLaneStripsPartialVisualGuidanceTagsFromSpeech() throws {
+    @MainActor @Test func voiceLaneStripsPartialVisualGuidanceTagsFromSpeech() throws {
         #expect(CompanionManager.stripTrailingVisualGuidanceTagFragment("that area there. [RECT:10,20") == "that area there.")
         #expect(CompanionManager.stripTrailingVisualGuidanceTagFragment("trace here. [SCRIBBLE:1,2;") == "trace here.")
         #expect(CompanionManager.stripTrailingVisualGuidanceTagFragment("look there. [POINT:12") == "look there.")
         #expect(CompanionManager.stripTrailingVisualGuidanceTagFragment("literal bracket [note") == "literal bracket [note")
     }
 
-    @Test func voiceLaneRoutesShapeDrawingRequestsToScreenContext() throws {
+    @MainActor @Test func voiceLaneRoutesShapeDrawingRequestsToScreenContext() throws {
         #expect(CompanionManager.testShouldAttachScreenContext(to: "draw a circle around that button"))
         #expect(CompanionManager.testShouldAttachScreenContext(to: "can you put a rectangle around the error"))
         #expect(CompanionManager.testShouldAttachScreenContext(to: "box around the login panel"))
@@ -220,7 +220,7 @@ struct OpenClickyVisualGuidanceOverlayTests {
         #expect(!CompanionManager.testShouldAttachScreenContext(to: "mark this task as done later"))
     }
 
-    @Test func automaticCalibrationAnchorsMapToExpectedCorners() throws {
+    @MainActor @Test func automaticCalibrationAnchorsMapToExpectedCorners() throws {
         let screenFrame = CGRect(x: 100, y: 50, width: 1200, height: 800)
 
         let apple = CompanionManager.testExpectedVisualGuidanceCalibrationCenter(
@@ -258,7 +258,7 @@ struct OpenClickyVisualGuidanceOverlayTests {
         #expect(Int((nativeWideTime?.y ?? 0).rounded()) == 1568)
     }
 
-    @Test func calibrationAnchorsAveragePerScreenCoordinateOffset() throws {
+    @MainActor @Test func calibrationAnchorsAveragePerScreenCoordinateOffset() throws {
         let displayFrame = CGRect(x: 10, y: 20, width: 1440, height: 900)
         CompanionManager.testResetVisualGuidanceCalibration(for: displayFrame)
         defer { CompanionManager.testResetVisualGuidanceCalibration(for: displayFrame) }
@@ -285,7 +285,7 @@ struct OpenClickyVisualGuidanceOverlayTests {
         #expect(CompanionManager.testVisualGuidanceCalibrationOffset(for: displayFrame) == CGSize(width: 8, height: -2))
     }
 
-    @Test func calibrationRejectsRawPixelSizedPoisonOffsets() throws {
+    @MainActor @Test func calibrationRejectsRawPixelSizedPoisonOffsets() throws {
         let displayFrame = CGRect(x: 0, y: 0, width: 3840, height: 1620)
         CompanionManager.testResetVisualGuidanceCalibration(for: displayFrame)
         defer { CompanionManager.testResetVisualGuidanceCalibration(for: displayFrame) }

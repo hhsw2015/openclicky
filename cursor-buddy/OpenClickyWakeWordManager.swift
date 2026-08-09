@@ -39,8 +39,21 @@ enum OpenClickyVoiceActivationMode: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Whether this mode arms the "Hey Clicky" listener.
+    ///
+    /// Deliberately an explicit allowlist rather than `self != .pushToTalk`.
+    /// With the negation, adding any future non-PTT mode (smart-turn
+    /// endpointing, an external-trigger mode) silently opts it into the wake
+    /// word: a continuous mic listener the user never asked for. Enumerating
+    /// makes the compiler force the decision at the point a case is added,
+    /// and the switch is exhaustive so a new case is a build error here.
     var usesWakeWord: Bool {
-        self != .pushToTalk
+        switch self {
+        case .toggleWakeWord, .alwaysWakeWord:
+            return true
+        case .pushToTalk:
+            return false
+        }
     }
 
     static func resolved(rawValue: String?) -> OpenClickyVoiceActivationMode {

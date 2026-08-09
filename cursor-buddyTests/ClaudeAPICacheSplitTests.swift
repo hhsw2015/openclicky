@@ -13,6 +13,7 @@
 // else.
 
 import XCTest
+@testable import OpenClicky
 
 final class ClaudeAPICacheSplitTests: XCTestCase {
 

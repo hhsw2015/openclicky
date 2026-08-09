@@ -91,7 +91,7 @@ struct OpenClickyComputerUseTests {
         #expect(capture.agentContextNote.contains("yScale 1.2550"))
     }
 
-    @Test func realtimeCompositeAppCommandIsNotReducedToOpenApp() throws {
+    @MainActor @Test func realtimeCompositeAppCommandIsNotReducedToOpenApp() throws {
         #expect(
             CompanionManager.testLocalAppOpenTarget(
                 from: "Can you open Spotify and play AC/DC Back to Black?"
@@ -112,7 +112,7 @@ struct OpenClickyComputerUseTests {
         #expect(CompanionManager.testWebOpenTarget(from: "Open Chrome and go to amazon.co.uk")?.browserAppName == "Google Chrome")
     }
 
-    @Test func directRequestRoutersDoNotStealQuestionsOrDesignTasks() throws {
+    @MainActor @Test func directRequestRoutersDoNotStealQuestionsOrDesignTasks() throws {
         #expect(CompanionManager.testLocalAppOpenTarget(from: "You open GitHub.") == "GitHub Desktop")
         #expect(CompanionManager.testLocalFolderOpenTarget(from: "Is your working folder currently the OpenClicky folder?") == nil)
         #expect(CompanionManager.testLocalFolderOpenTarget(from: "look into introducing workspaces or project folders in OpenClicky so I can configure named workspaces") == nil)
@@ -138,7 +138,7 @@ struct OpenClickyComputerUseTests {
         #expect(OpenAIRealtimeSpeechClient.testFirstTranscriptString(in: responseDone) == "Opening GitHub Desktop.")
     }
 
-    @Test func pastedLogsDoNotBecomeReminderCountCommands() throws {
+    @MainActor @Test func pastedLogsDoNotBecomeReminderCountCommands() throws {
         let pastedLogs = """
         find out why we're having issues
         [OpenClickyLog][2026-06-09T11:22:08Z][computer-use/incoming] native_cua.direct_request.reminder_count_detected {"route":"native_cua.reminder_count","transcript":"count tasks reminders"}
@@ -148,7 +148,7 @@ struct OpenClickyComputerUseTests {
         #expect(CompanionManager.testReminderCountInstruction(from: pastedLogs) == nil)
     }
 
-    @Test func spokenPlayButtonRequestsMapToARealKey() throws {
+    @MainActor @Test func spokenPlayButtonRequestsMapToARealKey() throws {
         #expect(CompanionManager.testNativeKeyPress(from: "Press play in Spotify.")?.key == "space")
         #expect(CompanionManager.testNativeKeyPress(from: "Press the play button in Spotify.")?.key == "space")
         #expect(CompanionManager.testNativeKeyPress(from: "Press play in Spotify.")?.modifiers == [])
@@ -205,7 +205,7 @@ struct OpenClickyComputerUseTests {
         #expect(CompanionManager.testSpotifyPlaybackControlAction(from: "mute volume") == nil)
     }
 
-    @Test func standaloneSystemVolumeCommandsUseSystemAudioRoute() throws {
+    @MainActor @Test func standaloneSystemVolumeCommandsUseSystemAudioRoute() throws {
         #expect(CompanionManager.testSystemVolumeControlAction(from: "turn volume up") == "volumeUp")
         #expect(CompanionManager.testSystemVolumeControlAction(from: "turn volume down") == "volumeDown")
         #expect(CompanionManager.testSystemVolumeControlAction(from: "mute") == "mute")
@@ -351,7 +351,7 @@ struct OpenClickyComputerUseTests {
         #expect(OpenClickyModelCatalog.codexVoiceSessionModel(withID: "gpt-5.5").id == "gpt-5.5")
     }
 
-    @Test func realtimeVoiceUsesRealtimeForComputerUsePointing() throws {
+    @MainActor @Test func realtimeVoiceUsesRealtimeForComputerUsePointing() throws {
         #expect(
             CompanionManager.testComputerUsePointingResolver(
                 selectedVoiceModelID: "gpt-realtime-2.1-mini",
@@ -360,7 +360,7 @@ struct OpenClickyComputerUseTests {
         )
     }
 
-    @Test func realtimeComputerUseModelUsesRealtimeAPIInsteadOfCodex() throws {
+    @MainActor @Test func realtimeComputerUseModelUsesRealtimeAPIInsteadOfCodex() throws {
         let model = OpenClickyModelCatalog.computerUseModel(withID: "gpt-realtime-2.1-mini")
         #expect(model.provider == .openAI)
         #expect(
@@ -371,7 +371,7 @@ struct OpenClickyComputerUseTests {
         )
     }
 
-    @Test func nonRealtimeVoiceKeepsSelectedComputerUsePointingResolver() throws {
+    @MainActor @Test func nonRealtimeVoiceKeepsSelectedComputerUsePointingResolver() throws {
         #expect(
             CompanionManager.testComputerUsePointingResolver(
                 selectedVoiceModelID: "gpt-5.5",
