@@ -274,7 +274,10 @@ struct CodexAgentModeTests {
         guard let instruction = maybeInstruction else { return }
 
         #expect(instruction.contains("Inspect the relevant local files or folders"))
-        #expect(instruction.contains("what's on my desktop?"))
+        // Without the "?" — normalizedCommandCandidate strips trailing
+        // punctuation before embedding the request, which is what we want in
+        // the instruction text.
+        #expect(instruction.contains("what's on my desktop"))
         #expect(CompanionManager.filesystemTaskAcknowledgement(from: "list my desktop files") == "i'm checking your desktop now.")
     }
 

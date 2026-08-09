@@ -13613,6 +13613,19 @@ final class CompanionManager: ObservableObject {
         return nil
     }
 
+    /// A "how would I / what is the way to" question — asking for an
+    /// explanation, not commissioning work. Deliberately narrow: it requires
+    /// the interrogative opener AND an explicit conceptual marker, so
+    /// "how do I fix this, just do it" and plain "fix this swift error"
+    /// still route to the agent.
+    private static func isConceptualHowToQuestion(_ normalized: String) -> Bool {
+        let opener = #"^(?:how\s+(?:would|do|should|can)\s+(?:i|you|we)|what(?:\s+is|\s+s)?\s+the\s+(?:best\s+)?way)\b"#
+        guard normalized.range(of: opener, options: .regularExpression) != nil else { return false }
+
+        let conceptualMarker = #"\b(?:conceptually|in\s+theory|theoretically|in\s+principle|generally|typically|usually|normally|explain|understand)\b"#
+        return normalized.range(of: conceptualMarker, options: .regularExpression) != nil
+    }
+
     private static func isMetaAgentRoutingQuestion(_ candidate: String) -> Bool {
         let normalized = SpokenText.normalizedSpokenCommandText(candidate)
         let prefixes = [
@@ -13631,7 +13644,21 @@ final class CompanionManager: ObservableObject {
             "when i asked",
             "when i ask"
         ]
-        return prefixes.contains { normalized.hasPrefix($0) }
+        if prefixes.contains(where: { normalized.hasPrefix($0) }) { return true }
+
+        // Questions ABOUT a feature, as opposed to requests to use it.
+        // "Can you explain what agent mode does?" is asking for a
+        // description; routing it to the agent makes OpenClicky go and *do*
+        // something instead of answering. Requires both an explain-shaped
+        // verb and one of OpenClicky's own subsystems as the object, so
+        // "explain what this error means" still routes normally.
+        let explainPattern = #"\b(?:explain|describe|tell\s+me)\b.{0,32}\b(?:agent\s+mode|voice\s+route|openclicky|clicky|peeky)\b"#
+        if normalized.range(of: explainPattern, options: .regularExpression) != nil {
+            return true
+        }
+
+        let whatIsPattern = #"^(?:what\s+(?:is|are|does|do)|how\s+does)\b.{0,32}\b(?:agent\s+mode|voice\s+route|openclicky|clicky|peeky)\b"#
+        return normalized.range(of: whatIsPattern, options: .regularExpression) != nil
     }
 
     private static func isIncompleteAgentTaskCreationRequest(from transcript: String) -> Bool {
@@ -14731,8 +14758,17 @@ final class CompanionManager: ObservableObject {
         }
         guard !isRawTransportDiagnosticEvent(candidate) else { return nil }
         guard !isMetaAgentRoutingQuestion(candidate) else { return nil }
-        guard !isVoiceRouteCapabilityQuestion(candidate) else { return nil }
-        guard !isGenericWebSearchCapabilityQuestion(candidate) else { return nil }
+        // These two take the ORIGINAL transcript, not `candidate`.
+        // `normalizedAgentTaskInstruction` strips a leading "can you " /
+        // "could you " so the remainder reads as an imperative task — which
+        // is exactly the prefix both predicates anchor on (`^can you ...`).
+        // Fed the stripped candidate, "Can you search the web?" arrives as
+        // "search the web", the capability guard cannot fire, and a question
+        // about whether OpenClicky *can* browse spawned an agent that went
+        // and did it. "Could OpenClicky browse..." was unaffected only
+        // because that phrasing is not in the stripping pattern.
+        guard !isVoiceRouteCapabilityQuestion(transcript) else { return nil }
+        guard !isGenericWebSearchCapabilityQuestion(transcript) else { return nil }
         guard !isConversationalPreferenceOrDesignReflection(candidate) else { return nil }
         guard !isLikelyPureConversation(candidate) else { return nil }
         guard !isInstantVoiceScreenContextRequest(candidate) else { return nil }
@@ -14748,6 +14784,19 @@ final class CompanionManager: ObservableObject {
 
         guard (hasAction && hasToolContext) || hasCodingImplementationCue || asksForFreshInfo else { return nil }
         guard !isLikelyDirectLocalOnlyRequest(candidate) else { return nil }
+
+        // A conceptual question that happens to name an action word must not
+        // route. "How would I fix this Swift error conceptually?" trips
+        // hasAction ("fix") and hasToolContext ("swift"), so the check above
+        // passes — but containsCodingImplementationCue already decided this
+        // is a question, not a work order. That verdict only gated its own
+        // term in the disjunction, so the hasAction && hasToolContext path
+        // routed it anyway and the agent went off editing code in answer to
+        // "how would I...". Honour the verdict for the whole decision.
+        if !hasCodingImplementationCue, !asksForFreshInfo,
+           isConceptualHowToQuestion(normalized) {
+            return nil
+        }
 
         return SpokenText.cleanedAgentTaskInstruction(candidate)
     }
@@ -14776,7 +14825,7 @@ final class CompanionManager: ObservableObject {
         guard hasLogEvidence else { return nil }
 
         let normalized = SpokenText.normalizedSpokenCommandText(candidate)
-        let intentPattern = #"\b(?:logs?|issue|issues|error|errors|why|fix|analyse|analyze|review|inspect|look\s+at|look\s+into|find\s+out|debug|diagnose|what\s+happened|what'?s\s+wrong|make\s+a\s+note|note\s+that)\b"#
+        let intentPattern = #"\b(?:logs?|issue|issues|error|errors|why|fix|analyse|analyze|review|inspect|look\s+at|look\s+into|find\s+out|debug|diagnose|what\s+happened|what['\s]?s\s+wrong|make\s+a\s+note|note\s+that)\b"#
         let hasAnalysisIntent = normalized.range(of: intentPattern, options: .regularExpression) != nil
 
         guard hasAnalysisIntent || candidate.count >= 500 else { return nil }
@@ -14792,8 +14841,17 @@ final class CompanionManager: ObservableObject {
         guard SpokenText.wordCount(in: normalized) >= 3 else { return nil }
         guard !isRawTransportDiagnosticEvent(candidate) else { return nil }
         guard !isMetaAgentRoutingQuestion(candidate) else { return nil }
-        guard !isVoiceRouteCapabilityQuestion(candidate) else { return nil }
-        guard !isGenericWebSearchCapabilityQuestion(candidate) else { return nil }
+        // These two take the ORIGINAL transcript, not `candidate`.
+        // `normalizedAgentTaskInstruction` strips a leading "can you " /
+        // "could you " so the remainder reads as an imperative task — which
+        // is exactly the prefix both predicates anchor on (`^can you ...`).
+        // Fed the stripped candidate, "Can you search the web?" arrives as
+        // "search the web", the capability guard cannot fire, and a question
+        // about whether OpenClicky *can* browse spawned an agent that went
+        // and did it. "Could OpenClicky browse..." was unaffected only
+        // because that phrasing is not in the stripping pattern.
+        guard !isVoiceRouteCapabilityQuestion(transcript) else { return nil }
+        guard !isGenericWebSearchCapabilityQuestion(transcript) else { return nil }
         guard !VoiceRouter.isSensitiveOrDestructiveAgentTaskRequest(normalized) else { return nil }
         guard !isLikelyDirectLocalOnlyRequest(candidate) else { return nil }
 
@@ -14936,7 +14994,15 @@ final class CompanionManager: ObservableObject {
         guard isAgentSuitableTask else { return false }
 
         let normalizedResponse = SpokenText.normalizedSpokenCommandText(responseText)
-        let filesystemRefusalPattern = #"\b(?:i\s+(?:do\s+not|don't|dont)\s+have\s+access|i\s+(?:can't|cannot)|unable\s+to|not\s+able\s+to)\b.{0,96}\b(?:file\s*system|files?|folders?|desktop|downloads?|documents?|browse|inspect|read)\b"#
+        // `don['\s]?t` / `can['\s]?t`, not `don't` / `can't`. This pattern is
+        // matched against normalizedSpokenCommandText output, which replaces
+        // apostrophes with spaces — so "i don't have access" arrives as
+        // "i don t have access" and the literal contraction never matched.
+        // Every filesystem refusal therefore failed to escalate to Agent
+        // Mode; the feature silently never fired. (The conversationStarters
+        // list below already spells out all three variants, so this had been
+        // hit before and fixed only locally.)
+        let filesystemRefusalPattern = #"\b(?:i\s+(?:do\s+not|don['\s]?t)\s+have\s+access|i\s+(?:can['\s]?t|cannot)|unable\s+to|not\s+able\s+to)\b.{0,96}\b(?:file\s*system|files?|folders?|desktop|downloads?|documents?|browse|inspect|read)\b"#
         let agentRouteRefusalPatterns = [
             #"\bthat\s+needs\s+openclicky(?:'s)?\s+agent\s+route\b"#,
             #"\bit\s+did(?:n\s*'?t| not)\s+start\s+from\s+this\s+voice\s+turn\b"#,
@@ -14978,7 +15044,11 @@ final class CompanionManager: ObservableObject {
     }
 
     private static func isLocalFilesystemInspectionRequest(_ normalized: String) -> Bool {
-        let actionPattern = #"\b(?:what'?s\s+on|what\s+is\s+on|list|show|check|inspect|review|find|search|look\s+at|read|summari[sz]e)\b"#
+        // `what <noun> are|is in|on` covers "what files are on my desktop",
+        // which the fixed forms missed — only "what's on" and "what is on"
+        // were listed, so the most natural phrasing for this feature did not
+        // register as a filesystem request at all.
+        let actionPattern = #"\b(?:what['\s]?s\s+(?:on|in)|what\s+is\s+(?:on|in)|what\s+\w+\s+(?:are|is)\s+(?:on|in)|list|show|check|inspect|review|find|search|look\s+at|read|summari[sz]e)\b"#
         let filesystemTargetPattern = #"\b(?:desktop|downloads?|documents?|folder|folders|file|files|directory|directories)\b"#
         return normalized.range(of: actionPattern, options: .regularExpression) != nil
             && normalized.range(of: filesystemTargetPattern, options: .regularExpression) != nil
@@ -15061,8 +15131,8 @@ final class CompanionManager: ObservableObject {
         guard !normalized.isEmpty else { return false }
 
         let visualReferencePatterns = [
-            #"\b(?:look at|take a look at|have a look at|check|inspect|review|summari[sz]e|describe)\s+(?:this|that|it|here|my screen|the screen|what'?s on screen|the current screen|the visible screen|the current page|this page|that page|this tab|that tab|the browser|this window|that window)\b"#,
-            #"\b(?:what do you think|what'?s this|what is this|what'?s that|what is that|can you see|do you see|are you seeing)\b"#
+            #"\b(?:look at|take a look at|have a look at|check|inspect|review|summari[sz]e|describe)\s+(?:this|that|it|here|my screen|the screen|what['\s]?s on screen|the current screen|the visible screen|the current page|this page|that page|this tab|that tab|the browser|this window|that window)\b"#,
+            #"\b(?:what do you think|what['\s]?s this|what is this|what['\s]?s that|what is that|can you see|do you see|are you seeing)\b"#
         ]
         let hasVisualReference = visualReferencePatterns.contains { pattern in
             normalized.range(of: pattern, options: .regularExpression) != nil
