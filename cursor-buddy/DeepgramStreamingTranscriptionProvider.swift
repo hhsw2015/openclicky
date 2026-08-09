@@ -61,7 +61,7 @@ final class DeepgramStreamingTranscriptionProvider: BuddyTranscriptionProvider {
     }
 }
 
-private final class DeepgramStreamingTranscriptionSession: StreamingWebSocketTranscriptionSession, @unchecked Sendable, BuddyStreamingTranscriptionSession {
+final class DeepgramStreamingTranscriptionSession: StreamingWebSocketTranscriptionSession, @unchecked Sendable, BuddyStreamingTranscriptionSession {
     private struct MessageEnvelope: Decodable {
         let type: String?
     }
@@ -206,7 +206,19 @@ private final class DeepgramStreamingTranscriptionSession: StreamingWebSocketTra
             case "speechstarted", "speech_started":
                 print("[Deepgram] speech started")
             case "utteranceend", "utterance_end":
+                // Deepgram's end-of-speech signal. Previously decoded and
+                // discarded, so after requestFinalTranscript() we sat on the
+                // 3 s deadline even though the server had already told us no
+                // more speech was coming. Only acts while awaiting an
+                // explicit final — mid-stream utterance boundaries are
+                // normal and must not terminate the session.
                 print("[Deepgram] utterance end")
+                stateQueue.async {
+                    guard self.isAwaitingExplicitFinalTranscript else { return }
+                    self.explicitFinalTranscriptDeadlineWorkItem?.cancel()
+                    self.explicitFinalTranscriptDeadlineWorkItem = nil
+                    self.deliverFinalTranscriptIfNeeded(self.bestAvailableTranscriptText())
+                }
             default:
                 print("[Deepgram] unknown frame type: \(envelope.type ?? "nil") — \(text.prefix(200))")
             }
@@ -338,7 +350,15 @@ private final class DeepgramStreamingTranscriptionSession: StreamingWebSocketTra
             URLQueryItem(name: "channels", value: "1"),
             URLQueryItem(name: "interim_results", value: "true"),
             URLQueryItem(name: "smart_format", value: "true"),
-            URLQueryItem(name: "endpointing", value: "300")
+            URLQueryItem(name: "endpointing", value: "300"),
+            // Ask for the UtteranceEnd frame. Without this the server never
+            // sends one, which is why the decoder's handler for it was dead
+            // code. 1000 ms is Deepgram's documented minimum and their
+            // recommended pairing with endpointing=300.
+            URLQueryItem(name: "utterance_end_ms", value: "1000"),
+            // UtteranceEnd is only emitted when interim results carry VAD
+            // events; Deepgram requires this flag alongside it.
+            URLQueryItem(name: "vad_events", value: "true")
         ]
 
         // Deepgram replaced the legacy `keywords=` parameter on nova-3

@@ -55,6 +55,11 @@ final class OpenClickyCameraCaptureController: NSObject, ObservableObject, AVCap
     @Published private(set) var latestFrameCapturedAt: Date?
     @Published private(set) var lastErrorMessage: String?
 
+    /// Longest-side cap for an emitted frame, in pixels. Matches the
+    /// screenshot path (`CompanionScreenCaptureUtility`, maxDimension 1280)
+    /// so neither modality is silently the expensive one.
+    static let maxFrameDimension = 1280
+
     private let captureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
     private let captureQueue = DispatchQueue(label: "com.openclicky.camera.capture", qos: .userInitiated)
@@ -308,7 +313,20 @@ final class OpenClickyCameraCaptureController: NSObject, ObservableObject, AVCap
         from connection: AVCaptureConnection
     ) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        var ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+
+        // Clamp the longest side to 1280, matching what
+        // CompanionScreenCaptureUtility does for screenshots. Frames used
+        // to ship at the session's native `.high` resolution, so a single
+        // camera frame could cost more upload than both displays combined.
+        // Vision models downscale far below this anyway.
+        let extent = ciImage.extent
+        let longest = max(extent.width, extent.height)
+        if longest > CGFloat(Self.maxFrameDimension) {
+            let scale = CGFloat(Self.maxFrameDimension) / longest
+            ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        }
+
         guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
         let bitmap = NSBitmapImageRep(cgImage: cgImage)
         guard let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.78]) else { return }

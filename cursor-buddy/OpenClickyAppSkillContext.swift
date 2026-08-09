@@ -23,6 +23,21 @@ struct OpenClickyAppSkillContext: Equatable {
     let concepts: [String]
     let workflows: [OpenClickyAppSkillWorkflow]
 
+    /// Character budget for the injected fragment. Every other dynamic
+    /// context source (xlb, memory, screen-history OCR) is capped; this one
+    /// was not, and the entries run ~2.5 KB (≈700 tokens) each — spent on
+    /// every turn, in the *dynamic* system block, so it never caches.
+    ///
+    /// Only the workflow list is trimmable. Tagline + interface description
+    /// + concepts + trailer are what actually ground a voice answer and are
+    /// always kept; across the current ten entries that floor is 1657-1937
+    /// chars, so a cap below ~1950 would be unreachable rather than
+    /// enforced. 2000 leaves the floor intact and cuts the workflow tail,
+    /// which is where the variance lives (Blender ran 3029).
+    ///
+    /// Verified by `promptFragmentFitsBudget()` below.
+    static let promptFragmentCharacterCap = 2_000
+
     var promptFragment: String {
         let conceptText = concepts.map { "- \($0)" }.joined(separator: "\n")
         let workflowText = workflows.map { workflow in
@@ -43,18 +58,28 @@ struct OpenClickyAppSkillContext: Equatable {
         \(conceptText)
         """
 
-        if !workflowText.isEmpty {
-            prompt += """
-
-        Useful workflows:
-        \(workflowText)
-        """
-        }
-
-        prompt += """
+        let trailer = """
 
         Use this only when it helps the user with the current app. Do not announce that a skill loaded. Keep voice answers natural and point at visible app areas when useful.
         """
+
+        if !workflowText.isEmpty {
+            // Fit as many whole workflows as the budget allows rather than
+            // slicing mid-step, which would leave a dangling instruction.
+            let room = Self.promptFragmentCharacterCap - prompt.count - trailer.count
+            let header = "\n\nUseful workflows:\n"
+            if room > header.count {
+                var kept = ""
+                for block in workflowText.components(separatedBy: "\n\n") {
+                    let candidate = kept.isEmpty ? block : kept + "\n\n" + block
+                    if header.count + candidate.count > room { break }
+                    kept = candidate
+                }
+                if !kept.isEmpty { prompt += header + kept }
+            }
+        }
+
+        prompt += trailer
         return prompt
     }
 

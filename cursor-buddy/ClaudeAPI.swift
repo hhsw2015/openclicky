@@ -23,6 +23,50 @@ class ClaudeAPI {
 
     private static let tlsWarmupGate = TLSWarmupGate()
 
+    /// Build the `system` field as cache-aware blocks.
+    ///
+    /// This path used to send `"system": systemPrompt` — a bare string with
+    /// no `cache_control`, so the fallback path paid full price for the
+    /// identity/tools/style preamble on every single turn while the mirage
+    /// path (`CompanionManager+AIResponsePipeline`) cached the same bytes.
+    ///
+    /// Callers hand us one merged string, so recover the split the same way
+    /// that path does: peel off the byte-stable prefix produced by
+    /// `CompanionManager.stableVoiceResponseSystemPrompt()` and cache only
+    /// that. Anthropic hashes exact bytes up to the marker, so the volatile
+    /// tail must follow it, never precede it.
+    ///
+    /// When the caller passed something else entirely (visual-analysis,
+    /// assist-agent rounds) the whole prompt is treated as stable — that is
+    /// correct whenever the caller's own prompt is byte-stable across turns
+    /// of *its* flow, and harmless otherwise (a miss, not a corruption).
+    static func systemBlocks(for systemPrompt: String,
+                             stablePrefix: String) -> [[String: Any]] {
+        guard !systemPrompt.isEmpty else { return [] }
+
+        guard !stablePrefix.isEmpty, systemPrompt.hasPrefix(stablePrefix) else {
+            return [[
+                "type": "text",
+                "text": systemPrompt,
+                "cache_control": ["type": "ephemeral", "ttl": "1h"]
+            ]]
+        }
+
+        var blocks: [[String: Any]] = [[
+            "type": "text",
+            "text": stablePrefix,
+            "cache_control": ["type": "ephemeral", "ttl": "1h"]
+        ]]
+        let tail = String(systemPrompt.dropFirst(stablePrefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty {
+            // Deliberately NO cache_control — this changes per turn and
+            // marking it would move the breakpoint past volatile bytes.
+            blocks.append(["type": "text", "text": tail])
+        }
+        return blocks
+    }
+
     private var apiKey: String?
     private let apiURL: URL
     var model: String
@@ -189,13 +233,17 @@ class ClaudeAPI {
             }
         }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": maxOutputTokens,
             "stream": true,
-            "system": systemPrompt,
             "messages": messages
         ]
+        let blocks = Self.systemBlocks(
+            for: systemPrompt,
+            stablePrefix: CompanionManager.stableVoiceResponseSystemPromptForCaching()
+        )
+        if !blocks.isEmpty { body["system"] = blocks }
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
@@ -394,12 +442,16 @@ class ClaudeAPI {
         ])
         messages.append(["role": "user", "content": contentBlocks])
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": maxOutputTokens,
-            "system": systemPrompt,
             "messages": messages
         ]
+        let blocks = Self.systemBlocks(
+            for: systemPrompt,
+            stablePrefix: CompanionManager.stableVoiceResponseSystemPromptForCaching()
+        )
+        if !blocks.isEmpty { body["system"] = blocks }
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
