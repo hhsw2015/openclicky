@@ -216,7 +216,25 @@ actor MiragePeekyOrchestrator {
     /// tier 4 (Claude) on nil. Routelet has no `.agent` output by
     /// design — agent turns go through the voice cue in tier 1.
     func routeletClassify(_ transcript: String) async -> MirageIntent? {
-        guard let prediction = await OpenClickyIntentClassifier.shared.classify(transcript) else {
+        // routelet is English-only. Its base is BAAI/bge-small-en-v1.5 and
+        // its training corpus contains no CJK; the 488 CJK entries in the
+        // vocab are leftovers from bert-base-uncased, not support. Measured:
+        // Chinese in, it returns `none` at ~0.99 for every input regardless
+        // of content — so this tier abstains on every Chinese turn and the
+        // work falls through to Claude (tier 4, a network round-trip).
+        //
+        // Translating first fixes it: on the same corpus, Chinese -> English
+        // -> routelet scored 87.5%, identical to hand-written English, and
+        // up from 0%. See docs/parlor-integration-research/
+        // 05-integration-plan.md §4.2a and §12.
+        //
+        // Translation is best-effort. If the local model is not installed or
+        // not reachable, classify the original text — that is exactly the
+        // behaviour before this change, so the fallback is a no-op rather
+        // than a regression.
+        let classifiable = await Self.englishTextForRoutelet(transcript)
+
+        guard let prediction = await OpenClickyIntentClassifier.shared.classify(classifiable) else {
             return nil
         }
         // Reject class → let Claude decide.
@@ -227,6 +245,48 @@ actor MiragePeekyOrchestrator {
         // scoped). The two enums share the same string raw values so a
         // rawValue-based bridge is exact.
         return MirageIntent(rawValue: prediction.intent.rawValue)
+    }
+
+    /// Text to hand routelet: the original when it is already English, a
+    /// local-model translation when it is not.
+    ///
+    /// Only non-Latin scripts are translated. Detecting "is this English"
+    /// properly is its own problem, and getting it wrong in the permissive
+    /// direction costs a needless ~300 ms on every English turn. Checking
+    /// for CJK/Cyrillic/Arabic/etc. is cheap, exact for the case that
+    /// matters here, and leaves European languages on the pre-existing
+    /// path — they at least share routelet's alphabet, so its behaviour on
+    /// them is degraded rather than pinned at `none`.
+    static func englishTextForRoutelet(_ transcript: String) async -> String {
+        guard containsNonLatinScript(transcript) else { return transcript }
+        guard OpenClickyLocalLLMClient.isConfigured else { return transcript }
+
+        let translated = await MainActor.run { OpenClickyLocalLLMClient() }
+        guard let english = try? await translated.translateToEnglish(transcript),
+              !english.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            // Local model missing, server down, or an empty reply. Fall back
+            // to the original: classification quality is unchanged from
+            // before this feature existed.
+            return transcript
+        }
+        return english
+    }
+
+    /// Whether the text carries a script routelet's tokenizer cannot handle.
+    /// Mirrors the ranges OpenClickyIntentClassifier.isCJKCodepoint treats as
+    /// Chinese, plus the other common non-Latin blocks.
+    nonisolated static func containsNonLatinScript(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            let cp = scalar.value
+            return (cp >= 0x4E00 && cp <= 0x9FFF)      // CJK Unified
+                || (cp >= 0x3400 && cp <= 0x4DBF)      // CJK Extension A
+                || (cp >= 0x3040 && cp <= 0x30FF)      // Hiragana + Katakana
+                || (cp >= 0xAC00 && cp <= 0xD7AF)      // Hangul syllables
+                || (cp >= 0x0400 && cp <= 0x04FF)      // Cyrillic
+                || (cp >= 0x0590 && cp <= 0x05FF)      // Hebrew
+                || (cp >= 0x0600 && cp <= 0x06FF)      // Arabic
+                || (cp >= 0x0E00 && cp <= 0x0E7F)      // Thai
+        }
     }
 
     /// Bare "openclicky agent, X" / "peeky agent, X" prefix. Returns the

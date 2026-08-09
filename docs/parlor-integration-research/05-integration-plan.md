@@ -1292,3 +1292,43 @@ It also argues for a pre-flight redaction pass in the shipping product:
 `ContextExtractor` already runs Vision OCR, so the same credential-shaped
 grep is nearly free and should gate any frame before it reaches either a
 local or a remote model.
+
+### 12.14 Layer B shipped — measured through the real code path
+
+`MiragePeekyOrchestrator.routeletClassify` now translates non-Latin
+transcripts before handing them to routelet. Re-measured end to end: the
+32-item Gate A corpus translated by the **live local model through the
+same helper the app calls**, then classified by the **shipped** routelet.
+
+| arm | accuracy | `none` rate |
+| --- | --- | --- |
+| 1 zh-raw (before) | **0.0%** | 100% |
+| 2 zh-grounded | 0.0% | 100% |
+| 3 en, live translation (after) | **78.1%** | 3.1% |
+| 4 en-raw control | 84.4% | 0% |
+
+Translation cost **348 ms mean**, local, no quota.
+
+0% → 78.1%, against an 84.4% ceiling set by hand-written English. Every
+Chinese turn previously fell through this tier to Claude (tier 4, a
+network round-trip); most now resolve locally in ~350 ms.
+
+The 78.1% is slightly below §12's 87.5%, which used hand-written English
+for arm 3. The gap is translation phrasing, not classifier drift — the
+model returns "Where is the search box?" where the corpus author wrote
+"where is the search bar in the Safari toolbar". Worth noting rather than
+tuning: arm 4 shows the classifier's own ceiling is 84.4%, so the
+remaining headroom is ~6 points.
+
+#### Scope of the trigger
+
+Only non-Latin scripts are translated (CJK, kana, Hangul, Cyrillic,
+Hebrew, Arabic, Thai). Proper language detection is its own problem, and
+guessing permissively costs ~350 ms on every English turn for nothing.
+European languages stay on the old path — they at least share routelet's
+alphabet, so its behaviour there is degraded rather than pinned at
+`none`, and no measurement exists to justify spending latency on them.
+
+Failure is a no-op by construction: no local model, server down, or an
+empty reply all fall back to classifying the original text, which is
+exactly the pre-change behaviour.

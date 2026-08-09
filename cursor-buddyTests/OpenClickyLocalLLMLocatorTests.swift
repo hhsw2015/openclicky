@@ -166,6 +166,46 @@ final class OpenClickyLocalLLMLocatorTests: XCTestCase {
                                  "too lax — holds GBs of RAM long after use")
     }
 
+    // MARK: - Translation trigger
+    //
+    // Which transcripts get translated before routelet sees them. Being
+    // wrong is quiet in both directions: too narrow and Chinese turns keep
+    // classifying at 0%, too broad and every English turn pays ~350 ms for
+    // nothing.
+
+    func test_nonLatinDetection_triggersOnScriptsRouteletCannotHandle() {
+        for text in ["搜索框在哪", "点这个播放", "これを開いて", "이것을 열어",
+                     "где поиск", "افتح هذا", "เปิดอันนี้"] {
+            XCTAssertTrue(MiragePeekyOrchestrator.containsNonLatinScript(text),
+                          "\(text) should be translated before routelet")
+        }
+    }
+
+    func test_nonLatinDetection_leavesEnglishAlone() {
+        for text in ["where is the search bar", "play that song",
+                     "remember I use vim", "open settings", ""] {
+            XCTAssertFalse(MiragePeekyOrchestrator.containsNonLatinScript(text),
+                           "\(text) must not pay translation latency")
+        }
+    }
+
+    /// Mixed input still translates — one CJK clause is enough to make
+    /// routelet return `none`, so the whole utterance needs the bridge.
+    func test_nonLatinDetection_triggersOnMixedText() {
+        XCTAssertTrue(MiragePeekyOrchestrator.containsNonLatinScript("打开 Safari"))
+        XCTAssertTrue(MiragePeekyOrchestrator.containsNonLatinScript("search 一下 Swift"))
+    }
+
+    /// Punctuation, digits and accented Latin are not other scripts.
+    /// Treating "café" or "what's up?" as translatable would put every
+    /// second English turn through the model.
+    func test_nonLatinDetection_ignoresPunctuationAndAccents() {
+        for text in ["what's on my desktop?", "café", "naïve", "3.14", "a — b"] {
+            XCTAssertFalse(MiragePeekyOrchestrator.containsNonLatinScript(text),
+                           "\(text) is Latin script")
+        }
+    }
+
     // MARK: - Matching helper
 
     /// Callers ask what something is and match here, in code. Asking the
