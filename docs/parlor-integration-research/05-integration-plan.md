@@ -1332,3 +1332,51 @@ alphabet, so its behaviour there is degraded rather than pinned at
 Failure is a no-op by construction: no local model, server down, or an
 empty reply all fall back to classifying the original text, which is
 exactly the pre-change behaviour.
+
+### 12.15 Screen redaction gate — shipped
+
+§12.13's privacy note recommended a pre-flight redaction pass, on the
+grounds that `ContextExtractor` already runs Vision OCR so the marginal
+cost is a regex sweep over text the app has computed anyway. Built:
+`OpenClickyScreenRedactionGate`.
+
+It answers one question — send this frame, or refuse it. Deliberately not
+a redactor: no blurring or masking, because partial redaction invites
+"the secret was only half visible" reasoning.
+
+#### What it must not do
+
+The failure mode that makes such a gate worthless is refusing every code
+editor. A user who hits that turns the feature off, and then it protects
+nothing. So every pattern requires a high-entropy VALUE, never a
+credential-adjacent word:
+
+| blocked | allowed |
+| --- | --- |
+| `export OPENAI_API_KEY=sk-proj-abc123…` | `func anthropicAPIKey() -> String?` |
+| `password: hunter2swordfish` | `Enter your password to continue` |
+| `eyJhIjoiOGY0NGE5…` | `Settings > Anthropic API key` |
+| `client_secret_610.…json` | `let secret = try loadSecret()` |
+
+Filenames are also blocked, because the Finder case leaked no secret —
+the listing simply announced which file holds one.
+
+The refusal reason never quotes the match. Echoing a secret into a log or
+a spoken caption in order to explain that it must not be sent is
+self-defeating.
+
+#### Verified on live captures, not fixtures
+
+14 hand-written cases pass. More usefully, the gate was run over eight
+windows captured off this machine at that moment: **7 allowed, 1
+blocked** — a real `.pem` private-key filename visible on screen. A true
+positive on live data. (The captures were deleted immediately after.)
+
+#### Not yet wired
+
+The gate exists and is tested; no call site consults it. Wiring belongs
+with whichever path first sends a frame somewhere — and note it should
+gate BOTH destinations, local and remote. The local model is the safer
+of the two, not a safe one: it is still a process reading the frame, and
+"we only sent it to localhost" is a weaker promise than not reading the
+secret at all.

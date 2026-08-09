@@ -206,6 +206,67 @@ final class OpenClickyLocalLLMLocatorTests: XCTestCase {
         }
     }
 
+    // MARK: - Screen redaction gate
+    //
+    // Both blocked cases below are real windows found on this machine while
+    // building the screen-history gate (§12.13) — a live Cloudflare tunnel
+    // token in a window title, and a Finder listing naming a client_secret
+    // json. Under today's attach-everything-or-nothing architecture both
+    // would have been uploaded verbatim.
+
+    func test_redactionGate_blocksRealObservedCases() {
+        let tunnel = "cloudflared tunnel run --token eyJhIjoiOGY0NGE5YzYzZmE0Y2VhMjNhMTk0NGM2ZDgyOTk5NTAi"
+        XCTAssertFalse(OpenClickyScreenRedactionGate.evaluate(recognizedText: tunnel).isAllowed)
+
+        let finder = "skywork_paid_tokens.json\nclient_secret_610.apps.googleusercontent.com.json"
+        XCTAssertFalse(OpenClickyScreenRedactionGate.evaluate(recognizedText: finder).isAllowed)
+    }
+
+    func test_redactionGate_blocksCommonCredentialShapes() {
+        for text in ["export OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012",
+                     "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+                     "-----BEGIN RSA PRIVATE KEY-----",
+                     "password: hunter2swordfish",
+                     "AKIAIOSFODNN7EXAMPLE",
+                     "deploy key at ~/.ssh/id_rsa"] {
+            XCTAssertFalse(OpenClickyScreenRedactionGate.evaluate(recognizedText: text).isAllowed,
+                           "should have blocked: \(text)")
+        }
+    }
+
+    /// The failure mode that makes a gate useless: refusing every code
+    /// editor. A user who hits that turns the feature off, and then it
+    /// protects nothing. Every entry needs a high-entropy value, not a
+    /// credential-adjacent word.
+    func test_redactionGate_allowsOrdinaryScreens() {
+        for text in ["func anthropicAPIKey() -> String? { AppBundleConfiguration.key }",
+                     "Settings > Advanced Providers > Anthropic API key",
+                     "Enter your password to continue",
+                     "$ swift build\nCompiling OpenClicky\n198 tests passed",
+                     "let secret = try loadSecret()",
+                     "Wi-Fi  Bluetooth  Network  Battery",
+                     ""] {
+            XCTAssertTrue(OpenClickyScreenRedactionGate.evaluate(recognizedText: text).isAllowed,
+                          "false positive on: \(text)")
+        }
+    }
+
+    /// Explaining the block must not restate the secret. Echoing it into a
+    /// log or a spoken caption to say it must not be sent is self-defeating.
+    func test_redactionGate_reasonNeverEchoesTheSecret() {
+        let verdict = OpenClickyScreenRedactionGate.evaluate(
+            recognizedText: "sk-proj-abc123def456ghi789jkl012")
+        guard case .blocked(let reason) = verdict else {
+            return XCTFail("expected a block")
+        }
+        XCTAssertFalse(reason.contains("sk-"))
+        XCTAssertFalse(reason.contains("abc123"))
+
+        let sentence = OpenClickyScreenRedactionGate.explanation(for: verdict)
+        XCTAssertNotNil(sentence)
+        XCTAssertFalse(sentence!.contains("sk-"))
+    }
+
     // MARK: - Matching helper
 
     /// Callers ask what something is and match here, in code. Asking the
