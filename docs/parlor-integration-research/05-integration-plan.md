@@ -1525,9 +1525,22 @@ The categorisation is also the cheaper call, in both gates. A short free-
 text answer costs fewer tokens than a judgement the model has to reason
 its way to.
 
-#### Not wired
+#### Built as `OpenClickyScreenLegibilityRouter`
 
-Same position as the redaction gate was: measured, unbuilt. Replacing
-reactive escalation is a change to a working path, and it should carry
-its own switch — a wrong DEFER is invisible to the user except as
-latency, so it needs to be turnable off without rebuilding.
+Off by default (`openClickyLocalLegibilityRoutingEnabled`). It changes a
+path that already works, and a wrong DEFER is invisible to the user
+except as latency, so it has to be turnable off without a rebuild.
+
+Every failure path lands on DEFER — routing disabled, no local model,
+request failure, empty answer. Note this is the OPPOSITE of the redaction
+gate (§12.15), which fails OPEN, and the asymmetry is deliberate in both:
+
+| | fail open | fail closed |
+| --- | --- | --- |
+| redaction gate | ✓ blocking on a Vision hiccup removes a feature for a reason the user cannot see | |
+| legibility router | | ✓ answering on a hiccup invents content |
+
+Not yet consulted by the escalation path. Wiring it means changing
+`shouldEscalateVoiceResponseToAgent` from reactive to predictive, which
+is worth doing behind the switch once there is a reason to trust the
+switch is on.

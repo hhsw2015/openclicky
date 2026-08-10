@@ -316,6 +316,61 @@ final class OpenClickyLocalLLMLocatorTests: XCTestCase {
         return jpeg
     }
 
+    // MARK: - Legibility routing
+    //
+    // The asymmetry is the design: a false LEGIBLE means the model answers
+    // about text it cannot read (fabrication); a false ILLEGIBLE is one
+    // wasted round trip, which is what today's reactive escalation costs
+    // anyway. So every failure path must land on DEFER.
+
+    func test_legibilityRouter_categorisesGateJAnswers() {
+        // The exact strings the model returned in Gate J (§12.17).
+        for said in ["error log", "code snippet", "terminal window", "stack trace"] {
+            XCTAssertNotNil(
+                OpenClickyScreenLegibilityRouter.matchedDeferCategory(in: said),
+                "\(said) must defer — the model fabricates about dense text")
+        }
+        for said in ["settings menu", "document view", "web browser", "music player"] {
+            XCTAssertNil(
+                OpenClickyScreenLegibilityRouter.matchedDeferCategory(in: said),
+                "\(said) is a distinct-control screen; deferring wastes a round trip")
+        }
+    }
+
+    /// Substring, because the model answers "error log", never a bare
+    /// category word — and case-insensitively, because it varies.
+    func test_legibilityRouter_matchesSubstringsAndIgnoresCase() {
+        XCTAssertNotNil(OpenClickyScreenLegibilityRouter.matchedDeferCategory(in: "Error Log"))
+        XCTAssertNotNil(OpenClickyScreenLegibilityRouter.matchedDeferCategory(in: "a TERMINAL emulator"))
+        XCTAssertNil(OpenClickyScreenLegibilityRouter.matchedDeferCategory(in: ""))
+    }
+
+    /// Disabled by default: this replaces a working path, and a wrong DEFER
+    /// shows up only as latency, so it must be off until switched on.
+    @MainActor func test_legibilityRouter_isOffByDefaultAndFailsToDefer() async {
+        UserDefaults.standard.removeObject(
+            forKey: OpenClickyScreenLegibilityRouter.enabledDefaultsKey)
+        XCTAssertFalse(OpenClickyScreenLegibilityRouter.isEnabled)
+
+        let decision = await OpenClickyScreenLegibilityRouter.decide(imageData: Data())
+        XCTAssertFalse(decision.isLocal, "disabled must mean defer, never answer locally")
+    }
+
+    /// Unreadable input with routing ON must still defer. This is the
+    /// opposite of the redaction gate, which fails OPEN — there, blocking
+    /// on a hiccup removes a feature; here, answering on a hiccup invents
+    /// content.
+    @MainActor func test_legibilityRouter_failsToDeferOnUnusableInput() async {
+        UserDefaults.standard.set(true, forKey: OpenClickyScreenLegibilityRouter.enabledDefaultsKey)
+        defer {
+            UserDefaults.standard.removeObject(
+                forKey: OpenClickyScreenLegibilityRouter.enabledDefaultsKey)
+        }
+        let decision = await OpenClickyScreenLegibilityRouter.decide(
+            imageData: Data([0x00, 0x01, 0x02]))
+        XCTAssertFalse(decision.isLocal, "garbage input must defer, not answer locally")
+    }
+
     // MARK: - Matching helper
 
     /// Callers ask what something is and match here, in code. Asking the
