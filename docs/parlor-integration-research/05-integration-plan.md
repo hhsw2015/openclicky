@@ -1452,3 +1452,82 @@ Worth stating plainly because the plan repeatedly tempted the opposite:
 three separate times now, a capability that looked adjacent to a measured
 one turned out not to transfer — native audio (§12.3), open enumeration
 (§12.4), and now coordinates. Adjacent is not the same as demonstrated.
+
+### 12.17 Gate J — routing on legibility: PASS, but only in the naming form
+
+Gate E measured legibility judgement in isolation. The proposed use is
+stricter: decide **up front** whether a turn is answerable locally, in
+place of today's reactive escalation — which pays a full round trip, gets
+a refusal, and only then escalates (`shouldEscalateVoiceResponseToAgent`).
+
+The asymmetry sets the bar:
+
+* **false LEGIBLE** — the local model answers about text it cannot read,
+  i.e. fabricates. Unacceptable at any rate.
+* **false ILLEGIBLE** — one unnecessary escalation, which is exactly what
+  happens today. Waste, not harm.
+
+So: zero false-legible, or do not ship it.
+
+Six frames — three distinct controls (button, toggle, menu bar), three
+dense (stack trace, log spam, code).
+
+#### Asking for the verdict directly: FAIL
+
+| frame | said | should |
+| --- | --- | --- |
+| log spam | **LOCAL** | DEFER |
+| other five | correct | |
+
+1/6 false-legible at 1590 ms. One case, but the bar is zero.
+
+#### The same failure shape as §12.13, again
+
+Probing that one frame:
+
+* "What kind of window is this?" → **`Error log`**
+* "Is this mostly dense monospaced text?" → **`YES`**
+* "LOCAL or DEFER?" → **`LOCAL`**
+
+It sees correctly and judges wrongly. `LOCAL or DEFER?` is `is this an
+X?` wearing different words — it names the desired verdict and invites
+assent.
+
+#### Naming form: PASS
+
+Ask what the content *is*; match against an off-limits category list in
+code.
+
+| frame | said | routed |
+| --- | --- | --- |
+| button | `settings menu` | LOCAL |
+| toggle | `settings menu` | LOCAL |
+| menu bar | `document view` | LOCAL |
+| stack trace | `error log` | DEFER |
+| log spam | `error log` | DEFER |
+| code | `code snippet` | DEFER |
+
+**6/6, zero false-legible, zero false-defer, 1251 ms** — and cheaper than
+the direct question.
+
+#### The rule is now general
+
+Third confirmation, so it belongs in §0 rather than buried per-gate:
+
+> **Never ask the model to confirm a verdict. Ask what something is, and
+> decide in code.**
+
+It held for "is this a terminal?" (§12.13), for "is this legible?" here,
+and it is why the coordinate gate could not be rescued by rephrasing
+(§12.16) — there is no naming form for a pixel.
+
+The categorisation is also the cheaper call, in both gates. A short free-
+text answer costs fewer tokens than a judgement the model has to reason
+its way to.
+
+#### Not wired
+
+Same position as the redaction gate was: measured, unbuilt. Replacing
+reactive escalation is a change to a working path, and it should carry
+its own switch — a wrong DEFER is invisible to the user except as
+latency, so it needs to be turnable off without rebuilding.
