@@ -1391,3 +1391,64 @@ break the feature invisibly if wrong: a clean screen must survive the
 filter, and unreadable image data must fail OPEN. A gate that blocks on
 every Vision hiccup removes screen context for a reason the user can
 neither see nor fix.
+
+### 12.16 Gate I — coordinates: FAIL. Do not wire Layer C pointing.
+
+Gate F measured E4B *naming* the element a user means (8/8, zero
+invented). `runFindAction` needs **pixels**. Nothing measured bridged the
+two, and the plan was about to assume it did.
+
+Harness `/tmp/gateI/`. A synthetic UI with six labelled buttons, ground
+truth from Vision OCR boxes so the fixture labels itself. Scored on the
+only thing that matters for a click: did the returned point land inside
+the target's box (2% tolerance)?
+
+**0/6.** 1415 ms/query.
+
+| target | returned | true box |
+| --- | --- | --- |
+| Submit | (0.490, 0.260) | (0.273, 0.112) |
+| Cancel | (0.308, 0.517) | (0.273, 0.225) |
+| Settings | (0.340, 0.570) | (0.273, 0.337) |
+| Search | (0.340, 0.640) | (0.273, 0.447) |
+| Delete | (0.308, 0.707) | (0.273, 0.562) |
+| Export | (0.330, 0.750) | (0.273, 0.675) |
+
+#### The error is structured, which is why it was worth probing further
+
+y increases monotonically with row — the model knows the ordering — but
+the values are compressed toward the middle, ratio 2.08 at the top
+decaying to 1.09 at the bottom. x is off by +0.080 against boxes ~0.05
+wide. That is a systematic bias, not noise, so a prompt-form fix was
+plausible: the yes/no failure in §12.13 looked equally fundamental and
+turned out to be phrasing.
+
+Three alternative forms, on the easiest two targets:
+
+| form | Submit (row 1 of 6) | Delete (row 5 of 6) |
+| --- | --- | --- |
+| pixels on 1280x800 | `300,300` | `715,705` |
+| 10x10 grid cell | `B1` — correct | `D7` — should be ~row 8 |
+| plain row index | `1` — correct | `4` — should be 5 |
+
+Coarse bands come out right; anything finer does not. The model has
+reliable **relative** spatial sense and unreliable **absolute** placement,
+at every granularity tried.
+
+#### Consequence
+
+**Layer C pointing is not built.** A click is binary — inside the element
+or on whatever is behind it — so "close" has no partial credit, and 0/6
+with a 2% tolerance is not a tuning gap.
+
+This does not retract Gate F. Naming works; the existing pointing stack
+(ElementLocationDetector, the Claude/Codex resolvers) keeps that job. What
+E4B can contribute to a pointing turn is the *referent* — "the user means
+the Submit button" — handed to a resolver that finds it. That is
+§12.5's cross-language win (4/4 vs OCR's 0/4) and it needs no coordinates
+from the model at all.
+
+Worth stating plainly because the plan repeatedly tempted the opposite:
+three separate times now, a capability that looked adjacent to a measured
+one turned out not to transfer — native audio (§12.3), open enumeration
+(§12.4), and now coordinates. Adjacent is not the same as demonstrated.
