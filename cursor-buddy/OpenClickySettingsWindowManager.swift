@@ -4236,6 +4236,26 @@ private struct SKIModePanelView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
+                    rowIcon("waveform.badge.magnifyingglass").frame(width: 28)
+                    Text("End turns on intonation")
+                        .font(appUIFont(size: bodyFontSize, weight: .medium))
+                    Spacer()
+                    Toggle("", isOn: $prefSmartTurnEnabled)
+                        .labelsHidden()
+                        .disabled(!OpenClickySmartTurnDetector.isModelAvailable)
+                }
+                Text(OpenClickySmartTurnDetector.isModelAvailable
+                     ? "Listens to how a sentence ends instead of just how long the mic has been quiet, so a finished sentence stops about 1.7 s sooner. Only ever ends a turn early — a pause mid-sentence still waits out the hangover above (measured: 0/6 premature cuts)."
+                     : "Needs smart-turn-v3.2-cpu.onnx (8 MB) in ~/models/smart-turn/. Without it, the hangover above decides on its own.")
+                    .font(appUIFont(size: subtextFontSize))
+                    .foregroundColor(.secondary)
+                    .padding(.leading, 40)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
                     rowIcon("waveform").frame(width: 28)
                     Text("Speech threshold")
                         .font(appUIFont(size: bodyFontSize, weight: .medium))
@@ -4267,6 +4287,7 @@ private struct SKIModePanelView: View {
     @AppStorage("openclicky.ski.handsFreeMode")     private var prefHandsFreeMode: Bool = false
     @AppStorage("openclicky.ski.vadSilenceMs")      private var prefVadSilenceMs: Int = 2000
     @AppStorage("openclicky.ski.vadThreshold")      private var prefVadThreshold: Double = 0.5
+    @AppStorage("openclicky.ski.smartTurnEnabled")  private var prefSmartTurnEnabled: Bool = false
 
     private var skiModePreferencesGroup: some View {
         settingsGroup("SKI Mode preferences") {

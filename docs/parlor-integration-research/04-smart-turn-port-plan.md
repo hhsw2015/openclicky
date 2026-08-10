@@ -747,6 +747,16 @@ Off by default (`openclicky.ski.smartTurnEnabled`), and gated on the model
 being installed. It changes WHEN a turn ends, which is the most disruptive
 thing to get wrong in a hands-free session.
 
-### Remaining
+### Settings
 
-A Settings row for the switch. Layer A is otherwise complete.
+"End turns on intonation" in SKI Mode preferences, directly under the
+Silence hangover stepper it modifies. Disabled, with an install hint,
+when the model is absent — which is the common case, since it is an 8 MB
+optional asset in `~/models/smart-turn/` rather than a bundled resource.
+
+The toggle writes `openclicky.ski.smartTurnEnabled`, the same key
+`SKIModeHandsFreeSession.isSmartTurnEnabled` reads. Verified rather than
+assumed: a Settings switch writing a key nobody reads is exactly the bug
+that left xlb inert in this codebase.
+
+**Layer A complete.**
