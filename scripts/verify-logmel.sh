@@ -33,64 +33,100 @@ fi
 
 rm -rf "$WORK" && mkdir -p "$WORK" && cd "$WORK"
 
-python3 - "$PARLOR" <<'PY'
+# Real speech as well as a synthetic sweep. The sweep exercises every mel
+# bin; the speech pair proves the port preserves the model's actual job —
+# telling a finished sentence from a cut-off one.
+say -v Samantha -o complete.aiff "I need you to open the settings window." 2>/dev/null
+say -v Samantha -o cutoff.aiff   "I need you to open the" 2>/dev/null
+for clip in complete cutoff; do
+    ffmpeg -y -loglevel error -i "$clip.aiff" -ar 16000 -ac 1 -f f32le "$clip.raw"
+done
+
+python3 - "$PARLOR" <<'PYGEN'
 import sys, numpy as np
 sys.path.insert(0, sys.argv[1] + "/src")
 from parlor.turn_detector import compute_whisper_log_mel_features
 
-# Deterministic 8 s: a sweep plus a fixed tone, so every mel bin sees energy.
-n = 128_000
-t = np.arange(n) / 16_000.0
-wav = (0.5 * np.sin(2 * np.pi * (200 + 900 * t / 8.0) * t)
-       + 0.2 * np.sin(2 * np.pi * 3000 * t)).astype(np.float32)
-wav.tofile("wav.f32")
-np.asarray(compute_whisper_log_mel_features(wav), dtype=np.float32).tofile("mel_ref.f32")
-print("reference: 80x800 features from 8 s of audio")
-PY
+N = 128_000
+def window(x):
+    return x[-N:] if len(x) >= N else np.concatenate([np.zeros(N - len(x), np.float32), x])
+
+t = np.arange(N) / 16_000.0
+clips = {"sweep": (0.5 * np.sin(2 * np.pi * (200 + 900 * t / 8.0) * t)
+                   + 0.2 * np.sin(2 * np.pi * 3000 * t)).astype(np.float32)}
+for name in ("complete", "cutoff"):
+    clips[name] = window(np.fromfile(name + ".raw", dtype=np.float32))
+
+for name, wav in clips.items():
+    wav.tofile(name + ".f32")
+    np.asarray(compute_whisper_log_mel_features(wav), dtype=np.float32).tofile(name + ".mel")
+print("reference: %d clips x 80x800 features" % len(clips))
+PYGEN
 
 cat > main.swift <<'SWIFT'
 import Foundation
-let wav = try! Data(contentsOf: URL(fileURLWithPath: "wav.f32"))
-    .withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-guard let got = OpenClickyWhisperLogMel.features(from: wav) else {
-    FileHandle.standardError.write("features() returned nil\n".data(using: .utf8)!)
-    exit(1)
+for name in ["sweep", "complete", "cutoff"] {
+    let wav = try! Data(contentsOf: URL(fileURLWithPath: name + ".f32"))
+        .withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    let start = Date()
+    guard let got = OpenClickyWhisperLogMel.features(from: wav) else {
+        FileHandle.standardError.write("features() nil\n".data(using: .utf8)!)
+        exit(1)
+    }
+    print(String(format: "swift %-9@ %.0f ms", name as NSString,
+                 Date().timeIntervalSince(start) * 1000))
+    try! Data(bytes: got, count: got.count * 4)
+        .write(to: URL(fileURLWithPath: name + ".swiftmel"))
 }
-let start = Date()
-_ = OpenClickyWhisperLogMel.features(from: wav)
-print(String(format: "swift front-end: %.0f ms for 8 s of audio",
-             Date().timeIntervalSince(start) * 1000))
-try! Data(bytes: got, count: got.count * 4).write(to: URL(fileURLWithPath: "mel_got.f32"))
 SWIFT
 
 cp "$ROOT/cursor-buddy/OpenClickyWhisperLogMel.swift" .
 swiftc -O -o runner OpenClickyWhisperLogMel.swift main.swift
 ./runner
 
-python3 - "$MODEL" <<'PY'
+python3 - "$MODEL" <<'PYCHK'
 import sys, numpy as np
-ref = np.fromfile("mel_ref.f32", dtype=np.float32).reshape(1, 80, 800)
-got = np.fromfile("mel_got.f32", dtype=np.float32).reshape(1, 80, 800)
-
-delta = np.abs(got - ref)
-print(f"mel: max {delta.max():.6f}  mean {delta.mean():.8f}  "
-      f"({(delta > 1e-3).sum()} of 64000 above 1e-3)")
-
 try:
     import onnxruntime as ort
 except ImportError:
-    print("onnxruntime not installed — skipping the decision check")
-    sys.exit(0 if delta.max() < 5e-3 else 1)
+    print("onnxruntime not installed - cannot check the decision"); sys.exit(2)
 
 session = ort.InferenceSession(sys.argv[1], providers=["CPUExecutionProvider"])
-sigmoid = lambda z: 1 / (1 + np.exp(-z))
-p_ref = sigmoid(session.run(None, {"input_features": ref})[0].ravel()[0])
-p_got = sigmoid(session.run(None, {"input_features": got})[0].ravel()[0])
 
-print(f"p(complete): reference {p_ref:.6f}  swift {p_got:.6f}  delta {abs(p_ref - p_got):.7f}")
-same = (p_ref > 0.5) == (p_got > 0.5)
-ok = same and abs(p_ref - p_got) < 0.02
-print("\nPASS — front-end reproduces the reference" if ok else
-      "\nFAIL — the difference changes what the model decides")
+# NO sigmoid. The output tensor is named `logits` but the graph already
+# applies one - all-zeros / all-+5 / all--5 return 0.9889 / 0.8341 / 0.9870,
+# always inside (0,1), and parlor reads the value straight into
+# `probability`. A second sigmoid squashes everything toward 0.5 and makes
+# the threshold meaningless while still returning plausible numbers.
+def predict(features):
+    return float(session.run(None, {"input_features": features})[0].ravel()[0])
+
+ok = True
+results = {}
+for name in ("sweep", "complete", "cutoff"):
+    ref = np.fromfile(name + ".mel", dtype=np.float32).reshape(1, 80, 800)
+    got = np.fromfile(name + ".swiftmel", dtype=np.float32).reshape(1, 80, 800)
+    p_ref, p_got = predict(ref), predict(got)
+    results[name] = p_got
+
+    # Decision agreement, NOT absolute probability. The model is extremely
+    # steep near p=0: random mel noise of +-1e-4, smaller than our float32
+    # delta, moves p by 0.29 on a cut-off utterance. A tight probability
+    # bound would measure the model's sensitivity, not the port's fidelity.
+    same = (p_ref > 0.5) == (p_got > 0.5)
+    ok = ok and same
+    print("%-9s mel max %.6f  p ref %.4f swift %.4f  %s" % (
+        name, np.abs(got - ref).max(), p_ref, p_got,
+        "agree" if same else "DISAGREE"))
+
+# The property the feature needs: a finished sentence and a cut-off one
+# must land on opposite sides, with room to spare.
+margin = results["complete"] - results["cutoff"]
+print("\ndiscrimination: complete %.4f - cutoff %.4f = %.4f" % (
+    results["complete"], results["cutoff"], margin))
+ok = ok and margin > 0.5
+
+print("\nPASS - front-end reproduces the reference decisions" if ok else
+      "\nFAIL - the port changes what the model decides")
 sys.exit(0 if ok else 1)
-PY
+PYCHK

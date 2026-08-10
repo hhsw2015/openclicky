@@ -371,6 +371,64 @@ final class OpenClickyLocalLLMLocatorTests: XCTestCase {
         XCTAssertFalse(decision.isLocal, "garbage input must defer, not answer locally")
     }
 
+    // MARK: - Smart-turn windowing
+    //
+    // The model reads exactly 8 s and decides on the final few hundred
+    // milliseconds. How a short buffer is padded therefore changes the
+    // answer, and getting it wrong produces confident nonsense rather than
+    // an error. Feature fidelity itself is covered by
+    // scripts/verify-logmel.sh against the Python reference.
+
+    func test_smartTurn_leftPadsShortAudio() {
+        let short = [Float](repeating: 0.5, count: 16_000)   // 1 s
+        let window = OpenClickySmartTurnDetector.fitToWindow(short)
+
+        XCTAssertEqual(window.count, OpenClickySmartTurnDetector.windowSamples)
+        // Speech must sit at the END. Right-padding would push it away from
+        // where the model looks for the end of the utterance.
+        XCTAssertEqual(window.last, 0.5)
+        XCTAssertEqual(window.first, 0.0)
+        XCTAssertEqual(window.suffix(16_000).filter { $0 == 0.5 }.count, 16_000)
+    }
+
+    func test_smartTurn_keepsTheMostRecentAudio() {
+        // 10 s ramp; the last 8 s must survive, not the first.
+        let long = (0..<160_000).map { Float($0) }
+        let window = OpenClickySmartTurnDetector.fitToWindow(long)
+
+        XCTAssertEqual(window.count, OpenClickySmartTurnDetector.windowSamples)
+        XCTAssertEqual(window.last, 159_999)
+        XCTAssertEqual(window.first, Float(160_000 - OpenClickySmartTurnDetector.windowSamples))
+    }
+
+    func test_smartTurn_exactLengthIsUnchanged() {
+        let exact = [Float](repeating: 0.25, count: OpenClickySmartTurnDetector.windowSamples)
+        XCTAssertEqual(OpenClickySmartTurnDetector.fitToWindow(exact).count, exact.count)
+    }
+
+    /// Above 0.5 on purpose. A false "finished" cuts the user off
+    /// mid-sentence; a false "still talking" costs at most the hangover
+    /// already being paid today.
+    func test_smartTurn_thresholdFavoursNotInterrupting() {
+        XCTAssertGreaterThan(OpenClickySmartTurnPrediction.defaultThreshold, 0.5)
+
+        let borderline = OpenClickySmartTurnPrediction(completionProbability: 0.6,
+                                                       elapsedMilliseconds: 12)
+        XCTAssertFalse(borderline.indicatesCompletion())
+
+        let confident = OpenClickySmartTurnPrediction(completionProbability: 0.95,
+                                                      elapsedMilliseconds: 12)
+        XCTAssertTrue(confident.indicatesCompletion())
+    }
+
+    /// Wrong sample counts must return nil rather than be padded here —
+    /// padding belongs to fitToWindow, and silently accepting a short
+    /// buffer would have the model judge mostly zeros.
+    func test_logMel_rejectsWrongLength() {
+        XCTAssertNil(OpenClickyWhisperLogMel.features(from: [Float](repeating: 0, count: 1000)))
+        XCTAssertNil(OpenClickyWhisperLogMel.features(from: []))
+    }
+
     // MARK: - Matching helper
 
     /// Callers ask what something is and match here, in code. Asking the

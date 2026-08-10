@@ -655,9 +655,44 @@ rather than a padding bug. Worth noting because "almost everything
 matches" was actively misleading here — the diagnosis only landed after
 dumping the reference's padded buffer and comparing element by element.
 
+### Inference done too — and one more trap, hit despite being documented
+
+`cursor-buddy/OpenClickySmartTurnDetector.swift`. The verifier now covers
+real speech, not just a synthetic sweep:
+
+```
+sweep     mel max 0.001336  p ref 0.3475 swift 0.3386  agree
+complete  mel max 0.003052  p ref 0.9759 swift 0.9836  agree
+cutoff    mel max 0.002208  p ref 0.0353 swift 0.1312  agree
+
+discrimination: complete 0.9836 - cutoff 0.1312 = 0.8525
+```
+
+"I need you to open the settings window." scores 0.98; "I need you to open
+the" scores 0.13. That gap is the feature working.
+
+**The sigmoid trap, which this plan lists, caught me anyway.** The output
+tensor is *named* `logits`, so I applied a sigmoid to it. It is already a
+probability: feeding all-zeros, all-+5 and all--5 returns 0.9889, 0.8341
+and 0.9870 — always inside (0,1) — and parlor reads the value straight
+into `probability`. A second sigmoid squashes everything toward 0.5 and
+makes any threshold meaningless, while still returning numbers that look
+entirely reasonable. Caught by probing the graph with extreme inputs, not
+by reading.
+
+**The acceptance criterion had to change.** An absolute probability bound
+was wrong: injecting random mel noise of ±1e-4 — smaller than our float32
+delta — moves p by 0.29 on the cut-off clip. The model is that steep near
+p=0, so a tight bound measures its sensitivity rather than the port's
+fidelity. The verifier now requires decision agreement plus a
+discrimination margin above 0.5.
+
+That also corrects a number reported earlier in this log: the "reference
+0.586003" figure was itself a double-sigmoid artefact. The true value for
+the sweep is 0.3475.
+
 ### Remaining
 
-The ONNX inference, the audio ring buffer, and the wiring into
-`SKIModeHandsFreeSession` (which currently pays a flat 2 s hangover). The
-front-end was the stated risk; that part is now measured rather than
-assumed.
+The audio ring buffer and the wiring into `SKIModeHandsFreeSession`, which
+currently pays a flat 2 s hangover. Both halves it depends on — features
+and inference — are now measured rather than assumed.
