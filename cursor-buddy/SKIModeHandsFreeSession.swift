@@ -41,6 +41,9 @@ final class SKIModeHandsFreeSession: ObservableObject {
     /// so the `nonisolated(unsafe)` is safe in practice.
     nonisolated(unsafe) private var vad: SileroVAD?
     nonisolated(unsafe) private var speechBuffer: [Int16] = []
+    /// Guards against overlapping smart-turn inferences — see
+    /// `consultSmartTurnOffMain`. Touched only on `ingestQueue`.
+    nonisolated(unsafe) private var smartTurnInFlight = false
     nonisolated(unsafe) private var silenceRunFrames: Int = 0
     nonisolated(unsafe) private var isInSpeech: Bool = false
     private var cancellables: Set<AnyCancellable> = []
@@ -239,11 +242,87 @@ final class SKIModeHandsFreeSession: ObservableObject {
                 silenceRunFrames += 1
                 if silenceRunFrames >= hangover {
                     flushUtteranceOffMain()
+                } else if shouldConsultSmartTurn(afterSilenceFrames: silenceRunFrames) {
+                    // Ask whether the speaker actually finished, rather than
+                    // waiting out the rest of the flat 2 s. Silence duration
+                    // cannot distinguish "open the settings window." from
+                    // "open the" — intonation can, and that is what the model
+                    // reads (0.98 vs 0.13, measured; see the 04 port log).
+                    //
+                    // Only ever ENDS a turn early; never consulted to extend
+                    // one. So the worst case stays today's hangover, and a
+                    // wrong answer cannot strand the user mid-capture.
+                    consultSmartTurnOffMain()
                 }
             } else {
                 if speechBuffer.count > chunkSize * 4 {
                     speechBuffer.removeFirst(speechBuffer.count - chunkSize * 4)
                 }
+            }
+        }
+    }
+
+    // MARK: - Smart-turn early cut
+
+    /// Frames of silence (~36 ms each) before the first consultation.
+    ///
+    /// Not zero: the model needs some trailing silence to judge that speech
+    /// stopped, and asking every chunk would run inference ~28x a second.
+    /// 8 frames is ~290 ms — a real pause, far short of the 2 s it beats.
+    private static let smartTurnFirstConsultFrame = 8
+
+    /// Re-ask this often while silence continues (~290 ms).
+    private static let smartTurnConsultInterval = 8
+
+    private static let smartTurnEnabledDefaultsKey = "openclicky.ski.smartTurnEnabled"
+
+    /// Off by default. It changes WHEN a turn ends, the most disruptive
+    /// thing to get wrong in a hands-free session, and the model is an
+    /// optional 8 MB asset that may not be installed.
+    nonisolated var isSmartTurnEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.smartTurnEnabledDefaultsKey)
+            && OpenClickySmartTurnDetector.isModelAvailable
+    }
+
+    nonisolated(unsafe) private func shouldConsultSmartTurn(afterSilenceFrames frames: Int) -> Bool {
+        guard isSmartTurnEnabled, !smartTurnInFlight else { return false }
+        guard frames >= Self.smartTurnFirstConsultFrame else { return false }
+        return (frames - Self.smartTurnFirstConsultFrame) % Self.smartTurnConsultInterval == 0
+    }
+
+    /// Run the detector over the audio so far; flush if it says the thought
+    /// is complete.
+    ///
+    /// `smartTurnInFlight` matters: inference is ~12-30 ms but chunks arrive
+    /// every ~36 ms, so a slow run would otherwise queue behind itself and
+    /// each queued answer would flush a buffer that no longer exists.
+    nonisolated(unsafe) private func consultSmartTurnOffMain() {
+        let snapshot = speechBuffer
+        guard snapshot.count >= 16_000 / 2 else { return }
+        smartTurnInFlight = true
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            var floats = [Float](repeating: 0, count: snapshot.count)
+            for i in 0..<snapshot.count { floats[i] = Float(snapshot[i]) / 32768.0 }
+
+            let prediction = await OpenClickySmartTurnDetector.shared.predict(samples: floats)
+            self.ingestQueue.async {
+                self.smartTurnInFlight = false
+                guard let prediction, prediction.indicatesCompletion() else { return }
+                // Re-check on the ingest queue: speech may have resumed while
+                // inference ran, and cutting then would truncate a word.
+                guard self.isInSpeech, self.silenceRunFrames > 0 else { return }
+                OpenClickyMessageLogStore.shared.append(
+                    lane: "voice", direction: "internal",
+                    event: "openclicky.ski.smart_turn_early_cut",
+                    fields: [
+                        "p_complete": String(format: "%.3f", prediction.completionProbability),
+                        "inference_ms": String(format: "%.0f", prediction.elapsedMilliseconds),
+                        "silence_frames": String(self.silenceRunFrames)
+                    ]
+                )
+                self.flushUtteranceOffMain()
             }
         }
     }

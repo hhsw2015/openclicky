@@ -691,8 +691,62 @@ That also corrects a number reported earlier in this log: the "reference
 0.586003" figure was itself a double-sigmoid artefact. The true value for
 the sweep is 0.3475.
 
+### Wired into SKI hands-free
+
+No new ring buffer was needed — `SKIModeHandsFreeSession.speechBuffer`
+already accumulates the utterance for Silero. The detector hangs off the
+silence branch: while silence is running but the 2 s hangover has not
+expired, ask whether the speaker actually finished.
+
+It can only ever END a turn early. It is never consulted to extend one, so
+the worst case remains today's behaviour and a wrong answer cannot strand
+the user mid-capture.
+
+#### What it buys, measured
+
+p(complete) as silence accumulates after a **finished** sentence:
+
+| trailing silence | p |
+| --- | --- |
+| 0 ms | 0.9759 |
+| **290 ms** (first consult) | **0.9854** |
+| 580 ms | 0.9860 |
+| 2000 ms (today's cut) | 0.9768 |
+
+Already far past the 0.7 threshold at the first consultation, so a
+finished sentence ends roughly **1.7 s sooner**.
+
+And the case that must not regress — a **mid-thought** pause, which has to
+stay below threshold for the whole window:
+
+| trailing silence | p |
+| --- | --- |
+| 290 ms | 0.0146 |
+| 580 ms | 0.1183 |
+| 870 ms | 0.0381 |
+| 1160 ms | 0.0717 |
+| 1450 ms | 0.0120 |
+| 1740 ms | 0.0170 |
+
+**0/6 premature cuts.** It never approaches 0.7, so the flat hangover
+still handles that case exactly as before.
+
+#### Two details that matter more than they look
+
+**Consultation cadence.** First at 8 frames (~290 ms), then every 8. Not
+every chunk: that would run inference ~28x a second for no benefit, since
+the model needs some trailing silence to judge that speech stopped at all.
+
+**An in-flight guard.** Inference is 12-30 ms but chunks arrive every
+~36 ms. Without the guard a slow run queues behind itself and each queued
+answer flushes a buffer that no longer exists. The result is also
+re-checked on the ingest queue before flushing, because speech may have
+resumed while inference ran — cutting then would truncate a word.
+
+Off by default (`openclicky.ski.smartTurnEnabled`), and gated on the model
+being installed. It changes WHEN a turn ends, which is the most disruptive
+thing to get wrong in a hands-free session.
+
 ### Remaining
 
-The audio ring buffer and the wiring into `SKIModeHandsFreeSession`, which
-currently pays a flat 2 s hangover. Both halves it depends on — features
-and inference — are now measured rather than assumed.
+A Settings row for the switch. Layer A is otherwise complete.

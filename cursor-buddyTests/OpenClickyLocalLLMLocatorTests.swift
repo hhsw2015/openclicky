@@ -429,6 +429,29 @@ final class OpenClickyLocalLLMLocatorTests: XCTestCase {
         XCTAssertNil(OpenClickyWhisperLogMel.features(from: []))
     }
 
+    // MARK: - Smart-turn hands-free wiring
+
+    /// Off unless BOTH the switch is on and the model is installed. Either
+    /// missing must leave the flat hangover in charge rather than silently
+    /// changing when turns end.
+    @MainActor func test_smartTurn_offWithoutExplicitOptIn() {
+        let key = "openclicky.ski.smartTurnEnabled"
+        UserDefaults.standard.removeObject(forKey: key)
+        XCTAssertFalse(SKIModeHandsFreeSession.shared.isSmartTurnEnabled,
+                       "must not alter turn-ending behaviour until opted in")
+    }
+
+    @MainActor func test_smartTurn_requiresTheModelEvenWhenSwitchedOn() {
+        let key = "openclicky.ski.smartTurnEnabled"
+        UserDefaults.standard.set(true, forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        // The 8 MB asset is optional. With the switch on, enablement must
+        // still track availability rather than assuming it.
+        XCTAssertEqual(SKIModeHandsFreeSession.shared.isSmartTurnEnabled,
+                       OpenClickySmartTurnDetector.isModelAvailable)
+    }
+
     // MARK: - Matching helper
 
     /// Callers ask what something is and match here, in code. Asking the
