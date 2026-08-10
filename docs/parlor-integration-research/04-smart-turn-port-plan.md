@@ -592,3 +592,72 @@ swiftc -parse cursor-buddy/OpenClickyWhisperLogMel.swift \
 ```
 
 Full builds and any TCC-touching runs go through Xcode.
+
+---
+
+## Port log — front-end done, verified numerically (2026-08-10)
+
+`cursor-buddy/OpenClickyWhisperLogMel.swift`, checked against parlor's
+Python reference by `scripts/verify-logmel.sh`:
+
+```
+swift front-end: 12 ms for 8 s of audio
+mel: max 0.001336  mean 0.00001382  (11 of 64000 above 1e-3)
+p(complete): reference 0.586003  swift 0.583848  delta 0.0021550
+PASS
+```
+
+The threshold is on the MODEL'S OUTPUT, not on the mel values. Swift runs
+float32 where the reference promotes to float64, so some mel delta is
+unavoidable; what matters is whether it moves the decision. A 1-ulp change
+to the input waveform already moves the reference by 7.7e-5, which sets
+the scale.
+
+### Two corrections to this plan
+
+**§1.4 is wrong about vDSP.** The plan states that `vDSP_DFT_zop` accepts
+"any length that factors into 2/3/5, and 400 = 2^4 · 5^2, so 400 is legal
+and exact". It is not — `vDSP_DFT_zop_CreateSetup` returns nil for 400.
+Probed empirically: 320, 480, 512 and 640 are accepted; 400, 800 and 1200
+are rejected. The real rule is f·2ⁿ with f in {1,3,5,15}.
+
+The plan was right to reject zero-padding to 512 (it moves the bin
+centres). With both documented options gone, the port computes the 201
+needed bins directly via two `cblas_sgemv` calls against precomputed
+cos/sin tables. That is ~80k multiply-adds per frame and still lands at
+12 ms for the whole 8 s window, so the O(n²) is irrelevant here.
+
+**The plan omits waveform normalisation entirely.** `transformers` runs
+`do_normalize=True` — zero-mean, unit-variance over the waveform, before
+any of the spectrogram work. Without it every one of the 64000 outputs is
+off by a uniform ~0.21, because the whole spectrogram shifts and the
+global max used for the dynamic-range clamp shifts with it. A constant
+offset everywhere reads like a scaling bug in the final `(x+4)/4` chain,
+not like a missing first step, which is what made it expensive to find.
+
+### The traps the plan called correctly
+
+All five, and each cost nothing because it was written down:
+
+* periodic vs symmetric Hann — `vDSP_hann_window` gives the wrong one
+* reflect vs symmetric padding, and the off-by-one in the left wing
+* global max over all 80×800, not per-frame
+* 801 frames computed, trailing one dropped
+* sigmoid baked into the ONNX graph — do not add another
+
+### One the plan could not have called
+
+The right-hand reflect wing was written in the correct *values* but
+reverse *order*. That preserves the min, max and mean of the padded
+buffer, so only the final frame's spectrum differs: 79913 of 80000
+outputs still matched, and the error looked like a boundary artefact
+rather than a padding bug. Worth noting because "almost everything
+matches" was actively misleading here — the diagnosis only landed after
+dumping the reference's padded buffer and comparing element by element.
+
+### Remaining
+
+The ONNX inference, the audio ring buffer, and the wiring into
+`SKIModeHandsFreeSession` (which currently pays a flat 2 s hangover). The
+front-end was the stated risk; that part is now measured rather than
+assumed.
