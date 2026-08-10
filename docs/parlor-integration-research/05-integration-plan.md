@@ -1372,11 +1372,22 @@ windows captured off this machine at that moment: **7 allowed, 1
 blocked** — a real `.pem` private-key filename visible on screen. A true
 positive on live data. (The captures were deleted immediately after.)
 
-#### Not yet wired
+#### Wired
 
-The gate exists and is tested; no call site consults it. Wiring belongs
-with whichever path first sends a frame somewhere — and note it should
-gate BOTH destinations, local and remote. The local model is the safer
-of the two, not a safe one: it is still a process reading the frame, and
-"we only sent it to localhost" is a weaker promise than not reading the
-secret at all.
+At `_analyzeVoiceResponseCore` — the one point every provider branch
+funnels through, so it covers both destinations. The local model is the
+safer one, not a safe one: it is still a process reading the frame.
+
+**27 ms per frame**, measured on a real 1280 px screenshot, against a
+network round trip.
+
+Offending frames are dropped rather than failing the turn. The user asked
+a question; a text-only answer beats an error. Each drop is logged as
+`openclicky.screen.redaction_blocked` with the KIND of secret, never the
+secret, so "why did it not see my screen" has an answer.
+
+Two behaviours are pinned by tests beyond the pattern list, because both
+break the feature invisibly if wrong: a clean screen must survive the
+filter, and unreadable image data must fail OPEN. A gate that blocks on
+every Vision hiccup removes screen context for a reason the user can
+neither see nor fix.

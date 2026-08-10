@@ -26,6 +26,8 @@
 //
 
 import Foundation
+import Vision
+import AppKit
 
 /// Why a frame was refused. Surfaced to the user so a block is explicable
 /// rather than a silent capability failure.
@@ -91,6 +93,46 @@ enum OpenClickyScreenRedactionGate {
             }
         }
         return .allow
+    }
+
+    /// Evaluate raw image data by OCRing it first.
+    ///
+    /// Callers hold `Data` (CompanionScreenCapture.imageData, a history
+    /// frame), not text — nothing in the capture pipeline threads OCR
+    /// output alongside the pixels, and adding that everywhere would touch
+    /// every call site. Doing the recognition here keeps the gate a single
+    /// call.
+    ///
+    /// `.fast` deliberately, not `.accurate`. This runs before every send,
+    /// so it must not add perceptible latency; and a credential is a long
+    /// high-entropy run, which is the easiest possible OCR target. Missing
+    /// a subtle glyph in prose does not matter here.
+    ///
+    /// Fails OPEN on OCR error. A gate that blocks whenever Vision hiccups
+    /// would break screen context for a reason the user cannot see or fix.
+    /// The gate reduces exposure; it is not a guarantee, and pretending
+    /// otherwise by failing closed trades a real feature for a false one.
+    static func evaluate(imageData: Data) -> OpenClickyScreenRedactionVerdict {
+        guard let image = NSImage(data: imageData),
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return .allow
+        }
+
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .fast
+        request.usesLanguageCorrection = false
+        request.recognitionLanguages = ["en-US", "zh-Hans"]
+
+        do {
+            try VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+        } catch {
+            return .allow
+        }
+
+        let lines = (request.results ?? []).compactMap {
+            $0.topCandidates(1).first?.string
+        }
+        return evaluate(recognizedLines: lines)
     }
 
     /// Convenience for callers holding OCR lines rather than one blob.

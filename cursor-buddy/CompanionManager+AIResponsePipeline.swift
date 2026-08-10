@@ -664,6 +664,28 @@ extension CompanionManager {
         _ = line
     }
 
+    /// Drop frames showing credentials. Returns the survivors.
+    ///
+    /// Logs each drop so a "why did it not see my screen" question has an
+    /// answer in the message log. The reason names the KIND of secret, never
+    /// the secret — echoing it into a log to explain that it must not be
+    /// sent would defeat the point.
+    nonisolated static func screenCaptureImagesPassingRedactionGate(
+        _ images: [(data: Data, label: String)]
+    ) -> [(data: Data, label: String)] {
+        guard !images.isEmpty else { return images }
+        return images.filter { image in
+            let verdict = OpenClickyScreenRedactionGate.evaluate(imageData: image.data)
+            guard case .blocked(let reason) = verdict else { return true }
+            OpenClickyMessageLogStore.shared.append(
+                lane: "voice", direction: "internal",
+                event: "openclicky.screen.redaction_blocked",
+                fields: ["label": String(image.label.prefix(60)), "reason": reason]
+            )
+            return false
+        }
+    }
+
     private func _analyzeVoiceResponseCore(
         images: [(data: Data, label: String)],
         modelID: String? = nil,
@@ -673,6 +695,23 @@ extension CompanionManager {
         assistantPrefill: String? = nil,
         onTextChunk: @MainActor @Sendable @escaping (String) -> Void
     ) async throws -> String {
+        // Credential pre-flight, at the single point every provider branch
+        // funnels through. Building the screen-history gate, enumerating
+        // real windows on this machine turned up one whose TITLE carried a
+        // live Cloudflare tunnel token and a Finder listing naming a
+        // client_secret json — both of which today's architecture would
+        // have uploaded verbatim, because it attaches the whole screen or
+        // nothing.
+        //
+        // Drops offending frames rather than failing the turn: the user
+        // asked a question, and a text-only answer beats an error. ~27 ms
+        // per frame measured on a real 1280 px screenshot, against a
+        // network round trip.
+        //
+        // Gates BOTH destinations. The local model is the safer one, not a
+        // safe one — it is still a process reading the frame.
+        let images = Self.screenCaptureImagesPassingRedactionGate(images)
+
         // Reset the xlb per-turn budget at each turn entry so the
         // 20k cap does not accumulate across turns (was: monotonic).
         await XLBSensorTools.resetTurnBudget()

@@ -17,6 +17,7 @@
 // These run against a temp directory, not the real ~/models, so they do
 // not depend on what happens to be installed.
 
+import AppKit
 import XCTest
 @testable import OpenClicky
 
@@ -265,6 +266,54 @@ final class OpenClickyLocalLLMLocatorTests: XCTestCase {
         let sentence = OpenClickyScreenRedactionGate.explanation(for: verdict)
         XCTAssertNotNil(sentence)
         XCTAssertFalse(sentence!.contains("sk-"))
+    }
+
+    // MARK: - Redaction gate, wired
+
+    /// The filter runs at _analyzeVoiceResponseCore, the one point every
+    /// provider branch funnels through. Two properties matter more than the
+    /// pattern list: an empty input must not become a crash, and a clean
+    /// screen must survive — a filter that silently eats good frames breaks
+    /// screen context in a way no error message explains.
+    @MainActor func test_redactionFilter_passesCleanFramesThrough() throws {
+        let clean = try makeJPEG(text: "Wi-Fi   Bluetooth   Network")
+        let input = [(data: clean, label: "screen")]
+        let output = CompanionManager.screenCaptureImagesPassingRedactionGate(input)
+        XCTAssertEqual(output.count, 1, "a clean screen must reach the model")
+    }
+
+    @MainActor func test_redactionFilter_handlesEmptyAndUnreadableInput() {
+        XCTAssertTrue(CompanionManager.screenCaptureImagesPassingRedactionGate([]).isEmpty)
+
+        // Garbage bytes: NSImage returns nil. Must fail OPEN — blocking on
+        // every decode hiccup would break screen context invisibly.
+        let junk = [(data: Data([0x00, 0x01, 0x02]), label: "junk")]
+        XCTAssertEqual(CompanionManager.screenCaptureImagesPassingRedactionGate(junk).count, 1,
+                       "unreadable image data must fail open, not blocked")
+    }
+
+    /// Render text to a JPEG so the gate has something real to OCR.
+    @MainActor private func makeJPEG(text: String) throws -> Data {
+        let size = NSSize(width: 900, height: 220)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        (text as NSString).draw(
+            at: NSPoint(x: 24, y: 90),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 34),
+                .foregroundColor: NSColor.black
+            ]
+        )
+        image.unlockFocus()
+
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let jpeg = rep.representation(using: .jpeg, properties: [:]) else {
+            throw XCTSkip("could not render a test image")
+        }
+        return jpeg
     }
 
     // MARK: - Matching helper
