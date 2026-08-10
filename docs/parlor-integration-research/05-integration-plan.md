@@ -159,7 +159,7 @@ Each ships separately, each has its own switch, none blocks the others.
 | **A. smart-turn-v3** | When do we stop recording? | No | 34 h (04) |
 | **B. E4B translate** | What is this in English? | Yes | small — text-in, 315 ms |
 | **C. E4B screen** | Can I see the target, and which element is it? | Yes | small — but needs the runtime |
-| **D. E4B curation** | What context does the backend get? | Yes | See §5, unvalidated |
+| ~~**D. E4B curation**~~ | ~~What context does the backend get?~~ | — | **STRUCK — measured, §12.18.** 1/5 facts retained when the question is unknown |
 
 > **Rev 3:** B and C were one layer ("the router") in earlier revisions.
 > Splitting them matters because they have different dependencies and
@@ -1544,3 +1544,65 @@ Not yet consulted by the escalation path. Wiring it means changing
 `shouldEscalateVoiceResponseToAgent` from reactive to predictive, which
 is worth doing behind the switch once there is a reason to trust the
 switch is on.
+
+### 12.18 Gate K — Layer D (curation): FAIL. Do not build.
+
+§5 has carried curation as "speculative" since revision 3. Measured now,
+and it does not survive.
+
+The proposal: E4B compresses context before Claude sees it — 20 OCR
+snippets become a sentence, 6000 chars of memory become a line. The
+saving is obvious; the risk is not. A summary missing the one detail the
+answer turned on is worse than no summary, because the backend cannot
+tell it is missing.
+
+#### With the question known: 5/5, and still not worth it
+
+Given the question alongside the context, every brief retained the
+load-bearing fact.
+
+| needed | retained | saving |
+| --- | --- | --- |
+| `5173` | yes | 56% |
+| `OpenClickyProfileTests` | yes | 55% |
+| `wowdd1@example.com` | yes | 23% |
+| `5.15` | yes | 12% |
+| `feature/local-llm` | yes | 31% |
+
+**2408 ms** to save 12-56% of a few hundred characters. Against Claude's
+measured 6500-13500 token turn (03), that is a rounding error bought with
+2.4 s of latency on every turn.
+
+And the framing flatters it: if the question is known and specific enough
+to curate against, a grep answers it for free.
+
+#### Without the question: 1/5
+
+The case curation must actually survive is a vague ask — "what was I
+doing?", "help me with this" — where it cannot know which detail will
+matter. Same context, no question:
+
+> The user ran `npm run dev` and opened `src/main.tsx`. They later ran
+> `swift test` which failed on `OpenClickyProfileTests.swift:26`.
+
+Kept: `OpenClickyProfileTests`. **Lost: the port, the branch, the model
+size, the other edited file** — four of five facts a plausible follow-up
+turns on. 70% saving on a 110-token blob, for 2250 ms.
+
+#### Consequence
+
+**Layer D is not built, and should be struck rather than deferred.** The
+economics do not work at either end: when curation is accurate it saves
+almost nothing worth 2.4 s, and when the saving is large it is because
+the facts are gone.
+
+This is not a prompt-form problem like §12.13 or §12.17. Nothing about
+asking differently tells a summariser which of five equally ordinary
+facts a future question will need — that is not a perception failure, it
+is missing information.
+
+Note the contrast with what did work. Every shipped use of this model
+answers a question that is fully specified at call time: translate THIS
+text, name THIS window, is THIS frame dense. Curation asks it to guess
+what will be asked later. That is the line — and it is a better predictor
+of what will transfer than "is this task adjacent to one that worked".
